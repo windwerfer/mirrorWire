@@ -1,1 +1,3 @@
 /target
+clippy-report.json
+lcov.info

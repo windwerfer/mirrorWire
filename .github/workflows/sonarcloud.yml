@@ -1,0 +1,81 @@
+# CI-based SonarCloud analysis (clippy JSON + lcov). Called from CI on every
+# push and pull request, and from Build on tags and workflow_dispatch (CI
+# already covers branch pushes). Automatic Analysis must be turned off under
+# SonarCloud Administration › Analysis method, or the upload is rejected.
+name: SonarCloud
+
+on:
+  workflow_call:
+    secrets:
+      SONAR_TOKEN:
+        required: false
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sonarcloud:
+    name: SonarCloud
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # GitHub does not pass repository secrets to pull requests from forks.
+      - name: Check for SONAR_TOKEN
+        id: token
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          if [ -n "$SONAR_TOKEN" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::SONAR_TOKEN is not available (e.g. a fork pull request); skipping SonarCloud scan."
+          fi
+
+      - name: Install system packages
+        if: steps.token.outputs.available == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavdevice-dev \
+            libavfilter-dev libswresample-dev libpipewire-0.3-dev libspa-0.2-dev libva-dev \
+            libdbus-1-dev libxkbcommon-dev libwayland-dev
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        if: steps.token.outputs.available == 'true'
+        with:
+          toolchain: stable
+          components: clippy, llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: steps.token.outputs.available == 'true'
+        with:
+          key: sonar
+
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        if: steps.token.outputs.available == 'true'
+        with:
+          tool: cargo-llvm-cov
+
+      # JSON on stdout is what SonarCloud imports. The Test job already gates
+      # on `clippy -D warnings`; this report is for the scanner.
+      - name: Clippy report
+        if: steps.token.outputs.available == 'true'
+        run: cargo clippy --workspace --all-targets --locked --message-format=json > clippy-report.json
+
+      # Unit/integration tests only. The 5 s loopback is a separate process and
+      # would need a second instrumented run; skip it to keep this job short.
+      - name: Coverage (lcov)
+        if: steps.token.outputs.available == 'true'
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+
+      - name: SonarCloud Scan
+        if: steps.token.outputs.available == 'true'
+        uses: SonarSource/sonarqube-scan-action@e805d875275f728fac1885b413934be6d7c63f65 # v8.4.1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io

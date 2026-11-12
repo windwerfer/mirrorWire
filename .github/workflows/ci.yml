@@ -15,6 +15,15 @@ jobs:
     name: Audit
     uses: ./.github/workflows/audit.yml
 
+  sonarcloud:
+    name: SonarCloud
+    needs: audit
+    permissions:
+      contents: read
+    uses: ./.github/workflows/sonarcloud.yml
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
   test:
     name: Test (Linux)
     runs-on: ubuntu-24.04

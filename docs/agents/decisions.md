@@ -30,6 +30,10 @@ agrees, update the entry (status, date, reason) in the same commit as the change
 
 Newest first. Add an entry when the owner decides something non-obvious.
 
+- **2026-11 (SonarCloud CI analysis):** the owner added a `SONAR_TOKEN` repository
+  secret and wants scans to run from GitHub Actions (Clippy report + lcov)
+  instead of Automatic Analysis. Automatic Analysis must be turned off under
+  Administration › Analysis method, or the CI upload is rejected.
 - **2026-11 (FilmCraft encoder):** the owner wants the FFmpeg version finished first, then the
   pure-Rust `filmcraft-h264enc` added as a switchable option for a side-by-side comparison. x264
   stays until then. Optional "use the system FFmpeg" mode accepted as a plan.

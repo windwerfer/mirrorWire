@@ -58,8 +58,9 @@ packaging/
   appimage/          AppImage packaging (linuxdeploy)
   linux/, icons/     desktop entry, AppStream metainfo, icon
 .github/workflows/
-  ci.yml             clippy, unit tests, loopback test, and the supply-chain audit
+  ci.yml             clippy, unit tests, loopback test, supply-chain audit, SonarCloud
   audit.yml          cargo audit and cargo-deny (also a weekly scheduled run)
+  sonarcloud.yml     CI SonarCloud scan (clippy report + lcov); also called from Build on tags
   build.yml          macOS arm64 + Intel DMG, Flatpak, AppImage; Release on v* tags
 .github/dependabot.yml  weekly updates for Actions SHA pins and Cargo
 ```
@@ -235,8 +236,11 @@ when the portal only sent 6.8 fps, because PTS advanced by 1/60 s per frame.
 
 ## Security
 
-SonarQube Cloud runs static analysis on `main` after each push (the Free plan
-does not analyze pull requests). `cargo audit` and `cargo deny` run on every
+SonarQube Cloud analysis runs from GitHub Actions on `main` and on pull
+requests from this repository (clippy report and unit-test coverage are
+uploaded with the scan). Fork pull requests skip the upload, because GitHub
+does not pass `SONAR_TOKEN`. Automatic Analysis on the SonarCloud project
+must stay off, or the CI upload is rejected. `cargo audit` and `cargo deny` run on every
 push and pull request, and again on a weekly schedule; the Build workflow
 waits for those checks and will not publish artifacts if they fail. GitHub
 Actions are pinned to full commit SHAs and updated by Dependabot. Downloads

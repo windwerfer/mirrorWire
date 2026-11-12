@@ -92,7 +92,19 @@ screen**, not logs. So:
 ## 5. CI and artifacts
 
 - `ci.yml` (push to `main`, PRs): clippy `-D warnings`, `cargo test`, 5 s loopback with x264,
-  and the reusable audit workflow.
+  the reusable audit workflow, and the reusable SonarCloud scan (`needs: audit`).
+- `sonarcloud.yml` (called from CI; also from Build on `v*` tags and
+  `workflow_dispatch`; can be dispatched on its own): if `SONAR_TOKEN` is
+  missing (fork PRs), the job succeeds and skips the upload. Otherwise it
+  writes a Clippy JSON report (`cargo clippy --message-format=json`) and
+  unit-test coverage (`cargo llvm-cov --lcov`), then runs
+  `SonarSource/sonarqube-scan-action` pinned to a full SHA. Report paths
+  live in `sonar-project.properties` (`sonar.rust.clippyReport.reportPaths`,
+  `sonar.rust.lcov.reportPaths`). The loopback test is not included in
+  coverage, so this stays a short extra compile. **Automatic Analysis must
+  be off** under SonarCloud Administration › Analysis method for
+  `windwerfer_mirrorWire`; if it is still on, the upload fails and should
+  not be worked around in the workflow.
 - `audit.yml` (called from CI and Build; also `workflow_dispatch` and a weekly Monday cron):
   `cargo audit` against the RustSec advisory DB, and
   `cargo deny check advisories bans licenses sources` with `deny.toml`.

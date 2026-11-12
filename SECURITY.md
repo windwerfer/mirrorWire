@@ -21,7 +21,11 @@ beyond current `main`.
 ## What this project does
 
 - **Static analysis.** [SonarQube Cloud](https://sonarcloud.io/project/overview?id=windwerfer_mirrorWire)
-  analyzes `main` after each push. The Free plan does not analyze pull requests.
+  is run from GitHub Actions on `main` and on pull requests from this
+  repository (a Clippy report and unit-test lcov coverage are uploaded with
+  the scan). Fork pull requests skip the upload when `SONAR_TOKEN` is
+  unavailable. Automatic Analysis must stay off on the SonarCloud project,
+  or the CI upload is rejected.
 - **Dependency and licence checks.** `cargo audit` (RustSec) and `cargo deny`
   (advisories, bans, licences, sources) run on every push and pull request,
   and on a weekly schedule so new advisories against existing pins are
