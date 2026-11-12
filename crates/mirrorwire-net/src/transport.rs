@@ -2,7 +2,11 @@
 //! (hello, pairing, keyframe requests, clock pings); video goes out as
 //! unreliable datagrams so a lost packet never stalls later frames.
 
-use crate::identity::Identity;
+use crate::diag::{
+    format_candidates, is_logical_reject, is_unreachable, no_answer_message, push_attempt,
+    ConnectStepId, ConnectTrace, IncomingAttempt, HANDSHAKE_TIMEOUT,
+};
+use crate::identity::{short_fingerprint, Identity};
 use crate::pairing::{ConnectInfo, PairedViewers};
 use crate::tls;
 use anyhow::{anyhow, bail, Context, Result};
@@ -60,6 +64,8 @@ pub struct PresenterConfig {
     /// Code an unpaired viewer must present. `None` accepts any viewer.
     pub pairing_code: Option<String>,
     pub config_dir: PathBuf,
+    /// Incoming handshake / pairing attempts for the presenter GUI.
+    pub attempts: std::sync::Arc<Mutex<Vec<IncomingAttempt>>>,
 }
 
 type Callback = Arc<dyn Fn() + Send + Sync>;
@@ -87,12 +93,13 @@ impl Presenter {
         tokio::spawn(send_loop(frames_rx, current_rx));
 
         let shared = Arc::new(SessionShared {
-            stream_info: cfg.stream_info,
+            stream_info: Mutex::new(cfg.stream_info),
             pairing_code: cfg.pairing_code,
             paired: Mutex::new(PairedViewers::load(&cfg.config_dir)),
             current: current_tx,
             connected: connected_tx,
             on_keyframe_request,
+            attempts: cfg.attempts,
         });
         let ep = endpoint.clone();
         tokio::spawn(async move {
@@ -115,25 +122,54 @@ impl Presenter {
 }
 
 struct SessionShared {
-    stream_info: StreamInfo,
+    stream_info: Mutex<StreamInfo>,
     pairing_code: Option<String>,
     paired: Mutex<PairedViewers>,
     current: Arc<watch::Sender<Option<Connection>>>,
     connected: watch::Sender<bool>,
     on_keyframe_request: Callback,
+    attempts: Arc<Mutex<Vec<IncomingAttempt>>>,
 }
 
 async fn handle_viewer(incoming: quinn::Incoming, shared: Arc<SessionShared>) -> Result<()> {
-    let conn = incoming.await?;
+    let remote = incoming.remote_address();
+    let conn = match incoming.await {
+        Ok(c) => c,
+        Err(e) => {
+            push_attempt(
+                &shared.attempts,
+                IncomingAttempt::new(remote, None, false, format!("handshake failed: {e:#}")),
+            );
+            return Err(e.into());
+        }
+    };
     let remote = conn.remote_address();
-    let fp = tls::peer_fingerprint(&conn).ok_or_else(|| anyhow!("viewer sent no certificate"))?;
+    let fp = match tls::peer_fingerprint(&conn) {
+        Some(fp) => fp,
+        None => {
+            push_attempt(
+                &shared.attempts,
+                IncomingAttempt::new(remote, None, false, "handshake failed: no certificate"),
+            );
+            bail!("viewer sent no certificate");
+        }
+    };
     let (mut send, mut recv) = conn.accept_bi().await?;
 
     let Control::Hello { protocol, name, pairing_code } = read_msg(&mut recv).await? else {
+        push_attempt(
+            &shared.attempts,
+            IncomingAttempt::new(remote, None, false, "expected hello on control stream"),
+        );
         bail!("expected hello from {remote}");
     };
     if protocol != PROTOCOL_VERSION {
-        write_msg(&mut send, &Control::Rejected { reason: format!("protocol {protocol} unsupported") }).await?;
+        let reason = format!("protocol {protocol} unsupported");
+        write_msg(&mut send, &Control::Rejected { reason: reason.clone() }).await?;
+        push_attempt(
+            &shared.attempts,
+            IncomingAttempt::new(remote, Some(name.clone()), false, reason),
+        );
         bail!("viewer {remote} speaks protocol {protocol}");
     }
     let authorized = match &shared.pairing_code {
@@ -152,13 +188,23 @@ async fn handle_viewer(incoming: quinn::Incoming, shared: Arc<SessionShared>) ->
         }
     };
     if !authorized {
-        write_msg(&mut send, &Control::Rejected { reason: "not paired: pairing code required".into() }).await?;
+        let reason = "not paired: pairing code required".to_owned();
+        write_msg(&mut send, &Control::Rejected { reason: reason.clone() }).await?;
         send.finish()?;
+        push_attempt(
+            &shared.attempts,
+            IncomingAttempt::new(remote, Some(name.clone()), false, "pairing rejected: wrong or missing code"),
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
         bail!("rejected unpaired viewer {name} at {remote}");
     }
 
-    write_msg(&mut send, &Control::StreamInfo(shared.stream_info.clone())).await?;
+    let stream_info = shared.stream_info.lock().expect("stream info").clone();
+    write_msg(&mut send, &Control::StreamInfo(stream_info)).await?;
+    push_attempt(
+        &shared.attempts,
+        IncomingAttempt::new(remote, Some(name.clone()), true, "connected"),
+    );
     tracing::info!("viewer {name} connected from {remote}");
     if let Some(old) = shared.current.send_replace(Some(conn.clone())) {
         old.close(1u32.into(), b"replaced by another viewer");
@@ -224,6 +270,10 @@ async fn send_loop(mut frames: mpsc::Receiver<OutgoingFrame>, current: watch::Re
             }
         }
         let done_us = now_us();
+        let send_ms = ms(done_us, sent_us);
+        if send_ms > 20.0 {
+            tracing::debug!("QUIC send of frame {} took {send_ms:.1} ms", frame.frame_id);
+        }
         stats.record("capture_to_encoded", ms(frame.encoded_us, frame.capture_us));
         stats.record("encoded_to_sent", ms(sent_us, frame.encoded_us));
         stats.record("send", ms(done_us, sent_us));
@@ -263,37 +313,60 @@ pub struct ViewerSession {
 
 impl ViewerSession {
     pub async fn connect(identity: &Identity, target: &ConnectInfo, viewer_name: &str) -> Result<Self> {
-        let tls = tls::client_config(identity, &target.fingerprint)?;
-        let mut client = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
-        client.transport_config(transport_config());
-        let bind: SocketAddr = if target.addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }.parse()?;
-        let mut endpoint = Endpoint::client(bind)?;
-        endpoint.set_default_client_config(client);
+        Self::connect_traced(identity, target, viewer_name, &ConnectTrace::new(), HANDSHAKE_TIMEOUT).await
+    }
 
-        let conn = endpoint
-            .connect(target.addr, crate::identity::CERT_SERVER_NAME)?
-            .await
-            .with_context(|| format!("connecting to {}", target.addr))?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        write_msg(
-            &mut send,
-            &Control::Hello {
-                protocol: PROTOCOL_VERSION,
-                name: viewer_name.to_owned(),
-                pairing_code: target.pairing_code.clone(),
-            },
-        )
-        .await?;
-        let stream_info = match read_msg(&mut recv).await? {
-            Control::StreamInfo(info) => info,
-            Control::Rejected { reason } => bail!("presenter rejected connection: {reason}"),
-            other => bail!("unexpected reply {other:?}"),
+    pub async fn connect_traced(
+        identity: &Identity,
+        target: &ConnectInfo,
+        viewer_name: &str,
+        trace: &ConnectTrace,
+        handshake_timeout: Duration,
+    ) -> Result<Self> {
+        let addrs = target.candidates();
+        trace.start(
+            ConnectStepId::Resolve,
+            format!("trying {} (UDP)", format_candidates(target)),
+        );
+        if addrs.is_empty() {
+            let msg = "no addresses to try".to_owned();
+            trace.fail(ConnectStepId::Resolve, msg.clone());
+            bail!("{msg}");
+        }
+        trace.ok(
+            ConnectStepId::Resolve,
+            format!("{} address(es): {}", addrs.len(), format_candidates(target)),
+        );
+
+        let mut last_err: Option<anyhow::Error> = None;
+        for (i, addr) in addrs.iter().enumerate() {
+            trace.start(
+                ConnectStepId::Handshake,
+                format!("QUIC handshake to {addr} (UDP), try {}/{}", i + 1, addrs.len()),
+            );
+            match connect_one(identity, target, viewer_name, *addr, trace, handshake_timeout).await {
+                Ok(session) => return Ok(session),
+                Err(e) => {
+                    tracing::warn!("connect to {addr} failed: {e:#}");
+                    if is_logical_reject(&e) {
+                        return Err(e);
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        let cause = last_err
+            .as_ref()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default();
+        let msg = if last_err.as_ref().is_some_and(is_unreachable) || last_err.is_some() {
+            no_answer_message(&addrs, Some(cause.trim()))
+        } else {
+            format!("failed to connect to {}: {cause}", format_candidates(target))
         };
-
-        let clock = Arc::new(Mutex::new(ClockSync::default()));
-        let (control, control_rx) = mpsc::unbounded_channel();
-        tokio::spawn(control_loop(send, recv, control_rx, clock.clone()));
-        Ok(Self { conn, stream_info, clock, control, _endpoint: endpoint })
+        trace.fail(ConnectStepId::Handshake, msg.clone());
+        trace.set_error(msg.clone(), Some(msg.clone()));
+        bail!("{msg}")
     }
 
     pub fn request_keyframe(&self, reason: &str) {
@@ -308,6 +381,135 @@ impl ViewerSession {
         let _ = self.control.send(Control::Bye);
         self.conn.close(0u32.into(), b"viewer closed");
     }
+}
+
+async fn connect_one(
+    identity: &Identity,
+    target: &ConnectInfo,
+    viewer_name: &str,
+    addr: SocketAddr,
+    trace: &ConnectTrace,
+    handshake_timeout: Duration,
+) -> Result<ViewerSession> {
+    let tls = tls::client_config(identity, &target.fingerprint)?;
+    let mut client = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
+    client.transport_config(transport_config());
+    let bind: SocketAddr = if addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    }
+    .parse()?;
+    let mut endpoint = Endpoint::client(bind)?;
+    endpoint.set_default_client_config(client);
+
+    let connecting = endpoint
+        .connect(addr, crate::identity::CERT_SERVER_NAME)
+        .with_context(|| format!("connecting to {addr}"))?;
+    let conn = match tokio::time::timeout(handshake_timeout, connecting).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            let err = anyhow!(e).context(format!("connecting to {addr}"));
+            if is_unreachable(&err) {
+                let msg = no_answer_message(&[addr], Some(&format!("{err:#}")));
+                trace.fail(ConnectStepId::Handshake, msg.clone());
+                bail!("{msg}");
+            }
+            trace.fail(ConnectStepId::Handshake, format!("{err:#}"));
+            return Err(err);
+        }
+        Err(_) => {
+            let msg = no_answer_message(
+                &[addr],
+                Some(&format!("timed out after {}s", handshake_timeout.as_secs())),
+            );
+            trace.fail(ConnectStepId::Handshake, msg.clone());
+            bail!("{msg}");
+        }
+    };
+    trace.ok(ConnectStepId::Handshake, format!("connected to {addr}"));
+
+    match crate::tls::peer_fingerprint(&conn) {
+        Some(fp) if fp.eq_ignore_ascii_case(&target.fingerprint) => {
+            trace.ok(
+                ConnectStepId::Cert,
+                format!("fingerprint matches ({})", short_fingerprint(&fp)),
+            );
+        }
+        Some(fp) => {
+            let msg = format!(
+                "presenter fingerprint mismatch: expected {}, got {}",
+                short_fingerprint(&target.fingerprint),
+                short_fingerprint(&fp)
+            );
+            trace.fail(ConnectStepId::Cert, msg.clone());
+            bail!("{msg}");
+        }
+        None => {
+            let msg = "presenter sent no certificate".to_owned();
+            trace.fail(ConnectStepId::Cert, msg.clone());
+            bail!("{msg}");
+        }
+    }
+
+    trace.start(ConnectStepId::Control, "opening control stream");
+    let (mut send, mut recv) = conn.open_bi().await?;
+    trace.ok(ConnectStepId::Control, "control stream open");
+
+    let pairing_note = if target.pairing_code.as_ref().is_some_and(|c| !c.is_empty()) {
+        "sending pairing code"
+    } else {
+        "no pairing code (already paired, or pairing is off)"
+    };
+    trace.start(ConnectStepId::Pairing, pairing_note);
+    write_msg(
+        &mut send,
+        &Control::Hello {
+            protocol: PROTOCOL_VERSION,
+            name: viewer_name.to_owned(),
+            pairing_code: target.pairing_code.clone(),
+        },
+    )
+    .await?;
+    let stream_info = match tokio::time::timeout(handshake_timeout, read_msg(&mut recv)).await {
+        Ok(Ok(Control::StreamInfo(info))) => {
+            trace.ok(ConnectStepId::Pairing, "accepted");
+            info
+        }
+        Ok(Ok(Control::Rejected { reason })) => {
+            let msg = format!("presenter rejected connection: {reason}");
+            trace.fail(ConnectStepId::Pairing, reason);
+            bail!("{msg}");
+        }
+        Ok(Ok(other)) => {
+            let msg = format!("unexpected reply {other:?}");
+            trace.fail(ConnectStepId::Pairing, msg.clone());
+            bail!("{msg}");
+        }
+        Ok(Err(e)) => {
+            trace.fail(ConnectStepId::Pairing, format!("{e:#}"));
+            return Err(e);
+        }
+        Err(_) => {
+            let msg = no_answer_message(
+                &[addr],
+                Some("timed out waiting for pairing / stream info"),
+            );
+            trace.fail(ConnectStepId::Pairing, msg.clone());
+            bail!("{msg}");
+        }
+    };
+
+    let clock = Arc::new(Mutex::new(ClockSync::default()));
+    let (control, control_rx) = mpsc::unbounded_channel();
+    tokio::spawn(control_loop(send, recv, control_rx, clock.clone()));
+    Ok(ViewerSession {
+        conn,
+        stream_info,
+        clock,
+        control,
+        _endpoint: endpoint,
+    })
 }
 
 async fn control_loop(
@@ -348,5 +550,58 @@ async fn control_loop(
     tokio::select! {
         _ = reader => {}
         _ = writer => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::Identity;
+    use crate::pairing::ConnectInfo;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[tokio::test]
+    async fn connect_timeout_reports_firewall_hint() {
+        let identity = Identity::generate().unwrap();
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = sock.local_addr().unwrap();
+        drop(sock);
+        let target = ConnectInfo {
+            addr,
+            addrs: Vec::new(),
+            fingerprint: identity.fingerprint(),
+            pairing_code: None,
+            name: Some("timeout-test".into()),
+        };
+        let started = std::time::Instant::now();
+        let result = ViewerSession::connect_traced(
+            &identity,
+            &target,
+            "tester",
+            &ConnectTrace::new(),
+            Duration::from_secs(2),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("expected connect to time out"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timeout too long: {:?}",
+            started.elapsed()
+        );
+        assert!(msg.contains(&format!("{addr} (UDP)")), "{msg}");
+        assert!(msg.contains("firewall-cmd"), "{msg}");
+        assert!(msg.contains("QUIC"), "{msg}");
+    }
+
+    #[test]
+    fn no_answer_message_is_stable() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 201, 132)), 47_800);
+        let msg = no_answer_message(&[addr], None);
+        assert!(msg.contains("192.168.201.132:47800 (UDP)"));
+        assert!(msg.contains("sudo firewall-cmd --add-port=47800/udp"));
     }
 }

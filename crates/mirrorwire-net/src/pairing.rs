@@ -10,12 +10,26 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectInfo {
     pub addr: SocketAddr,
+    /// Extra candidate addresses from mDNS, tried after `addr`.
+    pub addrs: Vec<SocketAddr>,
     pub fingerprint: String,
     pub pairing_code: Option<String>,
     pub name: Option<String>,
 }
 
 impl ConnectInfo {
+    /// Unique addresses to try, `addr` first, then `addrs` in order.
+    pub fn candidates(&self) -> Vec<SocketAddr> {
+        let mut out = Vec::with_capacity(1 + self.addrs.len());
+        out.push(self.addr);
+        for a in &self.addrs {
+            if !out.contains(a) {
+                out.push(*a);
+            }
+        }
+        out
+    }
+
     pub fn to_uri(&self) -> String {
         let mut url = url::Url::parse(&format!("mirrorwire://{}", self.addr)).expect("valid socket addr");
         {
@@ -49,6 +63,7 @@ impl ConnectInfo {
         }
         Ok(Self {
             addr: SocketAddr::new(ip, port),
+            addrs: Vec::new(),
             fingerprint,
             pairing_code: params.get("code").cloned(),
             name: params.get("name").cloned(),
@@ -124,13 +139,27 @@ impl PairedViewers {
     }
 }
 
-pub fn primary_ipv4() -> Option<IpAddr> {
-    if_addrs::get_if_addrs()
-        .ok()?
+/// Non-loopback IPv4 addresses, global (or site) first, then link-local.
+pub fn lan_ipv4s() -> Vec<IpAddr> {
+    let mut ips: Vec<IpAddr> = if_addrs::get_if_addrs()
+        .ok()
         .into_iter()
+        .flatten()
         .filter(|i| !i.is_loopback())
         .map(|i| i.ip())
-        .find(IpAddr::is_ipv4)
+        .filter(IpAddr::is_ipv4)
+        .collect();
+    ips.sort_by_key(|ip| match ip {
+        IpAddr::V4(v) if v.is_link_local() => 1,
+        IpAddr::V4(_) => 0,
+        _ => 2,
+    });
+    ips.dedup();
+    ips
+}
+
+pub fn primary_ipv4() -> Option<IpAddr> {
+    lan_ipv4s().into_iter().next()
 }
 
 #[cfg(test)]
@@ -141,10 +170,12 @@ mod tests {
     fn uri_roundtrip() {
         let info = ConnectInfo {
             addr: "192.168.1.20:47800".parse().unwrap(),
+            addrs: Vec::new(),
             fingerprint: "ab".repeat(32),
             pairing_code: Some("012345".into()),
             name: Some("T480s laptop".into()),
         };
+        assert_eq!(info.candidates(), vec![info.addr]);
         let uri = info.to_uri();
         assert!(uri.starts_with("mirrorwire://192.168.1.20:47800?"));
         assert_eq!(ConnectInfo::parse(&uri).unwrap(), info);
@@ -154,5 +185,27 @@ mod tests {
     #[test]
     fn rejects_bad_fingerprint() {
         assert!(ConnectInfo::parse("mirrorwire://127.0.0.1:1?fp=xyz").is_err());
+    }
+
+    #[test]
+    fn lan_ipv4s_omit_loopback() {
+        for ip in lan_ipv4s() {
+            assert!(ip.is_ipv4(), "{ip}");
+            assert!(!ip.is_loopback(), "{ip}");
+        }
+    }
+
+    #[test]
+    fn candidates_dedup_and_preserve_order() {
+        let a: SocketAddr = "192.168.1.2:47800".parse().unwrap();
+        let b: SocketAddr = "10.0.0.5:47800".parse().unwrap();
+        let info = ConnectInfo {
+            addr: a,
+            addrs: vec![a, b, a],
+            fingerprint: "ab".repeat(32),
+            pairing_code: None,
+            name: None,
+        };
+        assert_eq!(info.candidates(), vec![a, b]);
     }
 }

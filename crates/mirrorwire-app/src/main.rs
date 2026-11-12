@@ -1,3 +1,4 @@
+mod applog;
 #[cfg(feature = "gui")]
 mod gui;
 mod presenter;
@@ -79,22 +80,17 @@ pub struct ViewArgs {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,mdns_sd=warn,wgpu=warn,naga=warn,eframe=warn".into()),
-        )
-        .init();
+    let log = applog::init();
     mirrorwire_media::init()?;
     let cli = Cli::parse();
     let config_dir = mirrorwire_net::config_dir(cli.config_dir.as_deref());
     let renderer = resolve_renderer(cli.renderer);
 
     match cli.command {
-        None => run_gui(GuiLaunch::Home, ViewArgs::default(), &config_dir, renderer),
+        None => run_gui(GuiLaunch::Home, ViewArgs::default(), &config_dir, renderer, log, None),
         Some(Command::Present(args)) => presenter::run(args, &config_dir),
         Some(Command::View(args)) if args.headless => viewer::run_headless(args, &config_dir),
-        Some(Command::View(args)) => run_gui(GuiLaunch::View, args, &config_dir, renderer),
+        Some(Command::View(args)) => run_gui(GuiLaunch::View, args, &config_dir, renderer, log, None),
         Some(Command::Discover { seconds }) => {
             let found = mirrorwire_net::discovery::Browser::start()?
                 .browse_for(Duration::from_secs_f64(seconds));
@@ -102,10 +98,15 @@ fn main() -> Result<()> {
                 println!("no presenters found");
             }
             for p in found {
+                let addrs = if p.addrs.is_empty() {
+                    p.addr.to_string()
+                } else {
+                    p.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",")
+                };
                 println!(
                     "{}  {}  {}  {}",
                     p.name,
-                    p.addr,
+                    addrs,
                     p.resolution.unwrap_or_default(),
                     mirrorwire_net::identity::short_fingerprint(&p.fingerprint)
                 );
@@ -154,8 +155,10 @@ fn run_gui(
     args: ViewArgs,
     config_dir: &std::path::Path,
     renderer: RendererChoice,
+    log: applog::LogStore,
+    port: Option<u16>,
 ) -> Result<()> {
-    gui::run(launch, args, config_dir, renderer)
+    gui::run(launch, args, config_dir, renderer, log, port.unwrap_or(mirrorwire_proto::DEFAULT_PORT))
 }
 
 #[cfg(not(feature = "gui"))]
@@ -164,6 +167,8 @@ fn run_gui(
     _args: ViewArgs,
     _config_dir: &std::path::Path,
     _renderer: RendererChoice,
+    _log: applog::LogStore,
+    _port: Option<u16>,
 ) -> Result<()> {
     anyhow::bail!("built without the gui feature; use --headless or a subcommand")
 }

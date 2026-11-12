@@ -26,6 +26,7 @@ common=(
   --disable-everything --disable-debug
   --enable-decoder=h264 --enable-parser=h264
   --enable-swscale
+  --enable-avfilter
 )
 
 if [ "$OS" = Darwin ]; then
@@ -34,6 +35,7 @@ if [ "$OS" = Darwin ]; then
   platform=(
     --enable-videotoolbox
     --enable-encoder=h264_videotoolbox --enable-hwaccel=h264_videotoolbox
+    --enable-filter=buffer,buffersink,format,scale,hwupload,hwdownload,hwmap,null
     --extra-cflags="-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
     --extra-ldflags="-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
   )
@@ -48,6 +50,7 @@ else
   platform=(
     --enable-gpl --enable-libx264 --enable-encoder=libx264
     --enable-vaapi --enable-encoder=h264_vaapi --enable-hwaccel=h264_vaapi
+    --enable-filter=buffer,buffersink,format,scale,hwupload,hwdownload,hwmap,null,scale_vaapi,vpp_vaapi
     --pkg-config-flags=--static
   )
 fi

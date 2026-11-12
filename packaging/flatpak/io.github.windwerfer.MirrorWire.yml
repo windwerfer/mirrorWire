@@ -54,6 +54,8 @@ modules:
       - --enable-decoder=h264
       - --enable-parser=h264
       - --enable-swscale
+      - --enable-avfilter
+      - --enable-filter=buffer,buffersink,format,scale,hwupload,hwdownload,hwmap,null,scale_vaapi,vpp_vaapi
       - --enable-gpl
       - --enable-libx264
       - --enable-encoder=libx264

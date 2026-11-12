@@ -1,3 +1,4 @@
+use crate::pairing::lan_ipv4s;
 use anyhow::Result;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use mirrorwire_proto::MDNS_SERVICE;
@@ -7,7 +8,10 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Presenter {
     pub name: String,
+    /// Preferred address (first LAN IPv4).
     pub addr: SocketAddr,
+    /// Every IPv4 advertised for this presenter, preferred first.
+    pub addrs: Vec<SocketAddr>,
     pub fingerprint: String,
     pub resolution: Option<String>,
 }
@@ -26,15 +30,34 @@ impl Advertisement {
             .and_then(|h| h.into_string().ok())
             .unwrap_or_else(|| "mirrorwire".into());
         let props = [("fp", fingerprint), ("v", "1"), ("res", resolution)];
-        let info = ServiceInfo::new(
-            MDNS_SERVICE,
-            name,
-            &format!("{host}.local."),
-            "",
-            port,
-            &props[..],
-        )?
-        .enable_addr_auto();
+        let ips = lan_ipv4s();
+        let mut info = if ips.is_empty() {
+            ServiceInfo::new(
+                MDNS_SERVICE,
+                name,
+                &format!("{host}.local."),
+                (),
+                port,
+                &props[..],
+            )?
+        } else {
+            tracing::info!(
+                "mDNS advertising {} on UDP port {port}",
+                ips.iter()
+                    .map(|ip| ip.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            ServiceInfo::new(
+                MDNS_SERVICE,
+                name,
+                &format!("{host}.local."),
+                &ips[..],
+                port,
+                &props[..],
+            )?
+        };
+        info = info.enable_addr_auto();
         let fullname = info.get_fullname().to_owned();
         daemon.register(info)?;
         Ok(Self { daemon, fullname })
@@ -84,17 +107,45 @@ impl Browser {
         match event {
             ServiceEvent::ServiceResolved(info) => {
                 let Some(fp) = info.get_property_val_str("fp") else { return };
-                let mut addrs: Vec<IpAddr> = info.get_addresses().iter().map(|a| a.to_ip_addr()).collect();
-                addrs.sort_by_key(|a| (!a.is_ipv4(), a.is_loopback()));
-                let Some(ip) = addrs.first().copied() else { return };
+                let port = info.get_port();
+                let mut ips: Vec<IpAddr> = info.get_addresses().iter().map(|a| a.to_ip_addr()).collect();
+                // Prefer non-loopback IPv4, then link-local IPv4, then anything else.
+                ips.sort_by_key(|a| match a {
+                    IpAddr::V4(v) if a.is_loopback() => 2,
+                    IpAddr::V4(v) if v.is_link_local() => 1,
+                    IpAddr::V4(_) => 0,
+                    _ if a.is_loopback() => 4,
+                    _ => 3,
+                });
+                ips.dedup();
+                let addrs: Vec<SocketAddr> = ips
+                    .iter()
+                    .filter(|ip| ip.is_ipv4() && !ip.is_loopback())
+                    .map(|ip| SocketAddr::new(*ip, port))
+                    .collect();
+                let addrs = if addrs.is_empty() {
+                    ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect()
+                } else {
+                    addrs
+                };
+                let Some(addr) = addrs.first().copied() else { return };
                 let name = info
                     .get_fullname()
                     .trim_end_matches(MDNS_SERVICE)
                     .trim_end_matches('.')
                     .to_owned();
+                tracing::info!(
+                    "mDNS resolved {name} at {}",
+                    addrs
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
                 let presenter = Presenter {
                     name,
-                    addr: SocketAddr::new(ip, info.get_port()),
+                    addr,
+                    addrs,
                     fingerprint: fp.to_owned(),
                     resolution: info.get_property_val_str("res").map(str::to_owned),
                 };

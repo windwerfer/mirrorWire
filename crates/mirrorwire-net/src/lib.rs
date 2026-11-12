@@ -1,3 +1,4 @@
+pub mod diag;
 pub mod discovery;
 pub mod identity;
 pub mod pairing;

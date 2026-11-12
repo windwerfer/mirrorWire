@@ -163,6 +163,9 @@ impl RgbaConverter {
             .as_ref()
             .is_none_or(|(_, f, w, h)| (*f, *w, *h) != key)
         {
+            // Same-size YUV→RGBA: bicubic + accurate chroma siting, so 4:2:0
+            // desktop text is less muddy. The texture stays at the stream's
+            // native width×height; this is not a scale.
             let ctx = scaling::Context::get(
                 key.0,
                 key.1,
@@ -170,7 +173,10 @@ impl RgbaConverter {
                 Pixel::RGBA,
                 key.1,
                 key.2,
-                scaling::Flags::FAST_BILINEAR,
+                scaling::Flags::BICUBIC
+                    | scaling::Flags::ACCURATE_RND
+                    | scaling::Flags::FULL_CHR_H_INT
+                    | scaling::Flags::FULL_CHR_H_INP,
             )?;
             self.ctx = Some((ctx, key.0, key.1, key.2));
             self.out = frame::Video::new(Pixel::RGBA, key.1, key.2);

@@ -8,8 +8,14 @@ Low-latency screen mirroring over a LAN, written in Rust. One binary (`mirrorwir
   works in a Flatpak sandbox. The portal restore token is saved, so the
   "share screen" dialog appears only once.
 - Encode: H.264 through FFmpeg with low-latency settings (no B-frames, no
-  lookahead, IDR on demand, optional intra refresh). VAAPI is tried first on
+  lookahead, IDR on demand, optional intra refresh, High profile). The default
+  output size is the native capture size (the portal's 1920×1080 is no longer
+  scaled to 2000×1000). Default rate control is 40 Mbit/s CBR with a 2-second
+  VBV, using wall-clock PTS so a static desktop still gets enough bits per
+  frame. CQP/ICQ and a live bitrate control are available. VAAPI is tried first on
   Linux, VideoToolbox on macOS, and x264 (`ultrafast` + `zerolatency`) is the fallback.
+  Colour conversion (BGRx→NV12) uses VAAPI VPP (`hwupload` + `scale_vaapi`) when
+  present, otherwise CPU swscale.
 - Transport: QUIC (`quinn`). Video goes as unreliable datagrams (frames are
   fragmented, reassembled, and loss is detected per frame). A reliable control
   stream carries hello/pairing, keyframe requests, and clock pings.
@@ -72,8 +78,18 @@ MirrorWire to find devices on your local network.
 
 Launching the app without arguments opens a start screen with **Present this screen**
 and **View**. Present starts capture and the pairing window (Linux only; the button is
-disabled on macOS until capture exists there). **View** lists presenters as before.
-The CLI subcommands (`present`, `view`, `discover`) still work, including headless tests.
+disabled on macOS until capture exists there). The presenter window shows the pairing
+code, a live quality panel (bitrate, CBR/VBR/CQP/ICQ, keyint), connection attempts,
+and, on Fedora, a hint if firewalld may be blocking UDP 47800. **View** lists
+presenters and, while connecting, a staged status (handshake, certificate, pairing,
+first frame) plus a copyable log. After a timeout it suggests
+`sudo firewall-cmd --add-port=47800/udp`. The CLI subcommands (`present`, `view`,
+`discover`) still work, including headless tests.
+
+Logs are written to `~/Library/Logs/MirrorWire/mirrorwire.log` on macOS and to
+`$XDG_STATE_HOME/mirrorwire/mirrorwire.log` on Linux (under
+`~/.var/app/io.github.windwerfer.MirrorWire/` for the Flatpak). The path is shown
+in the window, with a **Copy log** button.
 
 **Renderer.** The viewer uses wgpu (Metal on macOS, Vulkan/GL on Linux) by default,
 except on macOS x86_64, where it uses OpenGL (`glow`) because older Intel Macs have
@@ -118,9 +134,12 @@ cargo build --release
 ./target/release/mirrorwire present          # portal dialog appears once, then a QR code
 ```
 
-Useful presenter options: `--width 2000 --height 1000 --fps 60 --bitrate-kbps 20000`,
+Useful presenter options: `--fps 60 --bitrate-kbps 40000` (or `--bitrate-mbps 40`),
+`--rc auto|cbr|vbr|cqp|icq`, `--qp 18`, `--keyint` (frames; 0 = 10 s),
 `--encoder auto|vaapi|x264`, `--intra-refresh`, `--source test`, `--no-pairing`, `--port`.
-The frame is scaled to `--width`x`--height`. Set them to the viewer's screen size.
+The default size is the native capture. `--size 1920x1080` (or `--width` / `--height`)
+overrides it and scales. If a viewer finds the presenter but cannot connect, open
+the port on Fedora: `sudo firewall-cmd --add-port=47800/udp`.
 
 ## Build and run: viewer on macOS
 
@@ -136,14 +155,24 @@ Add `--hwdec` for VideoToolbox decoding (falls back to software if it is
 unavailable). On an old Intel Mac without Metal, the viewer defaults to OpenGL;
 `--renderer wgpu` tries Metal first.
  Keys in the viewer: `F` or double-click
-for fullscreen, `S` toggles stats, `Esc` disconnects. Homebrew only supports
+for fullscreen, `S` toggles stats, `1` toggles 1:1 pixel-exact display (nearest
+neighbour, one stream pixel = one framebuffer pixel, taking `pixels_per_point`
+into account), `Esc` disconnects. The stats overlay shows native resolution,
+source fps (portal may send only damage, so this can be well below the configured
+fps), bitrate, decode time, and the window/texture scale factor. The video texture
+is the stream's native size; fit-to-window uses linear filtering.
+
+4:4:4 chroma is not used: Intel UHD 620 VAAPI and VideoToolbox H.264 decode are
+4:2:0-only, so a 4:4:4 encode would not decode in hardware on the iMac.
+
+Homebrew only supports
 recent macOS versions; on an older Mac, build FFmpeg from MacPorts instead and
 point `PKG_CONFIG_PATH` at it.
 
 ## Testing without a screen
 
 ```sh
-scripts/loopback-test.sh 10 --encoder x264            # 10 s, 2000x1000@60
+scripts/loopback-test.sh 10 --encoder x264            # 10 s, native test pattern 1920x1080@60, 40 Mbit/s
 scripts/loopback-test.sh 10 --intra-refresh -- --simulate-loss 0.5
 mirrorwire view --headless --duration 10 '<uri>'          # against a real presenter
 mirrorwire discover                                       # list presenters via mDNS
@@ -161,15 +190,18 @@ overlay also shows capture->texture.
 
 ## Status
 
-Tested on a Debian 13 VM (8 vCPU Xeon, no GPU), loopback:
+Tested on a Debian 13 VM (8 vCPU Xeon, no GPU), loopback (x264 software):
 
-| run | fps | bitrate | capture->decoded mean / p95 | lost |
-|---|---|---|---|---|
-| 2000x1000@60, x264, 20 Mbit/s cap, 30 s | 60.0 | 13.5 Mbit/s | 8.9 / 11.2 ms | 0 |
-| 1920x1080@60, x264, 30 Mbit/s cap, RGBA convert | 59.9 | 16.3 Mbit/s | 9.9 / 12.6 ms | 0 |
+| run | fps | bitrate | capture_to_encoded mean / p95 | capture->decoded mean / p95 | network mean | lost |
+|---|---|---|---|---|---|---|
+| before: 2000×1000@60, 20 Mbit/s cap, 8 s | 59.9 | 14.35 Mbit/s | 6.04 / 6.30 ms | 7.03 / 7.44 ms | 0.23 ms | 0 |
+| after: 1920×1080@60, 40 Mbit/s CBR, 8 s | 59.9 | 37.42 Mbit/s | 6.79 / 8.36 ms | 8.20 / 9.77 ms | 0.29 ms | 0 |
 
-Most of the time is x264 software encoding on the VM CPU (`capture_to_encoded`
-about 7.7 ms). Network plus reassembly on loopback is about 0.3 ms, decode about 0.9 ms.
+Most of the time is x264 software encoding on the VM CPU. Network plus reassembly
+on loopback is about 0.4 ms, decode about 0.9 ms. On real hardware (T480s VAAPI
+presenter, 2011 iMac viewer) the picture was previously scaled from a 1920×1080
+portal to 2000×1000 (wrong aspect, blur) and the bitrate collapsed to ~2.3 Mbit/s
+when the portal only sent 6.8 fps, because PTS advanced by 1/60 s per frame.
 
 | part | state |
 |---|---|
@@ -178,11 +210,12 @@ about 7.7 ms). Network plus reassembly on loopback is about 0.3 ms, decode about
 | QUIC datagram transport, control stream, keyframe recovery | loopback-tested, including simulated loss |
 | pinned TLS, pairing code, paired-viewer memory | tested: wrong fingerprint and missing code are rejected |
 | mDNS announce/browse | tested on one host |
-| egui viewer | runs on the VM (llvmpipe, X11) and shows the stream; OpenGL (glow) is the default on macOS x86_64 |
-| portal + PipeWire capture | compiles, **untested** on a real KDE session |
-| VAAPI encode, VAAPI decode | compiles, **untested** (no GPU on the build VM) |
-| VideoToolbox encode/decode, macOS build | **untested**; software H.264 decode is the fallback |
-| Flatpak, AppImage, macOS .app / DMG builds | built in CI, not yet run on the target machines |
+| egui viewer | runs on the VM (llvmpipe, X11) and on a 2011 iMac (OpenGL / glow, macOS 15 via OCLP) |
+| portal + PipeWire capture | tested on Fedora KDE (T480s, 1920×1080) |
+| VAAPI encode | tested on T480s UHD 620 (`h264_vaapi`); default is now 40 Mbit/s CBR, High profile, native size |
+| VAAPI decode | compiles, unused on the iMac (software H.264 there) |
+| VideoToolbox encode/decode, macOS build | software H.264 decode works on the 2011 iMac |
+| Flatpak, AppImage, macOS .app / DMG builds | built in CI; Flatpak presenter and Intel DMG viewer start on the real machines |
 | camera QR scanning | not started |
 | Android presenter/viewer | later (MediaProjection + MediaCodec via JNI) |
 
@@ -194,8 +227,10 @@ builds use only FFmpeg's LGPL parts plus VideoToolbox.
 
 ## Known limitations and next steps
 
-1. Run on the T480s: portal capture, VAAPI encode, measure on Wi-Fi and cable.
-2. Build the viewer on the actual Mac; choose software vs VideoToolbox decode.
+1. Re-test on the T480s + iMac after this quality/diagnostics build (40 Mbit/s,
+   native 1920×1080, firewall hint, GPU convert when VPP is in the runtime).
+2. If firewalld is running: `sudo firewall-cmd --add-port=47800/udp` (add
+   `--permanent` and reload to keep it).
 3. Forward error correction (Reed-Solomon parity per frame) so single packet
    losses on Wi-Fi do not cost a keyframe or artifacts.
 4. Zero-copy: PipeWire DMA-BUF -> VAAPI surface; VideoToolbox -> Metal texture,

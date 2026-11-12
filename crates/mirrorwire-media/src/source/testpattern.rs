@@ -20,6 +20,8 @@ pub struct TestPattern {
 
 impl TestPattern {
     pub fn new(width: u32, height: u32, fps: u32, limit: Option<u64>) -> Self {
+        let width = if width == 0 { 1920 } else { width };
+        let height = if height == 0 { 1080 } else { height };
         let period = width as usize;
         let mut gradient = Vec::with_capacity(period * 2 * 4);
         for i in 0..period * 2 {
@@ -91,6 +93,10 @@ impl FrameSource for TestPattern {
         };
         self.seq += 1;
         Ok(Some(frame))
+    }
+
+    fn is_finished(&self) -> bool {
+        self.limit.is_some_and(|l| self.seq >= l)
     }
 
     fn recycle(&mut self, buffer: Vec<u8>) {

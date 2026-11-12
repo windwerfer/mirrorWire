@@ -38,6 +38,7 @@ pub struct PortalSource {
     stop_portal: Option<tokio::sync::oneshot::Sender<()>>,
     stop_pw: pw::channel::Sender<()>,
     threads: Vec<JoinHandle<()>>,
+    finished: bool,
 }
 
 impl PortalSource {
@@ -97,6 +98,7 @@ impl PortalSource {
             stop_portal: Some(stop_portal),
             stop_pw,
             threads: vec![portal_thread, pw_thread],
+            finished: false,
         })
     }
 }
@@ -104,6 +106,21 @@ impl PortalSource {
 impl FrameSource for PortalSource {
     fn next_frame(&mut self) -> Result<Option<RawFrame>> {
         Ok(self.frames.recv().ok())
+    }
+
+    fn poll_frame(&mut self, timeout: std::time::Duration) -> Result<Option<RawFrame>> {
+        match self.frames.recv_timeout(timeout) {
+            Ok(frame) => Ok(Some(frame)),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(None),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                self.finished = true;
+                Ok(None)
+            }
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished
     }
 
     fn recycle(&mut self, buffer: Vec<u8>) {

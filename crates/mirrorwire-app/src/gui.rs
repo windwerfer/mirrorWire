@@ -1,8 +1,11 @@
+use crate::applog::LogStore;
 use crate::presenter::{self, PresentPhase, PresenterHandle};
 use crate::viewer::{self, ViewerHandle, ViewerOptions};
 use crate::{GuiLaunch, RendererChoice, ViewArgs};
 use anyhow::{anyhow, Result};
 use eframe::egui;
+use mirrorwire_media::encode::{EncoderConfig, RateControl, DEFAULT_BITRATE_KBPS, DEFAULT_QP};
+use mirrorwire_net::diag::{ConnectStep, FirewallHint, IncomingAttempt, StepState};
 use mirrorwire_net::discovery::{Browser, Presenter};
 use mirrorwire_net::identity::{short_fingerprint, Identity};
 use mirrorwire_net::pairing::ConnectInfo;
@@ -44,6 +47,8 @@ pub fn run(
     args: ViewArgs,
     config_dir: &Path,
     renderer: RendererChoice,
+    log: LogStore,
+    present_port: u16,
 ) -> Result<()> {
     let identity = Arc::new(Identity::load_or_create(config_dir)?);
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -74,6 +79,7 @@ pub fn run(
         let handle = handle.clone();
         let name = name.clone();
         let initial = initial.clone();
+        let log = log.clone();
         let hwdec = args.hwdec;
         move |used: ResolvedRenderer| {
             let identity = identity.clone();
@@ -81,6 +87,7 @@ pub fn run(
             let handle = handle.clone();
             let name = name.clone();
             let initial = initial.clone();
+            let log = log.clone();
             Box::new(move |cc: &eframe::CreationContext<'_>| {
                 let mut app = MirrorApp {
                     identity,
@@ -108,6 +115,14 @@ pub fn run(
                     },
                     renderer: used,
                     can_go_home: !start_in_view,
+                    log,
+                    last_target: None,
+                    present_port,
+                    pixel_exact: false,
+                    bitrate_mbps: DEFAULT_BITRATE_KBPS as f64 / 1000.0,
+                    rc: RateControl::Auto,
+                    qp: DEFAULT_QP,
+                    keyint_sec: 10,
                 };
                 if let Some(target) = initial {
                     app.screen = Screen::View;
@@ -163,6 +178,14 @@ struct MirrorApp {
     screen: Screen,
     renderer: ResolvedRenderer,
     can_go_home: bool,
+    log: LogStore,
+    last_target: Option<ConnectInfo>,
+    present_port: u16,
+    pixel_exact: bool,
+    bitrate_mbps: f64,
+    rc: RateControl,
+    qp: u32,
+    keyint_sec: u32,
 }
 
 impl MirrorApp {
@@ -170,6 +193,7 @@ impl MirrorApp {
         let repaint = ctx.clone();
         self.error = None;
         self.texture = None;
+        self.last_target = Some(target.clone());
         self.watching = Some(viewer::spawn(
             &self.runtime,
             self.identity.clone(),
@@ -204,6 +228,7 @@ impl MirrorApp {
             self.config_dir.clone(),
             (*self.identity).clone(),
             self.name.clone(),
+            self.present_port,
             Some(Arc::new(move || repaint.request_repaint())),
         ));
         self.screen = Screen::Present;
@@ -229,6 +254,7 @@ impl MirrorApp {
             "Renderer: {}  ·  video colour conversion: CPU (swscale YUV→RGBA)",
             self.renderer.label()
         ));
+        ui.weak(format!("Log: {}", self.log.path().display()));
     }
 
     fn home_ui(&mut self, ui: &mut egui::Ui) {
@@ -245,6 +271,11 @@ impl MirrorApp {
             if present.clicked() {
                 self.start_presenting(ui.ctx());
             }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.weak("UDP port:");
+                ui.add(egui::DragValue::new(&mut self.present_port).range(1..=65535));
+            });
             if !PRESENT_AVAILABLE {
                 ui.add_space(4.0);
                 ui.weak("Screen capture is not available on this platform yet.");
@@ -337,6 +368,33 @@ impl MirrorApp {
                 if let Some(fp) = &status.fingerprint {
                     ui.weak(format!("Fingerprint: {}", short_fingerprint(fp)));
                 }
+                ui.weak(format!("UDP port {}", status.port));
+                if !status.advertised.is_empty() {
+                    ui.weak(format!("Advertised: {}", status.advertised.join(", ")));
+                }
+                if let Some(sum) = &status.rc_summary {
+                    ui.weak(sum);
+                }
+                if let Some(conv) = &status.conversion {
+                    ui.weak(format!("Colour conversion: {conv}"));
+                }
+                let hud = &status.hud;
+                if hud.capture_w > 0 {
+                    ui.weak(format!(
+                        "Capture {}x{}  →  encode {}x{}  ·  source {:.1} fps  ·  convert {:.1} ms  encode {:.1} ms",
+                        hud.capture_w,
+                        hud.capture_h,
+                        status.settings.width,
+                        status.settings.height,
+                        hud.source_fps,
+                        hud.convert_ms,
+                        hud.encode_ms
+                    ));
+                }
+                quality_controls(ui, self, &status.settings);
+                firewall_panel(ui, status.firewall.as_ref());
+                attempts_panel(ui, &status.attempts);
+                log_panel(ui, &self.log);
             }
             PresentPhase::Failed => {
                 ui.colored_label(
@@ -386,16 +444,22 @@ impl MirrorApp {
                 if ui.button("Connect").clicked() {
                     chosen = Some(ConnectInfo {
                         addr: p.addr,
+                        addrs: p.addrs.clone(),
                         fingerprint: p.fingerprint.clone(),
                         pairing_code: Some(self.code_input.trim().to_owned())
                             .filter(|c| !c.is_empty()),
                         name: Some(p.name.clone()),
                     });
                 }
+                let addrs = if p.addrs.len() > 1 {
+                    p.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+                } else {
+                    p.addr.to_string()
+                };
                 ui.label(format!(
                     "{}  {}  {}  [{}]",
                     p.name,
-                    p.addr,
+                    addrs,
                     p.resolution.as_deref().unwrap_or(""),
                     short_fingerprint(&p.fingerprint)
                 ));
@@ -413,10 +477,12 @@ impl MirrorApp {
             }
         });
         ui.checkbox(&mut self.hwdec, "Hardware decoding");
+        ui.checkbox(&mut self.pixel_exact, "1:1 pixel-exact display (no scale)");
         ui.weak("If VideoToolbox or VAAPI is missing, the viewer falls back to software H.264 and logs it.");
         if let Some(target) = chosen {
             self.connect(ui.ctx(), target);
         }
+        log_panel(ui, &self.log);
         self.footer(ui);
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(500));
@@ -438,50 +504,65 @@ impl MirrorApp {
                 [f.width as usize, f.height as usize],
                 &f.rgba,
             );
+            let filter = if self.pixel_exact {
+                egui::TextureOptions::NEAREST
+            } else {
+                egui::TextureOptions::LINEAR
+            };
             match &mut self.texture {
-                Some(t) => t.set(image, egui::TextureOptions::LINEAR),
-                None => {
-                    self.texture =
-                        Some(ctx.load_texture("video", image, egui::TextureOptions::LINEAR))
-                }
+                Some(tex) => tex.set(image, filter),
+                None => self.texture = Some(ctx.load_texture("video", image, filter)),
             }
         }
         let status = handle.status.lock().expect("status lock").clone();
 
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+        let ppp = ui.ctx().pixels_per_point();
+        let mut scale_info = String::new();
         if let Some(tex) = &self.texture {
-            let size = tex.size_vec2();
-            let scale = (rect.width() / size.x).min(rect.height() / size.y);
-            let draw = egui::Rect::from_center_size(rect.center(), size * scale);
+            let tex_w = tex.size()[0] as f32;
+            let tex_h = tex.size()[1] as f32;
+            let native_pts = egui::vec2(tex_w / ppp, tex_h / ppp);
+            let draw_size = if self.pixel_exact {
+                native_pts
+            } else {
+                let fit = (rect.width() / native_pts.x).min(rect.height() / native_pts.y);
+                native_pts * fit
+            };
+            let draw = egui::Rect::from_center_size(rect.center(), draw_size);
             ui.painter().image(
                 tex.id(),
                 draw,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
-        } else {
-            let msg = status.error.clone().unwrap_or_else(|| "connecting…".into());
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                msg,
-                egui::FontId::proportional(20.0),
-                egui::Color32::GRAY,
+            let drawn_px = draw_size * ppp;
+            let sx = if tex_w > 0.0 { drawn_px.x / tex_w } else { 1.0 };
+            let sy = if tex_h > 0.0 { drawn_px.y / tex_h } else { 1.0 };
+            scale_info = format!(
+                "texture {tex_w:.0}x{tex_h:.0}  window {:.0}x{:.0} px  ppp {ppp:.2}  scale {sx:.2}x/{sy:.2}x  {}",
+                rect.width() * ppp,
+                rect.height() * ppp,
+                if self.pixel_exact { "1:1 nearest" } else { "fit linear" },
             );
         }
         if self.show_stats {
+            let stream = status.stream.as_ref();
             let text = format!(
-                "{}  |  {}  |  {}  |  capture->texture {:.1} ms\n{}\nS: stats  F / double-click: fullscreen  Esc: disconnect",
-                status
-                    .stream
-                    .as_ref()
-                    .map(|s| format!("{}x{}@{} {} ({})", s.width, s.height, s.fps, s.codec, s.encoder))
-                    .unwrap_or_default(),
+                "{}x{}  source {:.1} fps  {:.2} Mbit/s  {} ({})\n{}  decode {:.2} ms  {}  capture->texture {:.1} ms\n{}\n{}\nS: stats  1: 1:1 pixels  F / double-click: fullscreen  Esc: disconnect",
+                status.native_width.max(stream.map(|s| s.width).unwrap_or(0)),
+                status.native_height.max(stream.map(|s| s.height).unwrap_or(0)),
+                status.source_fps,
+                status.bitrate_mbps,
+                stream.map(|s| s.codec.as_str()).unwrap_or("h264"),
+                stream.map(|s| s.encoder.as_str()).unwrap_or("?"),
                 status.decoder,
+                status.decode_ms,
                 self.renderer.label(),
                 self.display_latency_ms,
-                status.last_second
+                status.last_second,
+                scale_info,
             );
             ui.painter().text(
                 rect.left_top() + egui::vec2(8.0, 8.0),
@@ -493,15 +574,19 @@ impl MirrorApp {
         }
 
         let response = ui.interact(rect, ui.scope_id().with("video"), egui::Sense::click());
-        let (toggle_fs, toggle_stats, leave) = ctx.input(|i| {
+        let (toggle_fs, toggle_stats, toggle_1to1, leave) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::F) || response.double_clicked(),
                 i.key_pressed(egui::Key::S),
+                i.key_pressed(egui::Key::Num1),
                 i.key_pressed(egui::Key::Escape),
             )
         });
         if toggle_stats {
             self.show_stats = !self.show_stats;
+        }
+        if toggle_1to1 {
+            self.pixel_exact = !self.pixel_exact;
         }
         if toggle_fs {
             self.fullscreen = !self.fullscreen;
@@ -511,10 +596,67 @@ impl MirrorApp {
         if leave || failed.is_some() && self.texture.is_some() && !status.connected {
             self.error = failed;
             self.disconnect(&ctx);
-        } else if let Some(err) = failed.filter(|_| self.texture.is_none()) {
-            self.error = Some(err);
-            self.watching = None;
         }
+    }
+
+    fn connecting_ui(&mut self, ui: &mut egui::Ui) {
+        let handle = match &self.watching {
+            Some(h) => h,
+            None => return,
+        };
+        let status = handle.status.lock().expect("status lock").clone();
+        if ui.button("Back").clicked() {
+            self.disconnect(ui.ctx());
+            return;
+        }
+        ui.add_space(8.0);
+        ui.heading("Connecting");
+        if let Some(t) = &self.last_target {
+            ui.monospace(format!(
+                "Target: {}  {}",
+                t.name.clone().unwrap_or_default(),
+                t.addr
+            ));
+        }
+        ui.add_space(8.0);
+        let progress = status.trace.snapshot();
+        for step in &progress.steps {
+            step_row(ui, step);
+        }
+        if let Some(err) = progress.error.as_ref().or(status.error.as_ref()) {
+            ui.add_space(8.0);
+            ui.colored_label(egui::Color32::LIGHT_RED, err);
+            if err.contains("firewall-cmd") {
+                ui.horizontal(|ui| {
+                    if ui.button("Copy firewall command").clicked() {
+                        if let Some(cmd) = err.split("On Fedora:").nth(1) {
+                            ui.ctx().copy_text(cmd.trim().to_owned());
+                        } else {
+                            ui.ctx().copy_text(err.clone());
+                        }
+                    }
+                });
+            }
+        } else {
+            ui.add_space(8.0);
+            ui.label("connecting…");
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Retry").clicked() {
+                if let Some(target) = self.last_target.clone() {
+                    self.disconnect(ui.ctx());
+                    self.connect(ui.ctx(), target);
+                }
+            }
+            if ui.button("Cancel").clicked() {
+                self.disconnect(ui.ctx());
+            }
+        });
+        log_panel(ui, &self.log);
+        self.footer(ui);
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(200));
     }
 }
 
@@ -527,10 +669,13 @@ impl eframe::App for MirrorApp {
             Screen::Present => {
                 egui::CentralPanel::default().show(ui, |ui| self.present_ui(ui));
             }
-            Screen::View if self.watching.is_some() => {
+            Screen::View if self.watching.is_some() && self.texture.is_some() => {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
                     .show(ui, |ui| self.video_ui(ui));
+            }
+            Screen::View if self.watching.is_some() => {
+                egui::CentralPanel::default().show(ui, |ui| self.connecting_ui(ui));
             }
             Screen::View => {
                 egui::CentralPanel::default().show(ui, |ui| self.browse_ui(ui));
@@ -570,3 +715,117 @@ fn qr_color_image(uri: &str) -> Result<egui::ColorImage> {
         &rgba,
     ))
 }
+
+
+fn step_row(ui: &mut egui::Ui, step: &ConnectStep) {
+    let (mark, color) = match step.state {
+        StepState::Pending => ("·", egui::Color32::GRAY),
+        StepState::Active => ("…", egui::Color32::from_rgb(230, 180, 40)),
+        StepState::Ok => ("✓", egui::Color32::from_rgb(0, 180, 80)),
+        StepState::Failed => ("✗", egui::Color32::LIGHT_RED),
+    };
+    ui.horizontal(|ui| {
+        ui.colored_label(color, mark);
+        ui.monospace(step.at.clone().unwrap_or_else(|| "        ".into()));
+        ui.strong(step.id.label());
+        if !step.detail.is_empty() {
+            ui.label(&step.detail);
+        }
+    });
+}
+
+fn log_panel(ui: &mut egui::Ui, log: &LogStore) {
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.weak(format!("Log: {}", log.path().display()));
+        if ui.button("Copy log").clicked() {
+            ui.ctx().copy_text(log.snapshot());
+        }
+    });
+    if let Some(err) = log.open_error() {
+        ui.colored_label(egui::Color32::LIGHT_RED, err);
+    }
+    let mut text = log.snapshot();
+    egui::ScrollArea::vertical()
+        .max_height(180.0)
+        .stick_to_bottom(true)
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut text)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(8)
+                    .font(egui::TextStyle::Monospace)
+                    .interactive(true),
+            );
+        });
+}
+
+fn firewall_panel(ui: &mut egui::Ui, hint: Option<&FirewallHint>) {
+    let Some(hint) = hint.filter(|h| h.show) else { return };
+    ui.add_space(8.0);
+    let color = if hint.prominent {
+        egui::Color32::from_rgb(230, 160, 40)
+    } else {
+        egui::Color32::GRAY
+    };
+    ui.colored_label(color, &hint.message);
+    ui.horizontal(|ui| {
+        ui.monospace(&hint.command);
+        if ui.button("Copy command").clicked() {
+            ui.ctx().copy_text(hint.command.clone());
+        }
+    });
+}
+
+fn attempts_panel(ui: &mut egui::Ui, attempts: &[IncomingAttempt]) {
+    ui.add_space(8.0);
+    ui.strong("Connection attempts");
+    if attempts.is_empty() {
+        ui.weak("No connection attempts received yet");
+        return;
+    }
+    for a in attempts.iter().rev().take(12) {
+        let color = if a.ok {
+            egui::Color32::from_rgb(0, 180, 80)
+        } else {
+            egui::Color32::LIGHT_RED
+        };
+        let name = a.viewer_name.as_deref().unwrap_or("unknown viewer");
+        ui.colored_label(color, format!("{}  {}  {}  {}", a.at, a.peer, name, a.outcome));
+    }
+}
+
+fn quality_controls(ui: &mut egui::Ui, app: &mut MirrorApp, live: &EncoderConfig) {
+    ui.add_space(8.0);
+    ui.strong("Quality");
+    ui.horizontal(|ui| {
+        ui.label("Bitrate (Mbit/s)");
+        ui.add(egui::DragValue::new(&mut app.bitrate_mbps).range(1.0..=80.0).speed(0.5));
+        ui.label("RC");
+        egui::ComboBox::from_id_salt("rc")
+            .selected_text(app.rc.as_str())
+            .show_ui(ui, |ui| {
+                for rc in RateControl::all() {
+                    ui.selectable_value(&mut app.rc, *rc, rc.as_str());
+                }
+            });
+        if matches!(app.rc, RateControl::Cqp | RateControl::Icq) {
+            ui.label("QP");
+            ui.add(egui::DragValue::new(&mut app.qp).range(10..=40));
+        }
+        ui.label("Keyint (s)");
+        ui.add(egui::DragValue::new(&mut app.keyint_sec).range(1..=60));
+        if ui.button("Apply").clicked() {
+            if let Some(h) = &app.presenting {
+                let mut cfg = live.clone();
+                cfg.bitrate_kbps = (app.bitrate_mbps * 1000.0).round().max(1.0) as u32;
+                cfg.rate_control = app.rc;
+                cfg.qp = app.qp;
+                cfg.keyint = Some(app.keyint_sec.saturating_mul(cfg.fps.max(1)));
+                h.apply_settings(cfg);
+            }
+        }
+    });
+    ui.weak("Apply restarts the encoder with an IDR. 4:4:4 chroma is not available with VAAPI on UHD 620 or with VideoToolbox decode.");
+}
+

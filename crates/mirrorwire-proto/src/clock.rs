@@ -8,13 +8,18 @@ pub fn now_us() -> u64 {
 }
 
 /// Estimates `presenter_clock - viewer_clock` from ping/pong samples, keeping the
-/// sample with the smallest round trip as the most trustworthy one.
+/// sample with the smallest round trip as the most trustworthy one. A handful of
+/// the lowest-RTT samples are retained so a single lucky (but slightly skewed)
+/// reading cannot dominate after clocks have settled.
 #[derive(Debug, Default, Clone)]
 pub struct ClockSync {
     best_rtt_us: Option<u64>,
     offset_us: i64,
     samples: u32,
+    best: Vec<(u64, i64)>,
 }
+
+const BEST_KEEP: usize = 8;
 
 impl ClockSync {
     pub fn add_sample(&mut self, t_send_us: u64, t_presenter_us: u64, t_recv_us: u64) {
@@ -22,10 +27,24 @@ impl ClockSync {
         let midpoint = (t_send_us + t_recv_us) / 2;
         let offset = t_presenter_us as i64 - midpoint as i64;
         self.samples += 1;
-        if self.best_rtt_us.is_none_or(|best| rtt <= best) {
-            self.best_rtt_us = Some(rtt);
-            self.offset_us = offset;
+        self.best.push((rtt, offset));
+        self.best.sort_by_key(|(r, _)| *r);
+        if self.best.len() > BEST_KEEP {
+            self.best.truncate(BEST_KEEP);
         }
+        // Prefer the offset from the single best RTT. If several samples share
+        // a similarly low RTT (within 25% or 200 us), use their median offset.
+        let best_rtt = self.best[0].0;
+        let threshold = best_rtt.saturating_add((best_rtt / 4).max(200));
+        let mut offsets: Vec<i64> = self
+            .best
+            .iter()
+            .filter(|(r, _)| *r <= threshold)
+            .map(|(_, o)| *o)
+            .collect();
+        offsets.sort();
+        self.best_rtt_us = Some(best_rtt);
+        self.offset_us = offsets[offsets.len() / 2];
     }
 
     pub fn offset_us(&self) -> i64 {
