@@ -57,7 +57,7 @@ then Artifacts). A `v*` tag also attaches them to a GitHub Release:
 | `MirrorWire-macos-x86_64.zip` | Intel Macs, macOS 10.13 or newer | FFmpeg statically linked, no Homebrew needed |
 | `MirrorWire-macos-arm64.zip` | Apple Silicon Macs, macOS 11 or newer | FFmpeg statically linked |
 | `MirrorWire-x86_64.flatpak` | Linux (Fedora, …) | `flatpak install --user MirrorWire-x86_64.flatpak` |
-| `MirrorWire-x86_64.AppImage` | Linux, glibc 2.35 or newer | needs `libva` and `libpipewire` from the system |
+| `MirrorWire-x86_64.AppImage` | Linux, glibc 2.39 or newer (Fedora 40+, Ubuntu 24.04+) | needs `libva` and `libpipewire` from the system |
 
 **Opening the unsigned Mac app.** The builds are ad-hoc signed, not notarized.
 Unzip, move `MirrorWire.app` to Applications, then right-click it and choose
