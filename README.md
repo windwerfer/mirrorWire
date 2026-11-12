@@ -205,3 +205,8 @@ builds use only FFmpeg's LGPL parts plus VideoToolbox.
 7. QR scanning with the viewer's camera, virtual-monitor (extend) mode via portal.
 8. Optional Miracast sink as a second `VideoSink`.
 9. Android comes later. WebAssembly is out of scope (capture and codecs are native).
+
+## Contributing
+
+Humans and AI agents: read [AGENTS.md](AGENTS.md) first (rules and fixed decisions), then
+[CONTRIBUTING.md](CONTRIBUTING.md) and the maps in [docs/agents/](docs/agents/README.md).
