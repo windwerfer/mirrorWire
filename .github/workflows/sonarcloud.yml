@@ -63,6 +63,9 @@ jobs:
 
       # JSON on stdout is what SonarCloud imports. The Test job already gates
       # on `clippy -D warnings`; this report is for the scanner.
+      # Reports stay at the repo root (not gitignored): the scanner also
+      # respects .gitignore, and workspace modules resolve relative paths
+      # against each crate directory, so the scan step passes absolute paths.
       - name: Clippy report
         if: steps.token.outputs.available == 'true'
         run: cargo clippy --workspace --all-targets --locked --message-format=json > clippy-report.json
@@ -73,9 +76,17 @@ jobs:
         if: steps.token.outputs.available == 'true'
         run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
 
+      - name: Check reports
+        if: steps.token.outputs.available == 'true'
+        run: ls -la clippy-report.json lcov.info
+
       - name: SonarCloud Scan
         if: steps.token.outputs.available == 'true'
         uses: SonarSource/sonarqube-scan-action@e805d875275f728fac1885b413934be6d7c63f65 # v8.4.1
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          args: >
+            -Dsonar.rust.clippyReport.reportPaths=${{ github.workspace }}/clippy-report.json
+            -Dsonar.rust.lcov.reportPaths=${{ github.workspace }}/lcov.info
