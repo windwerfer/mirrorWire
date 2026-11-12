@@ -34,10 +34,10 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: ${{ matrix.min_macos }}
       FFMPEG_PREFIX: ${{ github.workspace }}/.ffmpeg
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install build tools
         run: brew install nasm pkgconf || true
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: ffmpeg-cache
         with:
           path: .ffmpeg
@@ -45,10 +45,11 @@ jobs:
       - name: Build static FFmpeg
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         run: packaging/build-ffmpeg.sh "$FFMPEG_PREFIX"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}-${{ matrix.min_macos }}
       - name: Build
@@ -66,7 +67,7 @@ jobs:
         run: dist/MirrorWire.app/Contents/MacOS/mirrorwire --version
       # archive: false (upload-artifact v7+) uploads the bare .dmg; the artifact
       # name is the filename, so the Actions download is not wrapped in a zip.
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           path: ${{ steps.bundle.outputs.dmg }}
           archive: false
@@ -80,14 +81,14 @@ jobs:
     env:
       FFMPEG_PREFIX: ${{ github.workspace }}/.ffmpeg
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install system packages
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential nasm pkg-config \
             clang libclang-dev libva-dev libpipewire-0.3-dev libspa-0.2-dev libdbus-1-dev \
             libxkbcommon-dev libwayland-dev file
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: ffmpeg-cache
         with:
           path: .ffmpeg
@@ -95,8 +96,10 @@ jobs:
       - name: Build static FFmpeg
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         run: packaging/build-ffmpeg.sh "$FFMPEG_PREFIX"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: appimage
       - name: Build
@@ -107,7 +110,7 @@ jobs:
         run: target/release/mirrorwire --version && ldd target/release/mirrorwire
       - name: Package AppImage
         run: packaging/appimage/build.sh dist
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           path: dist/MirrorWire-x86_64.AppImage
           archive: false
@@ -121,14 +124,14 @@ jobs:
       image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
       options: --privileged
     steps:
-      - uses: actions/checkout@v7
-      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6.8
         with:
           bundle: MirrorWire-x86_64.flatpak
           manifest-path: packaging/flatpak/io.github.windwerfer.MirrorWire.yml
           cache-key: flatpak-builder-${{ hashFiles('packaging/flatpak/*.yml') }}
           upload-artifact: false
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           path: MirrorWire-x86_64.flatpak
           archive: false
@@ -143,7 +146,7 @@ jobs:
       contents: write
     steps:
       # v8 is required to download artifacts uploaded with archive: false.
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           merge-multiple: true

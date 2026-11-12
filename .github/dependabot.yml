@@ -1,0 +1,12 @@
+# Keep GitHub Actions SHA pins and Cargo.lock current. Weekly is enough:
+# cargo audit already runs on every push and on a Monday cron.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly

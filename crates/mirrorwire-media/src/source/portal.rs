@@ -153,7 +153,8 @@ async fn start_session(
 )> {
     let proxy = Screencast::new().await.context("connecting to ScreenCast portal")?;
     let session = proxy.create_session(Default::default()).await?;
-    let restore_token = std::fs::read_to_string(&opts.restore_token_path)
+    let restore_token = tokio::fs::read_to_string(&opts.restore_token_path)
+        .await
         .ok()
         .map(|t| t.trim().to_owned())
         .filter(|t| !t.is_empty());
@@ -184,9 +185,9 @@ async fn start_session(
 
     if let Some(token) = streams.restore_token() {
         if let Some(dir) = opts.restore_token_path.parent() {
-            std::fs::create_dir_all(dir)?;
+            tokio::fs::create_dir_all(dir).await?;
         }
-        std::fs::write(&opts.restore_token_path, token)?;
+        tokio::fs::write(&opts.restore_token_path, token).await?;
     }
 
     let stream = streams

@@ -1,5 +1,14 @@
 # MirrorWire
 
+<p>
+  <a href="https://github.com/windwerfer/mirrorWire/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/windwerfer/mirrorWire/actions/workflows/ci.yml/badge.svg?branch=main&style=flat-square"></a>
+  <a href="https://github.com/windwerfer/mirrorWire/actions/workflows/build.yml"><img alt="Build" src="https://github.com/windwerfer/mirrorWire/actions/workflows/build.yml/badge.svg?branch=main&style=flat-square"></a>
+  <a href="#license"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue?style=flat-square"></a>
+  <br>
+  <a href="https://sonarcloud.io/project/overview?id=windwerfer_mirrorWire"><img alt="Scanned by SonarCloud" src="https://img.shields.io/badge/Scanned_by-SonarCloud-4b9fd5?style=flat-square&logo=sonarqubecloud&logoColor=white"></a>
+  <a href="https://sonarcloud.io/summary/new_code?id=windwerfer_mirrorWire"><img alt="Quality Gate Status" src="https://sonarcloud.io/api/project_badges/measure?project=windwerfer_mirrorWire&metric=alert_status"></a>
+</p>
+
 Low-latency screen mirroring over a LAN, written in Rust. One binary (`mirrorwire`) runs in
 **presenter** mode (captures and encodes the screen) or **viewer** mode
 (receives, decodes and shows it).
@@ -49,8 +58,10 @@ packaging/
   appimage/          AppImage packaging (linuxdeploy)
   linux/, icons/     desktop entry, AppStream metainfo, icon
 .github/workflows/
-  ci.yml             clippy, unit tests, loopback test
+  ci.yml             clippy, unit tests, loopback test, and the supply-chain audit
+  audit.yml          cargo audit and cargo-deny (also a weekly scheduled run)
   build.yml          macOS arm64 + Intel DMG, Flatpak, AppImage; Release on v* tags
+.github/dependabot.yml  weekly updates for Actions SHA pins and Cargo
 ```
 
 ## Downloads
@@ -220,6 +231,25 @@ when the portal only sent 6.8 fps, because PTS advanced by 1/60 s per frame.
 | Flatpak, AppImage, macOS .app / DMG builds | built in CI; Flatpak presenter and Intel DMG viewer start on the real machines |
 | camera QR scanning | not started |
 | Android presenter/viewer | later (MediaProjection + MediaCodec via JNI) |
+
+
+## Security
+
+SonarQube Cloud runs static analysis on `main` after each push (the Free plan
+does not analyze pull requests). `cargo audit` and `cargo deny` run on every
+push and pull request, and again on a weekly schedule; the Build workflow
+waits for those checks and will not publish artifacts if they fail. GitHub
+Actions are pinned to full commit SHAs and updated by Dependabot. Downloads
+in the packaging scripts are fetched over HTTPS and checked against pinned
+SHA-256 digests.
+
+The transport is QUIC with TLS 1.3: each install generates a self-signed
+certificate, the viewer pins the presenter's SHA-256 fingerprint, and the
+presenter only streams to a viewer that has shown the pairing code once.
+macOS builds are ad-hoc signed and not notarized, so Gatekeeper will warn
+on first launch (see [Downloads](#downloads)).
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## License
 
