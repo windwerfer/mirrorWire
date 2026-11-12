@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>MirrorWire</string>
+  <key>CFBundleDisplayName</key><string>MirrorWire</string>
+  <key>CFBundleIdentifier</key><string>io.github.windwerfer.MirrorWire</string>
+  <key>CFBundleExecutable</key><string>mirrorwire</string>
+  <key>CFBundleIconFile</key><string>MirrorWire</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>@VERSION@</string>
+  <key>CFBundleVersion</key><string>@VERSION@</string>
+  <key>LSMinimumSystemVersion</key><string>@MIN_MACOS@</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSLocalNetworkUsageDescription</key><string>MirrorWire finds and connects to screens shared on your local network.</string>
+  <key>NSBonjourServices</key><array><string>_mirrorwire._udp</string></array>
+</dict>
+</plist>

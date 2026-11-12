@@ -1,0 +1,24 @@
+[package]
+name = "mirrorwire-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+portal = ["dep:ashpd", "dep:pipewire"]
+static-ffmpeg = ["ffmpeg-next/static"]
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+crossbeam-channel.workspace = true
+tracing.workspace = true
+ffmpeg-next = "9"
+mirrorwire-proto = { path = "../mirrorwire-proto" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.14", optional = true, default-features = false, features = ["tokio", "screencast"] }
+pipewire = { version = "0.10", optional = true }
+tokio = { workspace = true, optional = false }

@@ -1,0 +1,30 @@
+[package]
+name = "mirrorwire-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "mirrorwire"
+path = "src/main.rs"
+
+[features]
+default = ["gui", "portal"]
+gui = ["dep:eframe"]
+portal = ["mirrorwire-media/portal"]
+static-ffmpeg = ["mirrorwire-media/static-ffmpeg"]
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+crossbeam-channel.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hostname = "0.4"
+clap = { version = "4", features = ["derive"] }
+mirrorwire-proto = { path = "../mirrorwire-proto" }
+mirrorwire-media = { path = "../mirrorwire-media" }
+mirrorwire-net = { path = "../mirrorwire-net" }
+eframe = { version = "0.37", optional = true, default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }

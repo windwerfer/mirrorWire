@@ -3,8 +3,8 @@
 # usage: scripts/loopback-test.sh [seconds] [presenter args...] [-- viewer args...]
 set -euo pipefail
 cd "$(dirname "$0")/.."
-cargo build --release -q -p mirror-app --no-default-features
-BIN=target/release/mirror
+cargo build --release -q -p mirrorwire-app --no-default-features
+BIN=target/release/mirrorwire
 DUR=${1:-10}; shift || true
 PA=(); while [ $# -gt 0 ] && [ "$1" != "--" ]; do PA+=("$1"); shift; done
 [ $# -gt 0 ] && shift

@@ -1994,7 +1994,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mirror-app"
+name = "mirrorwire-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2003,16 +2003,16 @@ dependencies = [
  "crossbeam-channel",
  "eframe",
  "hostname",
- "mirror-media",
- "mirror-net",
- "mirror-proto",
+ "mirrorwire-media",
+ "mirrorwire-net",
+ "mirrorwire-proto",
  "tokio",
  "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
-name = "mirror-media"
+name = "mirrorwire-media"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2020,14 +2020,14 @@ dependencies = [
  "bytes",
  "crossbeam-channel",
  "ffmpeg-next",
- "mirror-proto",
+ "mirrorwire-proto",
  "pipewire",
  "tokio",
  "tracing",
 ]
 
 [[package]]
-name = "mirror-net"
+name = "mirrorwire-net"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2038,7 +2038,7 @@ dependencies = [
  "hostname",
  "if-addrs",
  "mdns-sd",
- "mirror-proto",
+ "mirrorwire-proto",
  "qrcode",
  "quinn",
  "rcgen",
@@ -2052,7 +2052,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mirror-proto"
+name = "mirrorwire-proto"
 version = "0.1.0"
 dependencies = [
  "anyhow",

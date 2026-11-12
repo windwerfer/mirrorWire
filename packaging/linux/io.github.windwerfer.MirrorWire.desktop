@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=MirrorWire
+GenericName=Screen Mirroring
+Comment=Low-latency screen mirroring over your local network
+Exec=mirrorwire
+Icon=io.github.windwerfer.MirrorWire
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=screen;mirror;cast;stream;display;

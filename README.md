@@ -1,6 +1,6 @@
-# mirror
+# MirrorWire
 
-Low-latency screen mirroring over a LAN, written in Rust. One binary runs in
+Low-latency screen mirroring over a LAN, written in Rust. One binary (`mirrorwire`) runs in
 **presenter** mode (captures and encodes the screen) or **viewer** mode
 (receives, decodes and shows it).
 
@@ -17,8 +17,8 @@ Low-latency screen mirroring over a LAN, written in Rust. One binary runs in
   pins the presenter's SHA-256 fingerprint (from the QR code or mDNS). The
   presenter only streams to viewers that have shown the pairing code once; it
   remembers their certificate after that (`paired_viewers.json`).
-- Discovery: mDNS (`_mirror._udp.local.`) plus a QR code with a
-  `mirror://ip:port?fp=…&code=…&name=…` URI.
+- Discovery: mDNS (`_mirrorwire._udp.local.`) plus a QR code with a
+  `mirrorwire://ip:port?fp=…&code=…&name=…` URI.
 - Viewer UI: eframe/egui on wgpu (Metal on macOS, Vulkan/GL on Linux), with a list
   of discovered presenters, a box to paste a URI, the video, and a stats overlay.
 
@@ -26,19 +26,61 @@ Low-latency screen mirroring over a LAN, written in Rust. One binary runs in
 
 ```
 crates/
-  mirror-proto   wire format: datagram fragmentation/reassembly, control messages,
+  mirrorwire-proto   wire format: datagram fragmentation/reassembly, control messages,
                  clock-offset estimation, latency statistics (no I/O)
-  mirror-media   frame sources (test pattern, portal/PipeWire), H.264 encoder and
+  mirrorwire-media   frame sources (test pattern, portal/PipeWire), H.264 encoder and
                  decoder (FFmpeg, VAAPI/VideoToolbox/x264), capture->encode pipeline
                  and the VideoSink trait
-  mirror-net     identity/certificates, pinned TLS, QUIC presenter/viewer sessions,
+  mirrorwire-net     identity/certificates, pinned TLS, QUIC presenter/viewer sessions,
                  mDNS, QR/URI pairing
-  mirror-app     the `mirror` binary: CLI, presenter, headless viewer, egui viewer
+  mirrorwire-app     the `mirrorwire` binary: CLI, presenter, headless viewer, egui viewer
 scripts/
   loopback-test.sh   test pattern -> QUIC -> headless viewer on localhost
+packaging/
+  build-ffmpeg.sh    minimal static FFmpeg (+ x264 on Linux) used by all release builds
+  macos/             .app bundling (Info.plist, icon, ad-hoc signing)
+  flatpak/           Flatpak manifest
+  appimage/          AppImage packaging (linuxdeploy)
+  linux/, icons/     desktop entry, AppStream metainfo, icon
+.github/workflows/
+  ci.yml             clippy, unit tests, loopback test
+  build.yml          macOS arm64 + Intel .app, Flatpak, AppImage; Release on v* tags
 ```
 
-`mirror-media` does not depend on `mirror-net`. The presenter pushes encoded frames
+## Downloads
+
+Every push to `main` builds these in GitHub Actions (Actions tab, then the run,
+then Artifacts). A `v*` tag also attaches them to a GitHub Release:
+
+| artifact | for | notes |
+|---|---|---|
+| `MirrorWire-macos-x86_64.zip` | Intel Macs, macOS 10.13 or newer | FFmpeg statically linked, no Homebrew needed |
+| `MirrorWire-macos-arm64.zip` | Apple Silicon Macs, macOS 11 or newer | FFmpeg statically linked |
+| `MirrorWire-x86_64.flatpak` | Linux (Fedora, …) | `flatpak install --user MirrorWire-x86_64.flatpak` |
+| `MirrorWire-x86_64.AppImage` | Linux, glibc 2.35 or newer | needs `libva` and `libpipewire` from the system |
+
+**Opening the unsigned Mac app.** The builds are ad-hoc signed, not notarized.
+Unzip, move `MirrorWire.app` to Applications, then right-click it and choose
+**Open**, then **Open** again. On macOS 15 or newer, double-click once, then go to
+System Settings, Privacy & Security, and click **Open Anyway**. In a terminal,
+`xattr -dr com.apple.quarantine /Applications/MirrorWire.app` does the same. When
+asked, allow MirrorWire to find devices on your local network.
+
+Launching the app without arguments opens the viewer. The presenter runs from a terminal:
+
+```sh
+flatpak run io.github.windwerfer.MirrorWire present     # Flatpak
+./MirrorWire-x86_64.AppImage present                     # AppImage
+/Applications/MirrorWire.app/Contents/MacOS/mirrorwire view --hwdec   # Mac viewer from a terminal
+```
+
+**Flatpak permissions:** `--socket=wayland`, `--socket=fallback-x11`, `--share=ipc`
+(for X11 only), `--share=network` (QUIC and mDNS), and `--device=dri` (VAAPI and GPU
+rendering). There is no host filesystem access. Screen capture goes through the
+ScreenCast portal, which needs no extra permission. Settings live in
+`~/.var/app/io.github.windwerfer.MirrorWire/config/mirrorwire`.
+
+`mirrorwire-media` does not depend on `mirrorwire-net`. The presenter pushes encoded frames
 into a `VideoSink`; the QUIC transport is one implementation, and a Miracast/RTSP
 sink can be added next to it later.
 
@@ -55,7 +97,7 @@ vainfo | grep -i enc          # expect H264 VAEntrypointEncSlice lines
 
 curl https://sh.rustup.rs -sSf | sh     # if Rust is not installed yet
 cargo build --release
-./target/release/mirror present          # portal dialog appears once, then a QR code
+./target/release/mirrorwire present          # portal dialog appears once, then a QR code
 ```
 
 Useful presenter options: `--width 2000 --height 1000 --fps 60 --bitrate-kbps 20000`,
@@ -67,9 +109,9 @@ The frame is scaled to `--width`x`--height`. Set them to the viewer's screen siz
 ```sh
 brew install ffmpeg pkg-config
 curl https://sh.rustup.rs -sSf | sh
-cargo build --release -p mirror-app --no-default-features --features gui
-./target/release/mirror view              # pick a discovered presenter, enter pairing code once
-./target/release/mirror view 'mirror://192.168.1.20:47800?fp=…&code=…'
+cargo build --release -p mirrorwire-app --no-default-features --features gui
+./target/release/mirrorwire view              # pick a discovered presenter, enter pairing code once
+./target/release/mirrorwire view 'mirrorwire://192.168.1.20:47800?fp=…&code=…'
 ```
 
 Add `--hwdec` for VideoToolbox decoding. Keys in the viewer: `F` or double-click
@@ -82,8 +124,8 @@ point `PKG_CONFIG_PATH` at it.
 ```sh
 scripts/loopback-test.sh 10 --encoder x264            # 10 s, 2000x1000@60
 scripts/loopback-test.sh 10 --intra-refresh -- --simulate-loss 0.5
-mirror view --headless --duration 10 '<uri>'          # against a real presenter
-mirror discover                                       # list presenters via mDNS
+mirrorwire view --headless --duration 10 '<uri>'          # against a real presenter
+mirrorwire discover                                       # list presenters via mDNS
 ```
 
 The test pattern writes its frame number into the image as black/white blocks.
@@ -119,7 +161,15 @@ about 7.7 ms). Network plus reassembly on loopback is about 0.3 ms, decode about
 | portal + PipeWire capture | compiles, **untested** on a real KDE session |
 | VAAPI encode, VAAPI decode | compiles, **untested** (no GPU on the build VM) |
 | VideoToolbox encode/decode, macOS build | **untested** |
-| Flatpak packaging, camera QR scanning | not started |
+| Flatpak, AppImage, macOS .app builds | built in CI, not yet run on the target machines |
+| camera QR scanning | not started |
+| Android presenter/viewer | later (MediaProjection + MediaCodec via JNI) |
+
+## License
+
+The source is MIT OR Apache-2.0. The Linux release builds statically link x264
+(GPL-2.0-or-later), so those binaries are distributed under the GPL. The macOS
+builds use only FFmpeg's LGPL parts plus VideoToolbox.
 
 ## Known limitations and next steps
 
@@ -130,6 +180,7 @@ about 7.7 ms). Network plus reassembly on loopback is about 0.3 ms, decode about
 4. Zero-copy: PipeWire DMA-BUF -> VAAPI surface; VideoToolbox -> Metal texture,
    YUV->RGB in a wgpu shader instead of swscale + egui texture upload.
 5. Adaptive bitrate from QUIC RTT/loss stats.
-6. Flatpak manifest (org.freedesktop.Platform + ffmpeg-full extension), macOS app bundle.
+6. Vendor cargo sources (flatpak-cargo-generator) for a Flathub submission; notarized Mac builds.
 7. QR scanning with the viewer's camera, virtual-monitor (extend) mode via portal.
 8. Optional Miracast sink as a second `VideoSink`.
+9. Android comes later. WebAssembly is out of scope (capture and codecs are native).

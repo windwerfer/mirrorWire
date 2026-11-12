@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.windwerfer.MirrorWire</id>
+  <name>MirrorWire</name>
+  <summary>Low-latency screen mirroring over your local network</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-2.0-or-later</project_license>
+  <description>
+    <p>
+      Share a screen to another computer on the same network with only a few
+      milliseconds of delay. Screen capture goes through the desktop portal, video is
+      hardware-encoded H.264, and the stream travels over encrypted QUIC.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.windwerfer.MirrorWire.desktop</launchable>
+  <url type="homepage">https://github.com/windwerfer/mirrorWire</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-11-12"/>
+  </releases>
+</component>
