@@ -3,6 +3,8 @@ mod applog;
 mod gui;
 mod presenter;
 mod viewer;
+#[cfg(feature = "gui")]
+mod yuv_glow;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -55,7 +57,7 @@ enum Command {
     },
 }
 
-#[derive(Args, Default)]
+#[derive(Args)]
 pub struct ViewArgs {
     /// mirrorwire:// URI from the presenter's QR code. Without it, the GUI shows discovered presenters.
     pub uri: Option<String>,
@@ -66,8 +68,13 @@ pub struct ViewArgs {
     #[arg(long)]
     pub duration: Option<f64>,
     /// Use hardware decoding (VideoToolbox on macOS, VAAPI on Linux).
-    #[arg(long)]
+    /// Defaults to on on macOS; falls back to software if the GPU cannot
+    /// decode H.264 (a 2011 HD 6770M on OCLP often cannot).
+    #[arg(long, default_value_t = cfg!(target_os = "macos"))]
     pub hwdec: bool,
+    /// Force the software H.264 decoder.
+    #[arg(long, overrides_with = "hwdec")]
+    pub software_decode: bool,
     /// Convert decoded frames to RGBA in headless mode too, to measure that cost.
     #[arg(long)]
     pub rgba: bool,
@@ -77,6 +84,31 @@ pub struct ViewArgs {
     /// Name shown to the presenter.
     #[arg(long)]
     pub name: Option<String>,
+}
+
+impl Default for ViewArgs {
+    fn default() -> Self {
+        Self {
+            uri: None,
+            headless: false,
+            duration: None,
+            hwdec: cfg!(target_os = "macos"),
+            software_decode: false,
+            rgba: false,
+            simulate_loss: 0.0,
+            name: None,
+        }
+    }
+}
+
+impl ViewArgs {
+    pub fn want_hwdec(&self) -> bool {
+        if self.software_decode {
+            false
+        } else {
+            self.hwdec
+        }
+    }
 }
 
 fn main() -> Result<()> {

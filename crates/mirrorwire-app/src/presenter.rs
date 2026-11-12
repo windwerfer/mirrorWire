@@ -165,9 +165,10 @@ pub enum PresentPhase {
 #[cfg(feature = "gui")]
 #[derive(Debug, Clone)]
 pub struct EncodeHud {
+    pub pack_ms: f64,
     pub convert_ms: f64,
+    pub upload_ms: f64,
     pub encode_ms: f64,
-    #[allow(dead_code)]
     pub path: String,
     pub capture_w: u32,
     pub capture_h: u32,
@@ -178,7 +179,9 @@ pub struct EncodeHud {
 impl Default for EncodeHud {
     fn default() -> Self {
         Self {
+            pack_ms: 0.0,
             convert_ms: 0.0,
+            upload_ms: 0.0,
             encode_ms: 0.0,
             path: String::new(),
             capture_w: 0,
@@ -509,7 +512,9 @@ fn present_session(
 /// Timings the encode loop updates; the GUI polls them.
 #[derive(Debug, Clone, Default)]
 struct EncodeHudShim {
+    pack_ms: f64,
     convert_ms: f64,
+    upload_ms: f64,
     encode_ms: f64,
     path: String,
     output_w: u32,
@@ -524,8 +529,10 @@ struct EncodeHudShim {
 
 impl EncodeHudShim {
     fn note_frame(&mut self, enc: &mirrorwire_media::encode::Encoder, capture_w: u32, capture_h: u32) {
-        let (c, e) = enc.last_timings_ms();
+        let (p, c, u, e) = enc.last_breakdown_ms();
+        self.pack_ms = p;
         self.convert_ms = c;
+        self.upload_ms = u;
         self.encode_ms = e;
         self.path = enc.conversion_path().to_owned();
         let (w, h) = enc.output_size();
@@ -540,6 +547,17 @@ impl EncodeHudShim {
         let elapsed = now.saturating_duration_since(start);
         if elapsed >= std::time::Duration::from_secs(1) {
             self.source_fps = self.frames_window as f64 / elapsed.as_secs_f64();
+            tracing::info!(
+                "encoder {}  {}x{}  source {:.1} fps  pack {:.2} ms  convert {:.2} ms  upload {:.2} ms  encode {:.2} ms",
+                self.path,
+                self.capture_w,
+                self.capture_h,
+                self.source_fps,
+                self.pack_ms,
+                self.convert_ms,
+                self.upload_ms,
+                self.encode_ms
+            );
             self.frames_window = 0;
             self.window_start = Some(now);
         }
@@ -548,7 +566,9 @@ impl EncodeHudShim {
     #[cfg(feature = "gui")]
     fn to_hud(&self) -> EncodeHud {
         EncodeHud {
+            pack_ms: self.pack_ms,
             convert_ms: self.convert_ms,
+            upload_ms: self.upload_ms,
             encode_ms: self.encode_ms,
             path: self.path.clone(),
             capture_w: self.capture_w,

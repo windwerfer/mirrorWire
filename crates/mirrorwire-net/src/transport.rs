@@ -26,11 +26,17 @@ use tokio::sync::{mpsc, watch};
 
 fn transport_config() -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
-    t.datagram_receive_buffer_size(Some(16 << 20));
-    t.datagram_send_buffer_size(4 << 20);
+    t.datagram_receive_buffer_size(Some(32 << 20));
+    t.datagram_send_buffer_size(16 << 20);
+    t.send_window(8 * 1024 * 1024);
+    t.receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
+    t.stream_receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024));
+    // Default initial RTT is 333 ms, which paces a small window down to
+    // tens of kilobits. A LAN RTT is a couple of milliseconds.
+    t.initial_rtt(Duration::from_millis(2));
     t.keep_alive_interval(Some(Duration::from_secs(1)));
     t.max_idle_timeout(Some(Duration::from_secs(10).try_into().expect("valid idle timeout")));
-    t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    t.congestion_controller_factory(crate::lan_cc::factory());
     Arc::new(t)
 }
 
@@ -263,16 +269,28 @@ async fn send_loop(mut frames: mpsc::Receiver<OutgoingFrame>, current: watch::Re
             encoded_us: frame.encoded_us,
             sent_us,
         };
+        // Burst every fragment. send_datagram queues immediately; only wait
+        // when the datagram send buffer is full so a frame is not paced out
+        // one packet at a time.
+        let mut send_err = false;
         for datagram in fragment(frame.frame_id, frame.keyframe, timing, &frame.data, max) {
+            if conn.send_datagram(datagram.clone()).is_ok() {
+                continue;
+            }
             if let Err(e) = conn.send_datagram_wait(datagram).await {
                 tracing::debug!("datagram send failed: {e}");
+                send_err = true;
                 break;
             }
         }
         let done_us = now_us();
         let send_ms = ms(done_us, sent_us);
-        if send_ms > 20.0 {
-            tracing::debug!("QUIC send of frame {} took {send_ms:.1} ms", frame.frame_id);
+        if send_ms > 8.0 || send_err {
+            tracing::info!(
+                "QUIC send of frame {} took {send_ms:.1} ms{}",
+                frame.frame_id,
+                if send_err { " (truncated)" } else { "" }
+            );
         }
         stats.record("capture_to_encoded", ms(frame.encoded_us, frame.capture_us));
         stats.record("encoded_to_sent", ms(sent_us, frame.encoded_us));

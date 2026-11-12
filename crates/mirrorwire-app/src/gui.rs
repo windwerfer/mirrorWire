@@ -1,6 +1,7 @@
 use crate::applog::LogStore;
 use crate::presenter::{self, PresentPhase, PresenterHandle};
-use crate::viewer::{self, ViewerHandle, ViewerOptions};
+use crate::viewer::{self, viewer_ui, Picture, ViewerHandle, ViewerOptions, ViewerUi};
+use crate::yuv_glow::{YuvPaint, YuvRenderer};
 use crate::{GuiLaunch, RendererChoice, ViewArgs};
 use anyhow::{anyhow, Result};
 use eframe::egui;
@@ -10,7 +11,8 @@ use mirrorwire_net::discovery::{Browser, Presenter};
 use mirrorwire_net::identity::{short_fingerprint, Identity};
 use mirrorwire_net::pairing::ConnectInfo;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 const PRESENT_AVAILABLE: bool = cfg!(all(target_os = "linux", feature = "portal"));
 
@@ -80,7 +82,7 @@ pub fn run(
         let name = name.clone();
         let initial = initial.clone();
         let log = log.clone();
-        let hwdec = args.hwdec;
+        let hwdec = args.want_hwdec();
         move |used: ResolvedRenderer| {
             let identity = identity.clone();
             let config_dir = config_dir.clone();
@@ -119,6 +121,9 @@ pub fn run(
                     last_target: None,
                     present_port,
                     pixel_exact: false,
+                    yuv: None,
+                    yuv_gpu: Arc::new(Mutex::new(None)),
+                    copy_note: None,
                     bitrate_mbps: DEFAULT_BITRATE_KBPS as f64 / 1000.0,
                     rc: RateControl::Auto,
                     qp: DEFAULT_QP,
@@ -182,6 +187,9 @@ struct MirrorApp {
     last_target: Option<ConnectInfo>,
     present_port: u16,
     pixel_exact: bool,
+    yuv: Option<Arc<mirrorwire_media::decode::YuvImage>>,
+    yuv_gpu: Arc<Mutex<Option<YuvRenderer>>>,
+    copy_note: Option<(Instant, bool, String)>,
     bitrate_mbps: f64,
     rc: RateControl,
     qp: u32,
@@ -193,6 +201,7 @@ impl MirrorApp {
         let repaint = ctx.clone();
         self.error = None;
         self.texture = None;
+        self.yuv = None;
         self.last_target = Some(target.clone());
         self.watching = Some(viewer::spawn(
             &self.runtime,
@@ -201,7 +210,7 @@ impl MirrorApp {
             ViewerOptions {
                 hwdec: self.hwdec,
                 simulate_loss: 0.0,
-                rgba: true,
+                rgba: self.renderer != ResolvedRenderer::Glow,
                 name: self.name.clone(),
             },
             Some(Arc::new(move || repaint.request_repaint())),
@@ -213,6 +222,7 @@ impl MirrorApp {
             h.stop();
         }
         self.texture = None;
+        self.yuv = None;
         if self.fullscreen {
             self.fullscreen = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
@@ -347,8 +357,9 @@ impl MirrorApp {
                     ui.add_space(4.0);
                     ui.monospace(uri);
                     if ui.button("Copy link").clicked() {
-                        ui.ctx().copy_text(uri.clone());
+                        copy_with_feedback(ui.ctx(), uri.clone(), &mut self.copy_note);
                     }
+                    show_copy_note(ui, &self.copy_note);
                 }
                 ui.add_space(8.0);
                 if status.viewer_connected {
@@ -381,20 +392,23 @@ impl MirrorApp {
                 let hud = &status.hud;
                 if hud.capture_w > 0 {
                     ui.weak(format!(
-                        "Capture {}x{}  →  encode {}x{}  ·  source {:.1} fps  ·  convert {:.1} ms  encode {:.1} ms",
+                        "Capture {}x{}  →  encode {}x{}  ·  source {:.1} fps  ·  {}  pack {:.1} ms  convert {:.1} ms  upload {:.1} ms  encode {:.1} ms",
                         hud.capture_w,
                         hud.capture_h,
                         status.settings.width,
                         status.settings.height,
                         hud.source_fps,
+                        hud.path,
+                        hud.pack_ms,
                         hud.convert_ms,
+                        hud.upload_ms,
                         hud.encode_ms
                     ));
                 }
                 quality_controls(ui, self, &status.settings);
-                firewall_panel(ui, status.firewall.as_ref());
+                firewall_panel(ui, status.firewall.as_ref(), &mut self.copy_note);
                 attempts_panel(ui, &status.attempts);
-                log_panel(ui, &self.log);
+                log_panel(ui, &self.log, &mut self.copy_note);
             }
             PresentPhase::Failed => {
                 ui.colored_label(
@@ -476,13 +490,16 @@ impl MirrorApp {
                 }
             }
         });
-        ui.checkbox(&mut self.hwdec, "Hardware decoding");
+        ui.checkbox(
+            &mut self.hwdec,
+            "Hardware decoding (VideoToolbox / VAAPI, software fallback)",
+        );
         ui.checkbox(&mut self.pixel_exact, "1:1 pixel-exact display (no scale)");
-        ui.weak("If VideoToolbox or VAAPI is missing, the viewer falls back to software H.264 and logs it.");
+        ui.weak("On macOS, VideoToolbox is the default. An older GPU (HD 6770M on OCLP) may not decode H.264; the viewer then uses a tuned software decoder and shows which one is active.");
         if let Some(target) = chosen {
             self.connect(ui.ctx(), target);
         }
-        log_panel(ui, &self.log);
+        log_panel(ui, &self.log, &mut self.copy_note);
         self.footer(ui);
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(500));
@@ -500,18 +517,27 @@ impl MirrorApp {
                 mirrorwire_proto::clock::now_us(),
                 f.capture_us_viewer,
             );
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [f.width as usize, f.height as usize],
-                &f.rgba,
-            );
-            let filter = if self.pixel_exact {
-                egui::TextureOptions::NEAREST
-            } else {
-                egui::TextureOptions::LINEAR
-            };
-            match &mut self.texture {
-                Some(tex) => tex.set(image, filter),
-                None => self.texture = Some(ctx.load_texture("video", image, filter)),
+            match f.picture {
+                Picture::Rgba(rgba) => {
+                    let image = egui::ColorImage::from_rgba_unmultiplied(
+                        [f.width as usize, f.height as usize],
+                        &rgba,
+                    );
+                    let filter = if self.pixel_exact {
+                        egui::TextureOptions::NEAREST
+                    } else {
+                        egui::TextureOptions::LINEAR
+                    };
+                    match &mut self.texture {
+                        Some(tex) => tex.set(image, filter),
+                        None => self.texture = Some(ctx.load_texture("video", image, filter)),
+                    }
+                    self.yuv = None;
+                }
+                Picture::Yuv(img) => {
+                    self.yuv = Some(Arc::new(img));
+                    self.texture = None;
+                }
             }
         }
         let status = handle.status.lock().expect("status lock").clone();
@@ -520,9 +546,14 @@ impl MirrorApp {
         ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
         let ppp = ui.ctx().pixels_per_point();
         let mut scale_info = String::new();
-        if let Some(tex) = &self.texture {
-            let tex_w = tex.size()[0] as f32;
-            let tex_h = tex.size()[1] as f32;
+        let (tex_w, tex_h) = if let Some(tex) = &self.texture {
+            (tex.size()[0] as f32, tex.size()[1] as f32)
+        } else if let Some(yuv) = &self.yuv {
+            (yuv.width as f32, yuv.height as f32)
+        } else {
+            (0.0, 0.0)
+        };
+        if tex_w > 0.0 && tex_h > 0.0 {
             let native_pts = egui::vec2(tex_w / ppp, tex_h / ppp);
             let draw_size = if self.pixel_exact {
                 native_pts
@@ -531,17 +562,26 @@ impl MirrorApp {
                 native_pts * fit
             };
             let draw = egui::Rect::from_center_size(rect.center(), draw_size);
-            ui.painter().image(
-                tex.id(),
-                draw,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
+            if let Some(yuv) = &self.yuv {
+                ui.painter().add(YuvPaint::new(
+                    yuv.clone(),
+                    self.yuv_gpu.clone(),
+                    self.pixel_exact,
+                ).callback(draw));
+            } else if let Some(tex) = &self.texture {
+                ui.painter().image(
+                    tex.id(),
+                    draw,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
             let drawn_px = draw_size * ppp;
-            let sx = if tex_w > 0.0 { drawn_px.x / tex_w } else { 1.0 };
-            let sy = if tex_h > 0.0 { drawn_px.y / tex_h } else { 1.0 };
+            let sx = drawn_px.x / tex_w;
+            let sy = drawn_px.y / tex_h;
+            let convert = if self.yuv.is_some() { "GL YUV shader" } else { "CPU RGBA" };
             scale_info = format!(
-                "texture {tex_w:.0}x{tex_h:.0}  window {:.0}x{:.0} px  ppp {ppp:.2}  scale {sx:.2}x/{sy:.2}x  {}",
+                "texture {tex_w:.0}x{tex_h:.0}  window {:.0}x{:.0} px  ppp {ppp:.2}  scale {sx:.2}x/{sy:.2}x  {}  {convert}",
                 rect.width() * ppp,
                 rect.height() * ppp,
                 if self.pixel_exact { "1:1 nearest" } else { "fit linear" },
@@ -593,10 +633,23 @@ impl MirrorApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
         }
         let failed = status.error.clone();
-        if leave || failed.is_some() && self.texture.is_some() && !status.connected {
+        if leave || failed.is_some() && self.has_picture() && !status.connected {
             self.error = failed;
             self.disconnect(&ctx);
         }
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    }
+
+    fn has_picture(&self) -> bool {
+        self.texture.is_some() || self.yuv.is_some()
+    }
+
+    fn should_show_video(&self) -> bool {
+        let Some(handle) = &self.watching else {
+            return false;
+        };
+        let status = handle.status.lock().expect("status lock");
+        viewer_ui(status.connected, status.first_frame, self.has_picture()) == ViewerUi::Video
     }
 
     fn connecting_ui(&mut self, ui: &mut egui::Ui) {
@@ -629,17 +682,22 @@ impl MirrorApp {
             if err.contains("firewall-cmd") {
                 ui.horizontal(|ui| {
                     if ui.button("Copy firewall command").clicked() {
-                        if let Some(cmd) = err.split("On Fedora:").nth(1) {
-                            ui.ctx().copy_text(cmd.trim().to_owned());
-                        } else {
-                            ui.ctx().copy_text(err.clone());
-                        }
+                        let text = err
+                            .split("On Fedora:")
+                            .nth(1)
+                            .map(|s| s.trim().to_owned())
+                            .unwrap_or_else(|| err.clone());
+                        copy_with_feedback(ui.ctx(), text, &mut self.copy_note);
                     }
+                    show_copy_note(ui, &self.copy_note);
                 });
             }
         } else {
             ui.add_space(8.0);
             ui.label("connecting…");
+            if !status.decoder.is_empty() {
+                ui.weak(format!("Decoder: {}", status.decoder));
+            }
         }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -653,7 +711,7 @@ impl MirrorApp {
                 self.disconnect(ui.ctx());
             }
         });
-        log_panel(ui, &self.log);
+        log_panel(ui, &self.log, &mut self.copy_note);
         self.footer(ui);
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(200));
@@ -669,7 +727,7 @@ impl eframe::App for MirrorApp {
             Screen::Present => {
                 egui::CentralPanel::default().show(ui, |ui| self.present_ui(ui));
             }
-            Screen::View if self.watching.is_some() && self.texture.is_some() => {
+            Screen::View if self.should_show_video() => {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
                     .show(ui, |ui| self.video_ui(ui));
@@ -734,33 +792,63 @@ fn step_row(ui: &mut egui::Ui, step: &ConnectStep) {
     });
 }
 
-fn log_panel(ui: &mut egui::Ui, log: &LogStore) {
+fn copy_with_feedback(ctx: &egui::Context, text: String, note: &mut Option<(Instant, bool, String)>) {
+    ctx.copy_text(text.clone());
+    match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+        Ok(()) => *note = Some((Instant::now(), true, "Copied".into())),
+        Err(e) => {
+            *note = Some((
+                Instant::now(),
+                false,
+                format!("Clipboard unavailable ({e}). The text is selectable — use Cmd/Ctrl+C."),
+            ));
+        }
+    }
+}
+
+fn show_copy_note(ui: &mut egui::Ui, note: &Option<(Instant, bool, String)>) {
+    let Some((at, ok, msg)) = note else { return };
+    if at.elapsed().as_secs() >= 4 {
+        return;
+    }
+    let color = if *ok {
+        egui::Color32::from_rgb(0, 180, 80)
+    } else {
+        egui::Color32::from_rgb(230, 160, 40)
+    };
+    ui.colored_label(color, msg);
+}
+
+fn log_panel(ui: &mut egui::Ui, log: &LogStore, note: &mut Option<(Instant, bool, String)>) {
     ui.separator();
     ui.horizontal(|ui| {
         ui.weak(format!("Log: {}", log.path().display()));
         if ui.button("Copy log").clicked() {
-            ui.ctx().copy_text(log.snapshot());
+            copy_with_feedback(ui.ctx(), log.snapshot(), note);
         }
+        show_copy_note(ui, note);
     });
     if let Some(err) = log.open_error() {
         ui.colored_label(egui::Color32::LIGHT_RED, err);
     }
-    let mut text = log.snapshot();
+    let text = log.snapshot();
     egui::ScrollArea::vertical()
         .max_height(180.0)
         .stick_to_bottom(true)
         .show(ui, |ui| {
             ui.add(
-                egui::TextEdit::multiline(&mut text)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(8)
-                    .font(egui::TextStyle::Monospace)
-                    .interactive(true),
+                egui::Label::new(egui::RichText::new(text).monospace().size(11.0))
+                    .selectable(true)
+                    .wrap(),
             );
         });
 }
 
-fn firewall_panel(ui: &mut egui::Ui, hint: Option<&FirewallHint>) {
+fn firewall_panel(
+    ui: &mut egui::Ui,
+    hint: Option<&FirewallHint>,
+    note: &mut Option<(Instant, bool, String)>,
+) {
     let Some(hint) = hint.filter(|h| h.show) else { return };
     ui.add_space(8.0);
     let color = if hint.prominent {
@@ -772,8 +860,9 @@ fn firewall_panel(ui: &mut egui::Ui, hint: Option<&FirewallHint>) {
     ui.horizontal(|ui| {
         ui.monospace(&hint.command);
         if ui.button("Copy command").clicked() {
-            ui.ctx().copy_text(hint.command.clone());
+            copy_with_feedback(ui.ctx(), hint.command.clone(), note);
         }
+        show_copy_note(ui, note);
     });
 }
 

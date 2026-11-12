@@ -195,7 +195,9 @@ pub struct Encoder {
     conversion: &'static str,
     rc_summary: String,
     start_us: Option<u64>,
+    last_pack_us: u64,
     last_convert_us: u64,
+    last_upload_us: u64,
     last_encode_us: u64,
 }
 
@@ -251,6 +253,16 @@ impl Encoder {
     pub fn last_timings_ms(&self) -> (f64, f64) {
         (
             self.last_convert_us as f64 / 1000.0,
+            self.last_encode_us as f64 / 1000.0,
+        )
+    }
+
+    /// pack / colour-convert / upload / encode, in milliseconds.
+    pub fn last_breakdown_ms(&self) -> (f64, f64, f64, f64) {
+        (
+            self.last_pack_us as f64 / 1000.0,
+            self.last_convert_us as f64 / 1000.0,
+            self.last_upload_us as f64 / 1000.0,
             self.last_encode_us as f64 / 1000.0,
         )
     }
@@ -394,15 +406,16 @@ impl Encoder {
             conversion,
             rc_summary,
             start_us: None,
+            last_pack_us: 0,
             last_convert_us: 0,
+            last_upload_us: 0,
             last_encode_us: 0,
         })
     }
 
     pub fn encode(&mut self, raw: &RawFrame, force_keyframe: bool) -> Result<Vec<EncodedFrame>> {
-        let t0 = now_us();
         self.convert(raw)?;
-        let t1 = now_us();
+        let t_upload0 = now_us();
         let start = *self.start_us.get_or_insert(raw.capture_us);
         let pts = raw.capture_us.saturating_sub(start) as i64;
         let kind = if force_keyframe {
@@ -416,6 +429,7 @@ impl Encoder {
                 self.staging.set_pts(Some(pts));
                 self.staging.set_kind(kind);
                 self.inner.send_frame(&self.staging)?;
+                self.last_upload_us = 0;
             }
             Upload::Vaapi { frames, vpp, .. } => {
                 let frames_ptr = frames.as_ptr();
@@ -424,11 +438,16 @@ impl Encoder {
                     self.packed.set_pts(Some(pts));
                     self.packed.set_kind(kind);
                     self.inner.send_frame(&self.packed)?;
+                    self.last_upload_us = 0; // upload happened inside VPP
                 } else {
+                    // Prefer the VPP/CPU output in `packed` when it holds NV12
+                    // system memory, otherwise the CPU scaler output in `staging`.
                     self.transfer_to_vaapi_ptr(frames_ptr, pts, kind)?;
+                    self.last_upload_us = now_us().saturating_sub(t_upload0);
                 }
             }
         }
+        let t_enc0 = now_us();
 
         let mut out = Vec::with_capacity(1);
         let mut packet = Packet::empty();
@@ -443,9 +462,7 @@ impl Encoder {
                 });
             }
         }
-        let t2 = now_us();
-        self.last_convert_us = t1.saturating_sub(t0);
-        self.last_encode_us = t2.saturating_sub(t1);
+        self.last_encode_us = now_us().saturating_sub(t_enc0);
         Ok(out)
     }
 
@@ -461,7 +478,13 @@ impl Encoder {
             if ret < 0 {
                 bail!("av_hwframe_get_buffer: {}", ffmpeg_next::Error::from(ret));
             }
-            let ret = ffi::av_hwframe_transfer_data(hw_frame.as_mut_ptr(), self.staging.as_ptr(), 0);
+            let src = if matches!(self.packed.format(), Pixel::NV12 | Pixel::YUV420P | Pixel::YUVJ420P)
+            {
+                self.packed.as_ptr()
+            } else {
+                self.staging.as_ptr()
+            };
+            let ret = ffi::av_hwframe_transfer_data(hw_frame.as_mut_ptr(), src, 0);
             if ret < 0 {
                 bail!("av_hwframe_transfer_data: {}", ffmpeg_next::Error::from(ret));
             }
@@ -516,22 +539,36 @@ impl Encoder {
                 raw.height
             );
         }
+        let t_pack = now_us();
         fill_packed(&mut self.packed, raw)?;
+        self.last_pack_us = now_us().saturating_sub(t_pack);
         let vpp = match &mut self.upload {
             Upload::Vaapi { vpp: Some(v), .. } => v,
             _ => bail!("VPP graph missing"),
         };
+        let t_vpp = now_us();
         let mut src = vpp.graph.get("in").ok_or_else(|| anyhow!("vpp missing in"))?;
         src.source().add(&self.packed)?;
         let mut sink = vpp
             .graph
             .get("out")
             .ok_or_else(|| anyhow!("vpp missing out"))?;
-        sink.sink().frame(&mut self.packed)?;
+        let mut out = ffmpeg_next::frame::Video::empty();
+        sink.sink().frame(&mut out)?;
+        self.last_convert_us = now_us().saturating_sub(t_vpp);
+        if !is_vaapi_pixel(out.format()) {
+            tracing::warn!(
+                "VAAPI VPP delivered system memory ({}); this is a GPU download, will re-upload",
+                format_pixel(out.format())
+            );
+        }
+        self.packed = out;
         Ok(())
     }
 
     fn convert_cpu(&mut self, raw: &RawFrame) -> Result<()> {
+        let t0 = now_us();
+        self.last_pack_us = 0;
         let key = (raw.format, raw.width, raw.height);
         if self.scaler.as_ref().is_none_or(|s| s.src != key) {
             let same = raw.width == self.config.width && raw.height == self.config.height;
@@ -593,6 +630,7 @@ impl Encoder {
                 bail!("sws_scale failed: {ret}");
             }
         }
+        self.last_convert_us = now_us().saturating_sub(t0);
         Ok(())
     }
 }
@@ -663,6 +701,28 @@ impl VaapiVpp {
         let mut up_ctx = alloc_hw_filter(&mut graph, &hwupload, "upload", "", device)?;
         let mut vpp_ctx = alloc_hw_filter(&mut graph, &vpp, "vpp", &vpp_args, device)?;
         let mut out_ctx = graph.add(&sink, "out", "")?;
+        // Keep the result on a VAAPI surface so we do not download and
+        // re-upload through system memory.
+        unsafe {
+            let fmts = [
+                ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
+                ffi::AVPixelFormat::AV_PIX_FMT_NONE,
+            ];
+            let bytes = std::slice::from_raw_parts(
+                fmts.as_ptr() as *const u8,
+                std::mem::size_of_val(&fmts),
+            );
+            let ret = ffi::av_opt_set_bin(
+                out_ctx.as_mut_ptr().cast(),
+                c"pix_fmts".as_ptr(),
+                bytes.as_ptr(),
+                (std::mem::size_of::<ffi::AVPixelFormat>() * (fmts.len() - 1)) as i32,
+                ffi::AV_OPT_SEARCH_CHILDREN,
+            );
+            if ret < 0 {
+                tracing::warn!("could not pin buffersink to VAAPI ({})", ffmpeg_next::Error::from(ret));
+            }
+        }
         in_ctx.link(0, &mut up_ctx, 0);
         up_ctx.link(0, &mut vpp_ctx, 0);
         vpp_ctx.link(0, &mut out_ctx, 0);

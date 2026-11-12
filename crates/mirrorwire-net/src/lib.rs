@@ -1,4 +1,5 @@
 pub mod diag;
+mod lan_cc;
 pub mod discovery;
 pub mod identity;
 pub mod pairing;

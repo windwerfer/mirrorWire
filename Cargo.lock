@@ -1999,6 +1999,7 @@ name = "mirrorwire-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "bytes",
  "clap",
  "crossbeam-channel",

@@ -1,7 +1,7 @@
 use crate::ViewArgs;
 use anyhow::{anyhow, Result};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
-use mirrorwire_media::decode::{luma, Decoder, HwDecode, RgbaConverter};
+use mirrorwire_media::decode::{luma, Decoder, HwDecode, RgbaConverter, YuvImage};
 use mirrorwire_media::pattern::read_marker;
 use mirrorwire_net::identity::Identity;
 use mirrorwire_net::pairing::ConnectInfo;
@@ -21,6 +21,7 @@ pub const STAGES: &[&str] = &[
     "encoded_to_sent",
     "network",
     "reassembly",
+    "decode_wait",
     "decode",
     "convert",
     "capture_to_decoded",
@@ -30,8 +31,34 @@ pub const STAGES: &[&str] = &[
 pub struct DisplayFrame {
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    pub picture: Picture,
     pub capture_us_viewer: u64,
+}
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub enum Picture {
+    Rgba(Vec<u8>),
+    Yuv(YuvImage),
+}
+
+/// The viewer window should leave the connecting panel once the session is
+/// up or the first frame has been decoded — not only after a texture exists
+/// (the texture was previously created only in the video view, so the UI
+/// could stay on "connecting…" forever while the stream ran).
+#[cfg_attr(not(any(test, feature = "gui")), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewerUi {
+    Connecting,
+    Video,
+}
+
+#[cfg_attr(not(any(test, feature = "gui")), allow(dead_code))]
+pub fn viewer_ui(connected: bool, first_frame: bool, has_picture: bool) -> ViewerUi {
+    if has_picture || first_frame || connected {
+        ViewerUi::Video
+    } else {
+        ViewerUi::Connecting
+    }
 }
 
 #[derive(Clone, Default)]
@@ -47,6 +74,7 @@ pub struct ViewerStatus {
     pub decode_ms: f64,
     pub native_width: u32,
     pub native_height: u32,
+    pub first_frame: bool,
 }
 
 #[derive(Default)]
@@ -299,7 +327,11 @@ fn decode_loop(
         s.trace.ok(ConnectStepId::Decoder, decoder_name.clone());
     }
     tracing::info!("decoder: {decoder_name}");
-    let mut converter = RgbaConverter::default();
+    let mut converter = if opts.rgba {
+        Some(RgbaConverter::default())
+    } else {
+        None
+    };
     let mut window = StageStats::new(STAGES);
     let mut all = StageStats::new(STAGES);
     let mut totals = Totals::default();
@@ -311,6 +343,7 @@ fn decode_loop(
 
     while let Ok(ToDecode { frame }) = rx.recv() {
         let offset = clock.lock().expect("clock lock").clone();
+        let decode_started = now_us();
         let decoded = match decoder.decode(&frame.data) {
             Ok(Some(d)) => {
                 consecutive_hw_errors = 0;
@@ -342,17 +375,6 @@ fn decode_loop(
             }
         };
         let decoded_us = now_us();
-        if first_frame {
-            first_frame = false;
-            let mut s = status.lock().expect("status lock");
-            s.trace.ok(
-                ConnectStepId::FirstFrame,
-                format!("{}x{} via {decoder_name}", decoded.width(), decoded.height()),
-            );
-            s.native_width = decoded.width();
-            s.native_height = decoded.height();
-        }
-
         let (y, stride, w, h) = luma(decoded);
         if let Some(marker) = read_marker(y, stride, w, h) {
             if let Some((prev_marker, prev_id)) = last_marker {
@@ -364,18 +386,49 @@ fn decode_loop(
             last_marker = Some((marker, frame.frame_id));
         }
 
-        let mut convert_ms = None;
-        let mut rgba_frame = None;
-        if opts.rgba {
+        let capture_us_viewer = offset.to_viewer_clock(frame.timing.capture_us);
+        let (convert_ms, out_frame) = if opts.rgba {
             let mut rgba = Vec::new();
-            let (width, height) = converter.convert(decoded, &mut rgba)?;
-            convert_ms = Some(ms(now_us(), decoded_us));
-            rgba_frame = Some(DisplayFrame {
-                width,
-                height,
-                rgba,
-                capture_us_viewer: offset.to_viewer_clock(frame.timing.capture_us),
-            });
+            let (width, height) = converter
+                .as_mut()
+                .expect("rgba converter")
+                .convert(decoded, &mut rgba)?;
+            (
+                Some(ms(now_us(), decoded_us)),
+                Some(DisplayFrame {
+                    width,
+                    height,
+                    picture: Picture::Rgba(rgba),
+                    capture_us_viewer,
+                }),
+            )
+        } else {
+            let img = YuvImage::from_frame(decoded)?;
+            (
+                Some(ms(now_us(), decoded_us)),
+                Some(DisplayFrame {
+                    width: img.width,
+                    height: img.height,
+                    picture: Picture::Yuv(img),
+                    capture_us_viewer,
+                }),
+            )
+        };
+
+        if first_frame {
+            first_frame = false;
+            decoder_name = decoder.name().to_owned();
+            let width = out_frame.as_ref().map(|f| f.width).unwrap_or(0);
+            let height = out_frame.as_ref().map(|f| f.height).unwrap_or(0);
+            let mut s = status.lock().expect("status lock");
+            s.trace.ok(
+                ConnectStepId::FirstFrame,
+                format!("{width}x{height} via {decoder_name}"),
+            );
+            s.decoder = decoder_name.clone();
+            s.native_width = width;
+            s.native_height = height;
+            s.first_frame = true;
         }
 
         let t = frame.timing;
@@ -401,7 +454,8 @@ fn decode_loop(
             "reassembly",
             ms(frame.completed_us, frame.first_fragment_us),
         );
-        record("decode", ms(decoded_us, frame.completed_us));
+        record("decode_wait", ms(decode_started, frame.completed_us).max(0.0));
+        record("decode", ms(decoded_us, decode_started).max(0.0));
         if let Some(c) = convert_ms {
             record("convert", c);
         }
@@ -412,7 +466,7 @@ fn decode_loop(
         w_frames += 1;
         w_bytes += frame.data.len() as u64;
 
-        if let Some(display) = rgba_frame {
+        if let Some(display) = out_frame {
             if let Err(TrySendError::Full(display)) = frames_tx.try_send(display) {
                 let _ = frames_drain.try_recv();
                 let _ = frames_tx.try_send(display);
@@ -472,7 +526,7 @@ pub fn run_headless(args: ViewArgs, config_dir: &Path) -> Result<()> {
         identity,
         target,
         ViewerOptions {
-            hwdec: args.hwdec,
+            hwdec: args.want_hwdec(),
             simulate_loss: args.simulate_loss / 100.0,
             rgba: args.rgba,
             name: args
@@ -535,5 +589,30 @@ fn print_summary((totals, stats, secs): &(Totals, StageStats, f64)) {
                 s.mean, s.p50, s.p95, s.max
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{viewer_ui, ViewerUi};
+
+    #[test]
+    fn stays_connecting_until_session_is_up() {
+        assert_eq!(viewer_ui(false, false, false), ViewerUi::Connecting);
+    }
+
+    #[test]
+    fn switches_to_video_once_connected() {
+        assert_eq!(viewer_ui(true, false, false), ViewerUi::Video);
+    }
+
+    #[test]
+    fn switches_to_video_on_first_decoded_frame() {
+        assert_eq!(viewer_ui(false, true, false), ViewerUi::Video);
+    }
+
+    #[test]
+    fn switches_to_video_when_a_picture_is_ready() {
+        assert_eq!(viewer_ui(false, false, true), ViewerUi::Video);
     }
 }

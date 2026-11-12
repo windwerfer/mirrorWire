@@ -171,10 +171,10 @@ fn encode_one(
     let force = *first_for_viewer || controls.keyframe_requested.swap(false, Ordering::AcqRel);
     *first_for_viewer = false;
     let encoded = encoder.encode(&raw, force)?;
-    let (convert_ms, encode_ms) = encoder.last_timings_ms();
+    let (pack_ms, convert_ms, upload_ms, encode_ms) = encoder.last_breakdown_ms();
     if force {
-        tracing::debug!(
-            "encoded IDR {}x{} convert={convert_ms:.2} ms encode={encode_ms:.2} ms via {}",
+        tracing::info!(
+            "encoded IDR {}x{} pack={pack_ms:.2} convert={convert_ms:.2} upload={upload_ms:.2} encode={encode_ms:.2} ms via {}",
             raw.width,
             raw.height,
             encoder.conversion_path()

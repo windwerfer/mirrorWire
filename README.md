@@ -151,8 +151,10 @@ cargo build --release -p mirrorwire-app --no-default-features --features gui
 ./target/release/mirrorwire view 'mirrorwire://192.168.1.20:47800?fp=…&code=…'
 ```
 
-Add `--hwdec` for VideoToolbox decoding (falls back to software if it is
-unavailable). On an old Intel Mac without Metal, the viewer defaults to OpenGL;
+On macOS the viewer defaults to VideoToolbox decode and falls back to a
+tuned software decoder (`--software-decode` forces it). A 2011 HD 6770M on
+OCLP may not expose VT H.264. The OpenGL (glow) path converts YUV→RGB in a
+shader instead of CPU swscale. On an old Intel Mac without Metal, the viewer defaults to OpenGL;
 `--renderer wgpu` tries Metal first.
  Keys in the viewer: `F` or double-click
 for fullscreen, `S` toggles stats, `1` toggles 1:1 pixel-exact display (nearest
