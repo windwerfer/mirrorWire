@@ -52,16 +52,19 @@ jobs:
         run: |
           cargo build --release --locked --target ${{ matrix.target }} \
             -p mirrorwire-app --no-default-features --features gui,static-ffmpeg
-      - name: Bundle .app
+      - name: Bundle .app and DMG
+        id: bundle
         run: |
           packaging/macos/bundle.sh target/${{ matrix.target }}/release/mirrorwire \
             ${{ matrix.arch }} ${{ matrix.min_macos }} dist
       - name: Smoke test
         run: dist/MirrorWire.app/Contents/MacOS/mirrorwire --version
-      - uses: actions/upload-artifact@v4
+      # archive: false (upload-artifact v7+) uploads the bare .dmg; the artifact
+      # name is the filename, so the Actions download is not wrapped in a zip.
+      - uses: actions/upload-artifact@v7
         with:
-          name: MirrorWire-macos-${{ matrix.arch }}
-          path: dist/MirrorWire-macos-${{ matrix.arch }}.zip
+          path: ${{ steps.bundle.outputs.dmg }}
+          archive: false
           if-no-files-found: error
 
   appimage:
@@ -98,10 +101,10 @@ jobs:
         run: target/release/mirrorwire --version && ldd target/release/mirrorwire
       - name: Package AppImage
         run: packaging/appimage/build.sh dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
-          name: MirrorWire-x86_64.AppImage
           path: dist/MirrorWire-x86_64.AppImage
+          archive: false
           if-no-files-found: error
 
   flatpak:
@@ -118,10 +121,10 @@ jobs:
           manifest-path: packaging/flatpak/io.github.windwerfer.MirrorWire.yml
           cache-key: flatpak-builder-${{ hashFiles('packaging/flatpak/*.yml') }}
           upload-artifact: false
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
-          name: MirrorWire-x86_64.flatpak
           path: MirrorWire-x86_64.flatpak
+          archive: false
           if-no-files-found: error
 
   release:
@@ -132,7 +135,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      # v8 is required to download artifacts uploaded with archive: false.
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -141,5 +145,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           ls -la artifacts
-          gh release create "${GITHUB_REF_NAME}" artifacts/* \
+          gh release create "${GITHUB_REF_NAME}" \
+            artifacts/*.dmg artifacts/*.AppImage artifacts/*.flatpak \
             --repo "${GITHUB_REPOSITORY}" --title "MirrorWire ${GITHUB_REF_NAME}" --generate-notes

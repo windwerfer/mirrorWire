@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
-# Wraps a built mirrorwire binary into MirrorWire.app and zips it.
+# Wraps a built mirrorwire binary into MirrorWire.app and a UDZO DMG
+# (app + /Applications symlink, ready to drag and drop).
 # usage: packaging/macos/bundle.sh <binary> <arch-label> <min-macos> <out-dir>
 set -euo pipefail
 BIN=$1; ARCH=$2; MIN=$3; OUT=$4
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)
+
+# Tagged builds use the cargo/tag version; CI builds on main use the short SHA
+# so each Actions download has a distinct name.
+if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+  LABEL="${GITHUB_REF_NAME#v}"
+elif [[ -n "${VERSION:-}" && -n "$(git -C "$ROOT" rev-parse --short=7 HEAD 2>/dev/null)" ]]; then
+  # Prefer the SHA on untagged builds so artifact names don't collide across commits.
+  LABEL=$(git -C "$ROOT" rev-parse --short=7 HEAD)
+else
+  LABEL=$VERSION
+fi
 
 mkdir -p "$OUT"
 APP="$OUT/MirrorWire.app"
@@ -32,6 +44,28 @@ fi
 echo "== minimum macOS"
 otool -l "$APP/Contents/MacOS/mirrorwire" | grep -A4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX' | grep -E 'minos|version' | head -2
 
+# Sign the .app before it goes into the DMG (ad-hoc; not notarized).
 codesign --force --deep --sign - "$APP"
-ditto -c -k --keepParent "$APP" "$OUT/MirrorWire-macos-$ARCH.zip"
-echo "wrote $OUT/MirrorWire-macos-$ARCH.zip"
+
+STAGING=$(mktemp -d)
+# ditto preserves the code signature and resource forks; cp -R may not.
+ditto "$APP" "$STAGING/MirrorWire.app"
+ln -s /Applications "$STAGING/Applications"
+
+DMG="$OUT/MirrorWire-${LABEL}-macos-${ARCH}.dmg"
+rm -f "$DMG"
+# HFS+ so the image opens on macOS 10.13 (the Intel minimum).
+hdiutil create \
+  -volname MirrorWire \
+  -srcfolder "$STAGING" \
+  -ov \
+  -fs HFS+ \
+  -format UDZO \
+  -imagekey zlib-level=9 \
+  "$DMG"
+rm -rf "$STAGING"
+
+echo "wrote $DMG"
+if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+  echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
+fi

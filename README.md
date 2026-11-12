@@ -38,13 +38,13 @@ scripts/
   loopback-test.sh   test pattern -> QUIC -> headless viewer on localhost
 packaging/
   build-ffmpeg.sh    minimal static FFmpeg (+ x264 on Linux) used by all release builds
-  macos/             .app bundling (Info.plist, icon, ad-hoc signing)
+  macos/             .app bundling and UDZO DMG (Info.plist, icon, ad-hoc signing)
   flatpak/           Flatpak manifest
   appimage/          AppImage packaging (linuxdeploy)
   linux/, icons/     desktop entry, AppStream metainfo, icon
 .github/workflows/
   ci.yml             clippy, unit tests, loopback test
-  build.yml          macOS arm64 + Intel .app, Flatpak, AppImage; Release on v* tags
+  build.yml          macOS arm64 + Intel DMG, Flatpak, AppImage; Release on v* tags
 ```
 
 ## Downloads
@@ -54,17 +54,21 @@ then Artifacts). A `v*` tag also attaches them to a GitHub Release:
 
 | artifact | for | notes |
 |---|---|---|
-| `MirrorWire-macos-x86_64.zip` | Intel Macs, macOS 10.13 or newer | FFmpeg statically linked, no Homebrew needed |
-| `MirrorWire-macos-arm64.zip` | Apple Silicon Macs, macOS 11 or newer | FFmpeg statically linked |
+| `MirrorWire-<ver>-macos-x86_64.dmg` | Intel Macs, macOS 10.13 or newer | FFmpeg statically linked, no Homebrew needed |
+| `MirrorWire-<ver>-macos-arm64.dmg` | Apple Silicon Macs, macOS 11 or newer | FFmpeg statically linked |
 | `MirrorWire-x86_64.flatpak` | Linux (Fedora, …) | `flatpak install --user MirrorWire-x86_64.flatpak` |
 | `MirrorWire-x86_64.AppImage` | Linux, glibc 2.39 or newer (Fedora 40+, Ubuntu 24.04+) | needs `libva` and `libpipewire` from the system |
 
+`<ver>` is the version on a tagged release, or the short commit SHA on a
+`main`-branch build. Each artifact is a single file (not a zip).
+
 **Opening the unsigned Mac app.** The builds are ad-hoc signed, not notarized.
-Unzip, move `MirrorWire.app` to Applications, then right-click it and choose
-**Open**, then **Open** again. On macOS 15 or newer, double-click once, then go to
-System Settings, Privacy & Security, and click **Open Anyway**. In a terminal,
-`xattr -dr com.apple.quarantine /Applications/MirrorWire.app` does the same. When
-asked, allow MirrorWire to find devices on your local network.
+Open the DMG, drag `MirrorWire.app` to Applications, then right-click it and
+choose **Open**, then **Open** again. On macOS 15 or newer, double-click once,
+then go to System Settings, Privacy & Security, and click **Open Anyway**. If
+Gatekeeper still blocks it, run
+`xattr -dr com.apple.quarantine /Applications/MirrorWire.app`. When asked, allow
+MirrorWire to find devices on your local network.
 
 Launching the app without arguments opens the viewer. The presenter runs from a terminal:
 
@@ -161,7 +165,7 @@ about 7.7 ms). Network plus reassembly on loopback is about 0.3 ms, decode about
 | portal + PipeWire capture | compiles, **untested** on a real KDE session |
 | VAAPI encode, VAAPI decode | compiles, **untested** (no GPU on the build VM) |
 | VideoToolbox encode/decode, macOS build | **untested** |
-| Flatpak, AppImage, macOS .app builds | built in CI, not yet run on the target machines |
+| Flatpak, AppImage, macOS .app / DMG builds | built in CI, not yet run on the target machines |
 | camera QR scanning | not started |
 | Android presenter/viewer | later (MediaProjection + MediaCodec via JNI) |
 
