@@ -23,6 +23,34 @@ unsafe impl Send for Decoder {}
 
 impl Decoder {
     pub fn new(hw: HwDecode) -> Result<Self> {
+        match hw {
+            HwDecode::None => Self::open(None),
+            HwDecode::Auto => match open_hw_device() {
+                Ok((dev, label)) => match Self::open(Some((dev, label))) {
+                    Ok(decoder) => Ok(decoder),
+                    Err(e) => {
+                        tracing::warn!(
+                            "{label} H.264 decode failed to open ({e:#}); falling back to software"
+                        );
+                        Self::open(None)
+                    }
+                },
+                Err(e) => {
+                    let kind = if cfg!(target_os = "macos") {
+                        "VideoToolbox"
+                    } else {
+                        "VAAPI"
+                    };
+                    tracing::info!(
+                        "{kind} H.264 hardware decode unavailable ({e:#}); using software decoder"
+                    );
+                    Self::open(None)
+                }
+            },
+        }
+    }
+
+    fn open(hw: Option<(HwRef, &'static str)>) -> Result<Self> {
         let codec = decoder::find(codec::Id::H264).ok_or_else(|| anyhow!("no H.264 decoder"))?;
         let mut ctx = codec::context::Context::new_with_codec(codec);
         ctx.set_threading(codec::threading::Config {
@@ -36,18 +64,12 @@ impl Decoder {
             (*raw).flags2 |= ffi::AV_CODEC_FLAG2_FAST as i32;
         }
 
-        let mut name = "h264 (software)".to_owned();
-        let mut device = None;
-        if hw == HwDecode::Auto {
-            match open_hw_device() {
-                Ok((dev, label)) => {
-                    unsafe { (*ctx.as_mut_ptr()).hw_device_ctx = dev.new_ref() };
-                    name = format!("h264 ({label})");
-                    device = Some(dev);
-                }
-                Err(e) => tracing::info!("hardware decode unavailable, using software: {e:#}"),
-            }
-        }
+        let (name, device) = if let Some((dev, label)) = hw {
+            unsafe { (*ctx.as_mut_ptr()).hw_device_ctx = dev.new_ref() };
+            (format!("h264 ({label})"), Some(dev))
+        } else {
+            ("h264 (software)".to_owned(), None)
+        };
 
         let inner = ctx.decoder().video()?;
         Ok(Self {
@@ -62,6 +84,10 @@ impl Decoder {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn is_hardware(&self) -> bool {
+        self._hw.is_some()
     }
 
     /// Decodes one access unit. Returns a CPU-side frame (YUV420P or NV12).
@@ -100,9 +126,15 @@ fn is_hw_format(p: Pixel) -> bool {
 
 fn open_hw_device() -> Result<(HwRef, &'static str)> {
     if cfg!(target_os = "macos") {
-        Ok((hw::create_device(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX, None)?, "videotoolbox"))
+        Ok((
+            hw::create_device(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX, None)?,
+            "videotoolbox",
+        ))
     } else {
-        Ok((hw::create_device(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI, None)?, "vaapi"))
+        Ok((
+            hw::create_device(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI, None)?,
+            "vaapi",
+        ))
     }
 }
 
@@ -116,14 +148,21 @@ unsafe impl Send for RgbaConverter {}
 
 impl Default for RgbaConverter {
     fn default() -> Self {
-        Self { ctx: None, out: frame::Video::empty() }
+        Self {
+            ctx: None,
+            out: frame::Video::empty(),
+        }
     }
 }
 
 impl RgbaConverter {
     pub fn convert(&mut self, src: &frame::Video, dst: &mut Vec<u8>) -> Result<(u32, u32)> {
         let key = (src.format(), src.width(), src.height());
-        if self.ctx.as_ref().is_none_or(|(_, f, w, h)| (*f, *w, *h) != key) {
+        if self
+            .ctx
+            .as_ref()
+            .is_none_or(|(_, f, w, h)| (*f, *w, *h) != key)
+        {
             let ctx = scaling::Context::get(
                 key.0,
                 key.1,
@@ -152,5 +191,10 @@ impl RgbaConverter {
 
 /// Returns the luma plane of a decoded frame as (data, stride, width, height).
 pub fn luma(frame: &frame::Video) -> (&[u8], usize, usize, usize) {
-    (frame.data(0), frame.stride(0), frame.width() as usize, frame.height() as usize)
+    (
+        frame.data(0),
+        frame.stride(0),
+        frame.width() as usize,
+        frame.height() as usize,
+    )
 }

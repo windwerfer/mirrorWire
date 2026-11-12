@@ -87,9 +87,23 @@ pub fn spawn(
     let (done_tx, done) = bounded(1);
     let stop = Arc::new(AtomicBool::new(false));
     let drain = frames.clone();
-    let handle = ViewerHandle { status: status.clone(), frames, stop: stop.clone(), done };
+    let handle = ViewerHandle {
+        status: status.clone(),
+        frames,
+        stop: stop.clone(),
+        done,
+    };
     runtime.spawn(async move {
-        let result = session(identity, target, opts, status.clone(), (frames_tx, drain), stop, on_frame).await;
+        let result = session(
+            identity,
+            target,
+            opts,
+            status.clone(),
+            (frames_tx, drain),
+            stop,
+            on_frame,
+        )
+        .await;
         match result {
             Ok(summary) => {
                 let _ = done_tx.send(summary);
@@ -146,7 +160,17 @@ async fn session(
     let decode_thread = std::thread::Builder::new()
         .name("decode".into())
         .spawn(move || {
-            decode_loop(decode_rx, opts, clock, decode_status, frames_tx, frames_drain, decode_need_key, control, on_frame)
+            decode_loop(
+                decode_rx,
+                opts,
+                clock,
+                decode_status,
+                frames_tx,
+                frames_drain,
+                decode_need_key,
+                control,
+                on_frame,
+            )
         })?;
 
     let mut reassembler = Reassembler::new(500_000);
@@ -177,7 +201,9 @@ async fn session(
                 continue;
             }
         }
-        let Some((frame, event)) = reassembler.push(datagram, now_us()) else { continue };
+        let Some((frame, event)) = reassembler.push(datagram, now_us()) else {
+            continue;
+        };
         if event.lost_frames > 0 {
             lost += event.lost_frames as u64;
             if !self_healing {
@@ -208,7 +234,9 @@ async fn session(
     let elapsed = started.elapsed().as_secs_f64();
     session.close();
     drop(decode_tx);
-    let (mut totals, all) = decode_thread.join().map_err(|_| anyhow!("decode thread panicked"))??;
+    let (mut totals, all) = decode_thread
+        .join()
+        .map_err(|_| anyhow!("decode thread panicked"))??;
     totals.lost = lost;
     totals.skipped_waiting_keyframe = skipped;
     totals.keyframe_requests += requests;
@@ -231,7 +259,11 @@ fn decode_loop(
     control: tokio::sync::mpsc::UnboundedSender<mirrorwire_proto::control::Control>,
     on_frame: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> Result<(Totals, StageStats)> {
-    let mut decoder = Decoder::new(if opts.hwdec { HwDecode::Auto } else { HwDecode::None })?;
+    let mut decoder = Decoder::new(if opts.hwdec {
+        HwDecode::Auto
+    } else {
+        HwDecode::None
+    })?;
     status.lock().expect("status lock").decoder = decoder.name().to_owned();
     tracing::info!("decoder: {}", decoder.name());
     let mut converter = RgbaConverter::default();
@@ -241,17 +273,35 @@ fn decode_loop(
     let mut window_start = Instant::now();
     let (mut w_frames, mut w_bytes) = (0u64, 0u64);
     let mut last_marker: Option<(u32, u32)> = None;
+    let mut consecutive_hw_errors = 0u32;
 
     while let Ok(ToDecode { frame }) = rx.recv() {
         let offset = clock.lock().expect("clock lock").clone();
         let decoded = match decoder.decode(&frame.data) {
-            Ok(Some(d)) => d,
+            Ok(Some(d)) => {
+                consecutive_hw_errors = 0;
+                d
+            }
             Ok(None) => continue,
             Err(e) => {
                 totals.decode_errors += 1;
-                tracing::warn!("decode error: {e}");
+                let err_text = format!("{e}");
+                let transfer_fail = err_text.contains("hw frame download");
+                if decoder.is_hardware() {
+                    consecutive_hw_errors += 1;
+                }
+                if decoder.is_hardware() && (transfer_fail || consecutive_hw_errors >= 3) {
+                    tracing::warn!("hardware decode failed ({e}); falling back to software H.264");
+                    decoder = Decoder::new(HwDecode::None)?;
+                    status.lock().expect("status lock").decoder = decoder.name().to_owned();
+                    consecutive_hw_errors = 0;
+                } else {
+                    tracing::warn!("decode error: {e}");
+                }
                 need_keyframe.store(true, Ordering::Release);
-                let _ = control.send(mirrorwire_proto::control::Control::RequestKeyframe { reason: "decode error".into() });
+                let _ = control.send(mirrorwire_proto::control::Control::RequestKeyframe {
+                    reason: "decode error".into(),
+                });
                 totals.keyframe_requests += 1;
                 continue;
             }
@@ -291,10 +341,19 @@ fn decode_loop(
         record("capture_to_encoded", ms(t.encoded_us, t.capture_us));
         record("encoded_to_sent", ms(t.sent_us, t.encoded_us));
         if offset.samples() > 0 {
-            record("network", ms(frame.completed_us, offset.to_viewer_clock(t.sent_us)));
-            record("capture_to_decoded", ms(decoded_us, offset.to_viewer_clock(t.capture_us)));
+            record(
+                "network",
+                ms(frame.completed_us, offset.to_viewer_clock(t.sent_us)),
+            );
+            record(
+                "capture_to_decoded",
+                ms(decoded_us, offset.to_viewer_clock(t.capture_us)),
+            );
         }
-        record("reassembly", ms(frame.completed_us, frame.first_fragment_us));
+        record(
+            "reassembly",
+            ms(frame.completed_us, frame.first_fragment_us),
+        );
         record("decode", ms(decoded_us, frame.completed_us));
         if let Some(c) = convert_ms {
             record("convert", c);
@@ -355,12 +414,17 @@ pub fn run_headless(args: ViewArgs, config_dir: &Path) -> Result<()> {
             hwdec: args.hwdec,
             simulate_loss: args.simulate_loss / 100.0,
             rgba: args.rgba,
-            name: args.name.clone().unwrap_or_else(|| format!("{} (headless)", crate::default_name())),
+            name: args
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("{} (headless)", crate::default_name())),
         },
         None,
     );
 
-    let deadline = args.duration.map(|d| Instant::now() + Duration::from_secs_f64(d));
+    let deadline = args
+        .duration
+        .map(|d| Instant::now() + Duration::from_secs_f64(d));
     loop {
         while handle.frames.try_recv().is_ok() {}
         if let Ok(summary) = handle.done.recv_timeout(Duration::from_millis(50)) {
@@ -390,16 +454,25 @@ fn print_summary((totals, stats, secs): &(Totals, StageStats, f64)) {
     );
     println!(
         "lost {}  skipped-until-keyframe {}  keyframe requests {}  decode errors {}",
-        totals.lost, totals.skipped_waiting_keyframe, totals.keyframe_requests, totals.decode_errors
+        totals.lost,
+        totals.skipped_waiting_keyframe,
+        totals.keyframe_requests,
+        totals.decode_errors
     );
     println!(
         "frame marker checks {}  mismatches {}",
         totals.marker_checked, totals.marker_mismatch
     );
-    println!("{:<20} {:>8} {:>8} {:>8} {:>8}", "stage (ms)", "mean", "p50", "p95", "max");
+    println!(
+        "{:<20} {:>8} {:>8} {:>8} {:>8}",
+        "stage (ms)", "mean", "p50", "p95", "max"
+    );
     for (name, s) in stats.summaries() {
         if s.count > 0 {
-            println!("{name:<20} {:>8.2} {:>8.2} {:>8.2} {:>8.2}", s.mean, s.p50, s.p95, s.max);
+            println!(
+                "{name:<20} {:>8.2} {:>8.2} {:>8.2} {:>8.2}",
+                s.mean, s.p50, s.p95, s.max
+            );
         }
     }
 }

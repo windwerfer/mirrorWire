@@ -1,23 +1,44 @@
-mod presenter;
-mod viewer;
 #[cfg(feature = "gui")]
 mod gui;
+mod presenter;
+mod viewer;
 
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "mirrorwire", version, about = "Low-latency screen mirroring over LAN")]
+#[command(
+    name = "mirrorwire",
+    version,
+    about = "Low-latency screen mirroring over LAN"
+)]
 struct Cli {
     /// Directory for identity, pairing and portal state (default: ~/.config/mirrorwire).
     #[arg(long, global = true)]
     config_dir: Option<PathBuf>,
 
-    /// Without a subcommand the viewer window opens (used when launched from a desktop icon).
+    /// GUI renderer: `auto` (wgpu, then OpenGL), `gl` (OpenGL/glow), or `wgpu`.
+    /// Defaults to `gl` on macOS x86_64 (no Metal on older Intel Macs) and `auto` elsewhere.
+    /// Overrides the MIRRORWIRE_RENDERER environment variable.
+    #[arg(long, global = true, value_enum, value_name = "gl|wgpu|auto")]
+    renderer: Option<RendererChoice>,
+
+    /// Without a subcommand the start screen opens (Present / View).
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum RendererChoice {
+    /// Try wgpu first and fall back to OpenGL if it fails.
+    Auto,
+    /// OpenGL via eframe's glow backend. Default on macOS x86_64.
+    #[value(alias = "glow", alias = "opengl")]
+    Gl,
+    /// wgpu (Metal on macOS, Vulkan or GL on Linux).
+    Wgpu,
 }
 
 #[derive(Subcommand)]
@@ -67,14 +88,16 @@ fn main() -> Result<()> {
     mirrorwire_media::init()?;
     let cli = Cli::parse();
     let config_dir = mirrorwire_net::config_dir(cli.config_dir.as_deref());
+    let renderer = resolve_renderer(cli.renderer);
 
-    let command = cli.command.unwrap_or(Command::View(ViewArgs::default()));
-    match command {
-        Command::Present(args) => presenter::run(args, &config_dir),
-        Command::View(args) if args.headless => viewer::run_headless(args, &config_dir),
-        Command::View(args) => run_gui(args, &config_dir),
-        Command::Discover { seconds } => {
-            let found = mirrorwire_net::discovery::Browser::start()?.browse_for(Duration::from_secs_f64(seconds));
+    match cli.command {
+        None => run_gui(GuiLaunch::Home, ViewArgs::default(), &config_dir, renderer),
+        Some(Command::Present(args)) => presenter::run(args, &config_dir),
+        Some(Command::View(args)) if args.headless => viewer::run_headless(args, &config_dir),
+        Some(Command::View(args)) => run_gui(GuiLaunch::View, args, &config_dir, renderer),
+        Some(Command::Discover { seconds }) => {
+            let found = mirrorwire_net::discovery::Browser::start()?
+                .browse_for(Duration::from_secs_f64(seconds));
             if found.is_empty() {
                 println!("no presenters found");
             }
@@ -92,14 +115,57 @@ fn main() -> Result<()> {
     }
 }
 
+pub enum GuiLaunch {
+    /// Start screen with Present / View buttons.
+    Home,
+    /// Go straight to the viewer (CLI `view`).
+    View,
+}
+
+fn default_renderer() -> RendererChoice {
+    if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        RendererChoice::Gl
+    } else {
+        RendererChoice::Auto
+    }
+}
+
+pub fn resolve_renderer(cli: Option<RendererChoice>) -> RendererChoice {
+    if let Some(choice) = cli {
+        return choice;
+    }
+    match std::env::var("MIRRORWIRE_RENDERER") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "gl" | "glow" | "opengl" => RendererChoice::Gl,
+            "wgpu" => RendererChoice::Wgpu,
+            "auto" => RendererChoice::Auto,
+            other => {
+                tracing::warn!("unknown MIRRORWIRE_RENDERER={other:?}, using the default");
+                default_renderer()
+            }
+        },
+        Err(_) => default_renderer(),
+    }
+}
+
 #[cfg(feature = "gui")]
-fn run_gui(args: ViewArgs, config_dir: &std::path::Path) -> Result<()> {
-    gui::run(args, config_dir)
+fn run_gui(
+    launch: GuiLaunch,
+    args: ViewArgs,
+    config_dir: &std::path::Path,
+    renderer: RendererChoice,
+) -> Result<()> {
+    gui::run(launch, args, config_dir, renderer)
 }
 
 #[cfg(not(feature = "gui"))]
-fn run_gui(_args: ViewArgs, _config_dir: &std::path::Path) -> Result<()> {
-    anyhow::bail!("built without the gui feature; use --headless")
+fn run_gui(
+    _launch: GuiLaunch,
+    _args: ViewArgs,
+    _config_dir: &std::path::Path,
+    _renderer: RendererChoice,
+) -> Result<()> {
+    anyhow::bail!("built without the gui feature; use --headless or a subcommand")
 }
 
 pub fn default_name() -> String {

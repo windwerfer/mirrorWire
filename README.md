@@ -70,7 +70,21 @@ Gatekeeper still blocks it, run
 `xattr -dr com.apple.quarantine /Applications/MirrorWire.app`. When asked, allow
 MirrorWire to find devices on your local network.
 
-Launching the app without arguments opens the viewer. The presenter runs from a terminal:
+Launching the app without arguments opens a start screen with **Present this screen**
+and **View**. Present starts capture and the pairing window (Linux only; the button is
+disabled on macOS until capture exists there). **View** lists presenters as before.
+The CLI subcommands (`present`, `view`, `discover`) still work, including headless tests.
+
+**Renderer.** The viewer uses wgpu (Metal on macOS, Vulkan/GL on Linux) by default,
+except on macOS x86_64, where it uses OpenGL (`glow`) because older Intel Macs have
+no Metal. If wgpu fails to start, the app retries with OpenGL. Override with
+`--renderer gl|wgpu|auto` or `MIRRORWIRE_RENDERER`. Video is converted YUV→RGBA on
+the CPU (swscale) before it is uploaded as an egui texture, so the OpenGL path does
+not need a wgpu shader. Hardware H.264 decode (`--hwdec` or the View checkbox) uses
+VideoToolbox or VAAPI when present, and falls back to software with a log line if
+the device is missing or later fails.
+
+The presenter can also be started from a terminal:
 
 ```sh
 flatpak run io.github.windwerfer.MirrorWire present     # Flatpak
@@ -118,7 +132,10 @@ cargo build --release -p mirrorwire-app --no-default-features --features gui
 ./target/release/mirrorwire view 'mirrorwire://192.168.1.20:47800?fp=…&code=…'
 ```
 
-Add `--hwdec` for VideoToolbox decoding. Keys in the viewer: `F` or double-click
+Add `--hwdec` for VideoToolbox decoding (falls back to software if it is
+unavailable). On an old Intel Mac without Metal, the viewer defaults to OpenGL;
+`--renderer wgpu` tries Metal first.
+ Keys in the viewer: `F` or double-click
 for fullscreen, `S` toggles stats, `Esc` disconnects. Homebrew only supports
 recent macOS versions; on an older Mac, build FFmpeg from MacPorts instead and
 point `PKG_CONFIG_PATH` at it.
@@ -161,10 +178,10 @@ about 7.7 ms). Network plus reassembly on loopback is about 0.3 ms, decode about
 | QUIC datagram transport, control stream, keyframe recovery | loopback-tested, including simulated loss |
 | pinned TLS, pairing code, paired-viewer memory | tested: wrong fingerprint and missing code are rejected |
 | mDNS announce/browse | tested on one host |
-| egui viewer | runs on the VM (llvmpipe, X11) and shows the stream |
+| egui viewer | runs on the VM (llvmpipe, X11) and shows the stream; OpenGL (glow) is the default on macOS x86_64 |
 | portal + PipeWire capture | compiles, **untested** on a real KDE session |
 | VAAPI encode, VAAPI decode | compiles, **untested** (no GPU on the build VM) |
-| VideoToolbox encode/decode, macOS build | **untested** |
+| VideoToolbox encode/decode, macOS build | **untested**; software H.264 decode is the fallback |
 | Flatpak, AppImage, macOS .app / DMG builds | built in CI, not yet run on the target machines |
 | camera QR scanning | not started |
 | Android presenter/viewer | later (MediaProjection + MediaCodec via JNI) |

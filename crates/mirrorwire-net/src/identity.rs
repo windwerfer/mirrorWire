@@ -9,6 +9,7 @@ use std::path::Path;
 
 pub const CERT_SERVER_NAME: &str = "mirrorwire.local";
 
+#[derive(Clone)]
 pub struct Identity {
     pub cert: CertificateDer<'static>,
     key: Vec<u8>,
@@ -19,7 +20,10 @@ impl Identity {
         let cert_path = dir.join("identity.cert.der");
         let key_path = dir.join("identity.key.der");
         if let (Ok(cert), Ok(key)) = (std::fs::read(&cert_path), std::fs::read(&key_path)) {
-            return Ok(Self { cert: CertificateDer::from(cert), key });
+            return Ok(Self {
+                cert: CertificateDer::from(cert),
+                key,
+            });
         }
         let generated = Self::generate()?;
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;

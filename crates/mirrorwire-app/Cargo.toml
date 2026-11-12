@@ -27,4 +27,4 @@ clap = { version = "4", features = ["derive"] }
 mirrorwire-proto = { path = "../mirrorwire-proto" }
 mirrorwire-media = { path = "../mirrorwire-media" }
 mirrorwire-net = { path = "../mirrorwire-net" }
-eframe = { version = "0.37", optional = true, default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+eframe = { version = "0.37", optional = true, default-features = false, features = ["glow", "wgpu", "default_fonts", "wayland", "x11"] }
