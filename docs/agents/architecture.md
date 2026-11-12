@@ -38,9 +38,17 @@ Rules:
 Presenter                                                         Viewer
 ---------                                                         ------
 xdg-desktop-portal ScreenCast  (one-time dialog, restore token)
-  -> PipeWire stream (BGRx/BGRA/RGBx/RGBA, CPU copy today; DMA-BUF later)
-  -> FrameSource::next_frame -> RawFrame
+  -> PipeWire stream (BGRx/BGRA/RGBx/RGBA), maxFramerate = --fps (60)
+       DMA-BUF with modifiers offered first (VAAPI encoders), shared memory second
+  -> FrameSource::poll_frame -> RawFrame (pixels in `data`, or a DMA-BUF fd in `dmabuf`)
   -> Encoder (FFmpeg): h264_vaapi | h264_videotoolbox | libx264
+       capture paths (shown as "Capture path" in the presenter):
+         dmabuf-zero-copy          DRM-PRIME -> av_hwframe_map -> VAAPI surface -> scale_vaapi -> NV12
+         shm+upload (vaapi-vpp)    memcpy -> hwupload -> scale_vaapi -> NV12
+         shm+upload (cpu convert)  swscale BGRx->NV12 on the CPU -> upload
+         shm (cpu)                 x264 / VideoToolbox, CPU conversion
+       a quiet source (KWin sends frames on damage only) gets the last frame
+       re-encoded every 100 ms (REPEAT_AFTER), counted apart from real frames
        low latency: no B-frames, no lookahead, IDR on request,
        optional intra refresh, CBR-ish rate control
   -> VideoSink (QUIC)                                          QUIC endpoint (pinned cert)
@@ -53,6 +61,12 @@ xdg-desktop-portal ScreenCast  (one-time dialog, restore token)
                                                                 -> egui texture, drawn by
                                                                    wgpu (Metal/Vulkan/GL) or glow (OpenGL)
 ```
+
+DMA-BUF fallback: if the encoder is not VAAPI, FFmpeg lacks libdrm, or the VAAPI import
+fails, the pipeline drops that frame and calls `FrameSource::disable_dmabuf`; the portal
+source renegotiates shared memory with the compositor. `--no-dmabuf` or
+`MIRRORWIRE_NO_DMABUF=1` skips DMA-BUF entirely. The release FFmpeg builds need
+`--enable-libdrm` for the zero-copy path.
 
 Encoder selection (`--encoder auto|vaapi|x264|videotoolbox`): `auto` tries VAAPI on Linux,
 VideoToolbox on macOS, then x264. The chosen encoder is reported in `StreamInfo` and shown in

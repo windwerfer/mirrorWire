@@ -124,6 +124,7 @@ pub fn run(
                     yuv: None,
                     yuv_gpu: Arc::new(Mutex::new(None)),
                     copy_note: None,
+                    display_server: None,
                     bitrate_mbps: DEFAULT_BITRATE_KBPS as f64 / 1000.0,
                     rc: RateControl::Auto,
                     qp: DEFAULT_QP,
@@ -190,6 +191,8 @@ struct MirrorApp {
     yuv: Option<Arc<mirrorwire_media::decode::YuvImage>>,
     yuv_gpu: Arc<Mutex<Option<YuvRenderer>>>,
     copy_note: Option<(Instant, bool, String)>,
+    /// "Wayland (native)", "X11 (XWayland)", "macOS"…, read from the real window handle.
+    display_server: Option<String>,
     bitrate_mbps: f64,
     rc: RateControl,
     qp: u32,
@@ -261,8 +264,9 @@ impl MirrorApp {
     fn footer(&self, ui: &mut egui::Ui) {
         ui.separator();
         ui.weak(format!(
-            "Renderer: {}  ·  video colour conversion: CPU (swscale YUV→RGBA)",
-            self.renderer.label()
+            "Renderer: {}  ·  Window system: {}",
+            self.renderer.label(),
+            self.display_server.as_deref().unwrap_or("?")
         ));
         ui.weak(format!("Log: {}", self.log.path().display()));
     }
@@ -386,19 +390,33 @@ impl MirrorApp {
                 if let Some(sum) = &status.rc_summary {
                     ui.weak(sum);
                 }
-                if let Some(conv) = &status.conversion {
-                    ui.weak(format!("Colour conversion: {conv}"));
-                }
                 let hud = &status.hud;
+                let path = if hud.path.is_empty() {
+                    status.conversion.as_deref().unwrap_or("?")
+                } else {
+                    hud.path.as_str()
+                };
+                let zero_copy = path == mirrorwire_media::encode::path::DMABUF_ZERO_COPY;
+                ui.horizontal(|ui| {
+                    ui.weak("Capture path:");
+                    if zero_copy {
+                        ui.colored_label(egui::Color32::from_rgb(0, 180, 80), path);
+                    } else {
+                        ui.colored_label(egui::Color32::from_rgb(230, 160, 40), path);
+                    }
+                });
+                if let Some(note) = &hud.fallback_note {
+                    ui.colored_label(egui::Color32::from_rgb(230, 160, 40), note);
+                }
                 if hud.capture_w > 0 {
                     ui.weak(format!(
-                        "Capture {}x{}  →  encode {}x{}  ·  source {:.1} fps  ·  {}  pack {:.1} ms  convert {:.1} ms  upload {:.1} ms  encode {:.1} ms",
+                        "Capture {}x{}  →  encode {}x{}  ·  source {:.1} fps (+{:.1} repeats/s)  ·  map/pack {:.1} ms  convert {:.1} ms  upload {:.1} ms  encode {:.1} ms",
                         hud.capture_w,
                         hud.capture_h,
                         status.settings.width,
                         status.settings.height,
                         hud.source_fps,
-                        hud.path,
+                        hud.repeat_fps,
                         hud.pack_ms,
                         hud.convert_ms,
                         hud.upload_ms,
@@ -590,7 +608,7 @@ impl MirrorApp {
         if self.show_stats {
             let stream = status.stream.as_ref();
             let text = format!(
-                "{}x{}  source {:.1} fps  {:.2} Mbit/s  {} ({})\n{}  decode {:.2} ms  {}  capture->texture {:.1} ms\n{}\n{}\nS: stats  1: 1:1 pixels  F / double-click: fullscreen  Esc: disconnect",
+                "{}x{}  source {:.1} fps  {:.2} Mbit/s  {} ({})\n{}  decode {:.2} ms  {}  capture->texture {:.1} ms\nwindow: {}\n{}\n{}\nS: stats  1: 1:1 pixels  F / double-click: fullscreen  Esc: disconnect",
                 status.native_width.max(stream.map(|s| s.width).unwrap_or(0)),
                 status.native_height.max(stream.map(|s| s.height).unwrap_or(0)),
                 status.source_fps,
@@ -601,6 +619,7 @@ impl MirrorApp {
                 status.decode_ms,
                 self.renderer.label(),
                 self.display_latency_ms,
+                self.display_server.as_deref().unwrap_or("?"),
                 status.last_second,
                 scale_info,
             );
@@ -719,7 +738,12 @@ impl MirrorApp {
 }
 
 impl eframe::App for MirrorApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        if self.display_server.is_none() {
+            let label = crate::session::window_system(frame);
+            tracing::info!("window system: {label}");
+            self.display_server = Some(label);
+        }
         match self.screen {
             Screen::Home => {
                 egui::CentralPanel::default().show(ui, |ui| self.home_ui(ui));
@@ -792,18 +816,16 @@ fn step_row(ui: &mut egui::Ui, step: &ConnectStep) {
     });
 }
 
+/// Copy through egui's own clipboard (winit: smithay-clipboard on Wayland,
+/// the system pasteboard on macOS). It reports no errors back, so the note
+/// keeps the manual fallback in view.
 fn copy_with_feedback(ctx: &egui::Context, text: String, note: &mut Option<(Instant, bool, String)>) {
-    ctx.copy_text(text.clone());
-    match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
-        Ok(()) => *note = Some((Instant::now(), true, "Copied".into())),
-        Err(e) => {
-            *note = Some((
-                Instant::now(),
-                false,
-                format!("Clipboard unavailable ({e}). The text is selectable — use Cmd/Ctrl+C."),
-            ));
-        }
-    }
+    ctx.copy_text(text);
+    *note = Some((
+        Instant::now(),
+        true,
+        "Copied. If pasting doesn't work, the text is selectable — use Cmd/Ctrl+C.".into(),
+    ));
 }
 
 fn show_copy_note(ui: &mut egui::Ui, note: &Option<(Instant, bool, String)>) {

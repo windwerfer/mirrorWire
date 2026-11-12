@@ -1,10 +1,15 @@
-use crate::encode::{Encoder, EncoderConfig};
+use crate::encode::{DmaBufError, Encoder, EncoderConfig};
 use crate::frame::{EncodedFrame, RawFrame};
 use crate::source::FrameSource;
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// When the compositor sends nothing new (it only sends frames on damage),
+/// the last frame is encoded again after this long, so the stream never goes
+/// quiet: a floor of 10 frames per second. Repeats are cheap skip frames.
+pub const REPEAT_AFTER: Duration = Duration::from_millis(100);
 
 /// Destination for encoded frames. The QUIC transport implements this; a
 /// Miracast/RTSP sink could implement it the same way.
@@ -65,7 +70,7 @@ pub fn run_capture_encode(
                     if let Some(old) = held.take() {
                         source.recycle(old.data);
                     }
-                    encode_one(
+                    let _ = encode_one(
                         encoder.as_mut().expect("encoder"),
                         raw,
                         source,
@@ -94,7 +99,7 @@ pub fn run_capture_encode(
                                 &mut on_ready,
                                 &mut first_for_viewer,
                             )?;
-                            encode_one(
+                            let _ = encode_one(
                                 encoder.as_mut().expect("encoder"),
                                 raw,
                                 source,
@@ -160,17 +165,34 @@ fn maybe_reopen(
     Ok(())
 }
 
+/// Encode one captured frame. Returns `false` when the frame was dropped
+/// because the encoder could not use its DMA-BUF (the source is told to
+/// switch to shared memory, and the next frame is a keyframe).
 fn encode_one(
     encoder: &mut Encoder,
-    raw: RawFrame,
+    mut raw: RawFrame,
     source: &mut dyn FrameSource,
     sink: &mut dyn VideoSink,
     controls: &Controls,
     first_for_viewer: &mut bool,
-) -> Result<()> {
+) -> Result<bool> {
+    if raw.dmabuf.is_some() && !encoder.accepts_dmabuf() {
+        source.disable_dmabuf(&format!("encoder {} cannot import DMA-BUF", encoder.name()));
+        return Ok(false);
+    }
     let force = *first_for_viewer || controls.keyframe_requested.swap(false, Ordering::AcqRel);
+    let encoded = match encoder.encode(&raw, force) {
+        Ok(e) => e,
+        Err(e) if e.downcast_ref::<DmaBufError>().is_some() => {
+            source.disable_dmabuf(&format!("{e:#}"));
+            if force {
+                controls.request_keyframe();
+            }
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
     *first_for_viewer = false;
-    let encoded = encoder.encode(&raw, force)?;
     let (pack_ms, convert_ms, upload_ms, encode_ms) = encoder.last_breakdown_ms();
     if force {
         tracing::info!(
@@ -180,13 +202,31 @@ fn encode_one(
             encoder.conversion_path()
         );
     }
+    // Close our DMA-BUF fd now rather than when the buffer is recycled.
+    raw.dmabuf = None;
     source.recycle(raw.data);
     for frame in encoded {
         sink.send(frame)?;
     }
-    Ok(())
+    Ok(true)
 }
 
+/// Re-encode the last frame (static screen). Honours keyframe requests, so a
+/// viewer that lost a packet recovers without waiting for screen damage.
+fn encode_repeat(
+    encoder: &mut Encoder,
+    seq: u64,
+    sink: &mut dyn VideoSink,
+    controls: &Controls,
+) -> Result<bool> {
+    let force = controls.keyframe_requested.swap(false, Ordering::AcqRel);
+    let encoded = encoder.encode_repeat(seq, mirrorwire_proto::clock::now_us(), force)?;
+    let any = !encoded.is_empty();
+    for frame in encoded {
+        sink.send(frame)?;
+    }
+    Ok(any)
+}
 
 /// Wait until the source produces a frame (or ends / is stopped).
 pub fn wait_first_frame(
@@ -218,8 +258,19 @@ pub fn open_encoder_for(raw: &RawFrame, settings: &EncoderConfig) -> Result<Enco
     Encoder::new(resolved)
 }
 
+/// What one pass of the encode loop did, for the presenter's fps counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tick {
+    /// A new frame from the capture source was encoded.
+    Captured,
+    /// The last frame was encoded again because the source sent nothing new.
+    Repeated,
+}
+
 /// Continue capturing and encoding, starting from an already-opened encoder and
 /// an optional held frame (so a static screen can be sent when a viewer appears).
+/// While a viewer is connected and the source is quiet, the last frame is
+/// repeated every [`REPEAT_AFTER`].
 #[allow(clippy::too_many_arguments)]
 pub fn continue_capture_encode(
     source: &mut dyn FrameSource,
@@ -229,27 +280,32 @@ pub fn continue_capture_encode(
     controls: &Controls,
     settings: Arc<Mutex<EncoderConfig>>,
     mut on_reopen: impl FnMut(&Encoder) -> Result<()>,
-    mut on_tick: impl FnMut(&Encoder, u32, u32),
+    mut on_tick: impl FnMut(&Encoder, u32, u32, Tick),
 ) -> Result<()> {
     let mut first_for_viewer = true;
-    let poll = Duration::from_millis(50);
-    // If we already hold a frame and a viewer is already connected, encode it first.
+    let mut last_sent = Instant::now();
+    let mut last_size = (0u32, 0u32);
+    let mut repeat_seq = u64::MAX / 2;
     loop {
         if controls.stopped() {
             break;
         }
+        let poll = REPEAT_AFTER
+            .saturating_sub(last_sent.elapsed())
+            .clamp(Duration::from_millis(5), Duration::from_millis(50));
         match source.poll_frame(poll)? {
             Some(raw) => {
-                if maybe_replace_encoder(&mut encoder, &raw, &settings, &mut on_reopen, &mut first_for_viewer)? {
-                    // reopened
-                }
+                maybe_replace_encoder(&mut encoder, &raw, &settings, &mut on_reopen, &mut first_for_viewer)?;
                 if sink.wants_frames() {
                     if let Some(old) = held.take() {
                         source.recycle(old.data);
                     }
                     let (cw, ch) = (raw.width, raw.height);
-                    encode_one(&mut encoder, raw, source, sink, controls, &mut first_for_viewer)?;
-                    on_tick(&encoder, cw, ch);
+                    if encode_one(&mut encoder, raw, source, sink, controls, &mut first_for_viewer)? {
+                        last_sent = Instant::now();
+                        last_size = (cw, ch);
+                        on_tick(&encoder, cw, ch, Tick::Captured);
+                    }
                 } else {
                     first_for_viewer = true;
                     if let Some(old) = held.replace(raw) {
@@ -261,17 +317,26 @@ pub fn continue_capture_encode(
                 if source.is_finished() {
                     break;
                 }
-                if sink.wants_frames() {
-                    if first_for_viewer {
-                        if let Some(raw) = held.take() {
-                            maybe_replace_encoder(&mut encoder, &raw, &settings, &mut on_reopen, &mut first_for_viewer)?;
-                            let (cw, ch) = (raw.width, raw.height);
-                            encode_one(&mut encoder, raw, source, sink, controls, &mut first_for_viewer)?;
-                            on_tick(&encoder, cw, ch);
+                if !sink.wants_frames() {
+                    first_for_viewer = true;
+                    continue;
+                }
+                if first_for_viewer {
+                    if let Some(raw) = held.take() {
+                        maybe_replace_encoder(&mut encoder, &raw, &settings, &mut on_reopen, &mut first_for_viewer)?;
+                        let (cw, ch) = (raw.width, raw.height);
+                        if encode_one(&mut encoder, raw, source, sink, controls, &mut first_for_viewer)? {
+                            last_sent = Instant::now();
+                            last_size = (cw, ch);
+                            on_tick(&encoder, cw, ch, Tick::Captured);
                         }
                     }
-                } else {
-                    first_for_viewer = true;
+                } else if last_sent.elapsed() >= REPEAT_AFTER {
+                    repeat_seq = repeat_seq.wrapping_add(1);
+                    if encode_repeat(&mut encoder, repeat_seq, sink, controls)? {
+                        on_tick(&encoder, last_size.0, last_size.1, Tick::Repeated);
+                    }
+                    last_sent = Instant::now();
                 }
             }
         }
@@ -304,4 +369,89 @@ fn maybe_replace_encoder(
     on_reopen(encoder)?;
     *first_for_viewer = true;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encode::EncoderBackend;
+    use crate::frame::PixelFormat;
+    use std::time::Instant;
+
+    /// One frame, then silence (like KWin on a static screen), then the end.
+    struct OneShot {
+        sent: bool,
+        until: Instant,
+    }
+
+    impl FrameSource for OneShot {
+        fn next_frame(&mut self) -> Result<Option<RawFrame>> {
+            unreachable!("pipeline polls")
+        }
+        fn poll_frame(&mut self, timeout: Duration) -> Result<Option<RawFrame>> {
+            if !self.sent {
+                self.sent = true;
+                return Ok(Some(RawFrame {
+                    seq: 0,
+                    width: 64,
+                    height: 64,
+                    stride: 256,
+                    format: PixelFormat::Bgrx,
+                    data: vec![128; 256 * 64],
+                    capture_us: mirrorwire_proto::clock::now_us(),
+                    dmabuf: None,
+                }));
+            }
+            std::thread::sleep(timeout);
+            Ok(None)
+        }
+        fn is_finished(&self) -> bool {
+            self.sent && Instant::now() >= self.until
+        }
+        fn describe(&self) -> String {
+            "one shot".into()
+        }
+    }
+
+    struct Count(usize);
+    impl VideoSink for Count {
+        fn send(&mut self, _frame: EncodedFrame) -> Result<()> {
+            self.0 += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn static_source_gets_repeated_frames() {
+        crate::init().unwrap();
+        let cfg = EncoderConfig {
+            backend: EncoderBackend::X264,
+            ..EncoderConfig::default()
+        };
+        let mut source = OneShot {
+            sent: false,
+            until: Instant::now() + Duration::from_millis(450),
+        };
+        let first = source.poll_frame(Duration::ZERO).unwrap().unwrap();
+        let encoder = open_encoder_for(&first, &cfg).unwrap();
+        let mut sink = Count(0);
+        let (mut captured, mut repeated) = (0, 0);
+        continue_capture_encode(
+            &mut source,
+            Some(first),
+            encoder,
+            &mut sink,
+            &Controls::default(),
+            Arc::new(Mutex::new(cfg)),
+            |_| Ok(()),
+            |_, _, _, tick| match tick {
+                Tick::Captured => captured += 1,
+                Tick::Repeated => repeated += 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(captured, 1, "the held frame is sent once as a real frame");
+        assert!(repeated >= 2, "expected repeats every {REPEAT_AFTER:?}, got {repeated}");
+        assert_eq!(sink.0, captured + repeated);
+    }
 }

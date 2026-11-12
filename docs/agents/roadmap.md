@@ -9,7 +9,9 @@ target), **planned**, **idea**. Update this file when an item moves.
 |---|---|
 | Loopback pipeline (test pattern → x264 → QUIC → decode) | done on a VM (≈9 ms capture→decoded mean at 2000×1000@60) |
 | Portal + PipeWire capture on Fedora KDE | done on the T480s (first real stream works) |
-| VAAPI encode on UHD 620 | works on the T480s; slow (≈56 ms `capture_to_encoded` seen), see Next |
+| VAAPI encode on UHD 620 | works on the T480s; was on `cpu+vaapi-upload` at 6–10 fps (photos 2026-11-12) |
+| DMA-BUF zero-copy capture → VAAPI | built (2026-11-13), untested on the T480s; shm fallback built |
+| Shared-memory VPP path | built: the VPP graph got pixel format "bgrz" (invalid for FFmpeg) so every BGRx frame fell back to the CPU; fixed, untested on hardware |
 | Viewer on the iMac (OpenGL, DMG x86_64) | works on the target iMac |
 | Pairing, pinned TLS, mDNS | works between the target machines (after opening 47800/udp) |
 | Flatpak, AppImage, DMGs in CI | built; Flatpak and x86_64 DMG run on target |
@@ -34,8 +36,10 @@ target), **planned**, **idea**. Update this file when an item moves.
 - **FEC for Wi-Fi:** Reed-Solomon parity fragments per frame so single losses don't cost a
   keyframe. Needs a `WIRE_VERSION` bump ([protocol.md](protocol.md) §4).
 - **Adaptive bitrate** from QUIC RTT/loss and reassembly loss.
-- **Zero-copy:** PipeWire DMA-BUF → VAAPI surface on the presenter; VideoToolbox → texture and
-  a YUV→RGB shader on the viewer (glow and wgpu paths) instead of swscale + egui upload.
+- **Zero-copy (viewer):** VideoToolbox → texture and a YUV→RGB shader on the wgpu path too
+  (glow already has the shader). The presenter side (DMA-BUF → VAAPI) is built.
+- **DMA-BUF modifiers from VAAPI:** today a fixed list (Intel Y/X-tiled, linear, implicit) is
+  offered; query the driver's importable modifiers instead (AMD needs this).
 - **Camera QR scanning** in the viewer (the URI is already in the QR).
 - **Virtual monitor (extend) mode** via the portal's virtual source type.
 - **GitHub Releases** for stable download links (release job exists for `v*` tags, never run;
@@ -47,7 +51,8 @@ target), **planned**, **idea**. Update this file when an item moves.
 ## Open questions
 
 - Default bitrate and whether to offer 4:4:4 where the encoder supports it.
-- Does VideoToolbox decode work on the HD 6770M under OCLP, or is software decode the default?
+- VideoToolbox decode on the HD 6770M under OCLP: the photos show it unavailable (no H.264
+  decoder for that GPU); software decode takes ≈2.4 ms/frame there, so it is fine as default.
 - Line width for `rustfmt` (see Known debt).
 
 ## Known debt and doc/code mismatches

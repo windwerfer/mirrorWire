@@ -39,6 +39,13 @@ line `fps, Mbit/s, rtt, ms mean/p95/max: …stages…`.
 
 ## Lag
 
+- Presenter "Capture path" (also in the log as `capture path …`): `dmabuf-zero-copy` is the
+  fast path. `shm+upload (…)` means shared memory; an orange note below it says why DMA-BUF or
+  VPP was turned off (e.g. FFmpeg without libdrm, a modifier VAAPI can't import).
+- Presenter `source N fps (+M repeats/s)`: N is what the compositor actually delivered. KWin
+  sends frames only when the screen changes, so a still screen shows ~0 fps plus ~10
+  repeats/s; moving a window should push N towards 60. Low N while things move points at
+  the compositor or capture path, not the network.
 - `capture_to_encoded` high (tens of ms with VAAPI): CPU-side scaling/conversion before the
   encoder, or the software fallback is in use. Check the encoder name in the overlay.
 - `network` high or spiky: Wi-Fi. Try cable; note `rtt`.
@@ -54,4 +61,9 @@ line `fps, Mbit/s, rtt, ms mean/p95/max: …stages…`.
   Fusion's `intel-media-driver` for the native build. The Flatpak and AppImage bundle their own
   static FFmpeg (with x264); the Flatpak gets its VAAPI driver from the freedesktop runtime's GL
   extension and the GPU through `--device=dri`, the AppImage uses the host's `libva` and driver.
+- Window system: the footer (and the viewer stats overlay) shows `Wayland (native)` or
+  `X11 via XWayland`. Linux is Wayland-first (D13); XWayland means winit fell back, e.g.
+  `WAYLAND_DISPLAY` missing in the environment.
+- Force shared-memory capture to compare: `mirrorwire present --no-dmabuf` (or
+  `MIRRORWIRE_NO_DMABUF=1` for the GUI).
 - Terminal logs: `RUST_LOG=debug,mdns_sd=warn flatpak run io.github.windwerfer.MirrorWire present`.

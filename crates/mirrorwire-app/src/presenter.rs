@@ -6,7 +6,7 @@ use mirrorwire_media::encode::{
 };
 use mirrorwire_media::frame::EncodedFrame;
 use mirrorwire_media::pipeline::{
-    continue_capture_encode, open_encoder_for, wait_first_frame, Controls, VideoSink,
+    continue_capture_encode, open_encoder_for, wait_first_frame, Controls, Tick, VideoSink,
 };
 use mirrorwire_media::source::testpattern::TestPattern;
 use mirrorwire_media::source::FrameSource;
@@ -95,6 +95,10 @@ pub struct PresentArgs {
     /// Hide the mouse cursor in the capture (portal source).
     #[arg(long)]
     hide_cursor: bool,
+    /// Don't offer DMA-BUF (zero-copy GPU buffers) to the compositor; always
+    /// capture through shared memory. For debugging driver problems.
+    #[arg(long)]
+    no_dmabuf: bool,
 }
 
 impl PresentArgs {
@@ -148,6 +152,7 @@ impl PresentArgs {
             uri_file: None,
             frames: None,
             hide_cursor: false,
+            no_dmabuf: false,
         }
     }
 }
@@ -173,6 +178,9 @@ pub struct EncodeHud {
     pub capture_w: u32,
     pub capture_h: u32,
     pub source_fps: f64,
+    /// Re-sent frames per second while the screen was static.
+    pub repeat_fps: f64,
+    pub fallback_note: Option<String>,
 }
 
 #[cfg(feature = "gui")]
@@ -187,6 +195,8 @@ impl Default for EncodeHud {
             capture_w: 0,
             capture_h: 0,
             source_fps: 0.0,
+            repeat_fps: 0.0,
+            fallback_note: None,
         }
     }
 }
@@ -338,6 +348,12 @@ fn open_portal(args: &PresentArgs, config_dir: &Path) -> Result<Box<dyn FrameSou
         show_cursor: !args.hide_cursor,
         allow_virtual: true,
         fps: args.fps,
+        // Only VAAPI can import DMA-BUFs. With `auto` the encoder may still
+        // turn out to be x264; the pipeline then asks the source to switch
+        // to shared memory.
+        dmabuf: !args.no_dmabuf
+            && matches!(args.encoder, EncoderBackend::Auto | EncoderBackend::Vaapi)
+            && std::env::var_os("MIRRORWIRE_NO_DMABUF").is_none(),
     })?))
 }
 
@@ -498,9 +514,12 @@ fn present_session(
             }
             Ok(())
         },
-        move |enc, cw, ch| {
+        move |enc, cw, ch, tick| {
             if let Ok(mut h) = hud_tick.lock() {
-                h.note_frame(enc, cw, ch);
+                match tick {
+                    Tick::Captured => h.note_frame(enc, cw, ch),
+                    Tick::Repeated => h.note_repeat(),
+                }
             }
         },
     );
@@ -523,8 +542,11 @@ struct EncodeHudShim {
     capture_h: u32,
     rc_summary: String,
     frames_window: u32,
+    repeats_window: u32,
     window_start: Option<std::time::Instant>,
     source_fps: f64,
+    repeat_fps: f64,
+    fallback_note: Option<String>,
 }
 
 impl EncodeHudShim {
@@ -541,24 +563,41 @@ impl EncodeHudShim {
         self.capture_w = capture_w;
         self.capture_h = capture_h;
         self.rc_summary = enc.rc_summary().to_owned();
+        self.fallback_note = enc.fallback_note().map(str::to_owned);
+        self.frames_window += 1;
+        self.roll_window();
+    }
+
+    /// The last frame was re-sent because the compositor had no new one.
+    /// Counted apart from real frames so "source fps" stays honest.
+    fn note_repeat(&mut self) {
+        self.repeats_window += 1;
+        self.roll_window();
+    }
+
+    fn roll_window(&mut self) {
         let now = std::time::Instant::now();
         let start = *self.window_start.get_or_insert(now);
-        self.frames_window += 1;
         let elapsed = now.saturating_duration_since(start);
         if elapsed >= std::time::Duration::from_secs(1) {
-            self.source_fps = self.frames_window as f64 / elapsed.as_secs_f64();
+            let secs = elapsed.as_secs_f64();
+            self.source_fps = self.frames_window as f64 / secs;
+            self.repeat_fps = self.repeats_window as f64 / secs;
             tracing::info!(
-                "encoder {}  {}x{}  source {:.1} fps  pack {:.2} ms  convert {:.2} ms  upload {:.2} ms  encode {:.2} ms",
+                "capture path {}  {}x{}  source {:.1} fps (+{:.1} repeats/s)  pack/map {:.2} ms  convert {:.2} ms  upload {:.2} ms  encode {:.2} ms{}",
                 self.path,
                 self.capture_w,
                 self.capture_h,
                 self.source_fps,
+                self.repeat_fps,
                 self.pack_ms,
                 self.convert_ms,
                 self.upload_ms,
-                self.encode_ms
+                self.encode_ms,
+                self.fallback_note.as_deref().map(|n| format!("  [{n}]")).unwrap_or_default()
             );
             self.frames_window = 0;
+            self.repeats_window = 0;
             self.window_start = Some(now);
         }
     }
@@ -574,6 +613,8 @@ impl EncodeHudShim {
             capture_w: self.capture_w,
             capture_h: self.capture_h,
             source_fps: self.source_fps,
+            repeat_fps: self.repeat_fps,
+            fallback_note: self.fallback_note.clone(),
         }
     }
 }

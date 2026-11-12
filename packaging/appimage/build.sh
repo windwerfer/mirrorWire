@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Packages target/release/mirrorwire as an AppImage with linuxdeploy.
-# libva and libpipewire stay with the host system: their drivers and modules
+# libva, libdrm and libpipewire stay with the host system: their drivers and modules
 # must match the versions installed there.
 # usage: packaging/appimage/build.sh <out-dir>
 set -euo pipefail
@@ -44,6 +44,7 @@ export OUTPUT="$OUT/MirrorWire-x86_64.AppImage"
   --desktop-file "$ROOT/packaging/linux/io.github.windwerfer.MirrorWire.desktop" \
   --icon-file "$ROOT/packaging/icons/io.github.windwerfer.MirrorWire.png" \
   --exclude-library 'libva*' \
+  --exclude-library 'libdrm*' \
   --exclude-library 'libpipewire-0.3*' \
   --output appimage
 ls -la "$OUTPUT"

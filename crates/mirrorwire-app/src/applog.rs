@@ -140,6 +140,7 @@ pub fn init() -> LogStore {
         tracing::warn!("{err}");
     }
     tracing::info!("logging to {}", store.path().display());
+    tracing::info!("mirrorwire {} on {}", env!("CARGO_PKG_VERSION"), crate::session::session_from_env());
     store
 }
 

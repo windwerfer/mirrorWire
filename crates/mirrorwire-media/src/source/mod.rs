@@ -25,5 +25,10 @@ pub trait FrameSource: Send {
     /// Hands a frame buffer back so the source can reuse the allocation.
     fn recycle(&mut self, _buffer: Vec<u8>) {}
 
+    /// The encoder cannot use DMA-BUF frames (no VAAPI, or the import
+    /// failed): switch the capture to shared memory. No-op for sources that
+    /// never produce DMA-BUFs.
+    fn disable_dmabuf(&mut self, _reason: &str) {}
+
     fn describe(&self) -> String;
 }

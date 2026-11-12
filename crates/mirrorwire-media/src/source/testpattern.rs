@@ -90,6 +90,7 @@ impl FrameSource for TestPattern {
             format: PixelFormat::Bgra,
             data,
             capture_us,
+            dmabuf: None,
         };
         self.seq += 1;
         Ok(Some(frame))

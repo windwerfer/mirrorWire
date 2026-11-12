@@ -17,11 +17,13 @@ agrees, update the entry (status, date, reason) in the same commit as the change
 | D9 | **macOS targets:** x86_64 minimum macOS 10.13 (`MACOSX_DEPLOYMENT_TARGET`), arm64 minimum 11.0. Artifacts are DMGs, ad-hoc signed, not notarized. | The target viewer is an old Intel iMac. Notarization needs a paid Apple account (owner decision). |
 | D10 | **Renderer default:** OpenGL (`glow`) on macOS x86_64, wgpu elsewhere, with automatic fallback to glow if wgpu fails. | Old Intel Macs (Radeon HD 6770M) have no Metal; OCLP-patched macOS runs OpenGL more reliably. |
 | D11 | **Target hardware.** Presenter: Lenovo ThinkPad T480s, Fedora, KDE Plasma (Wayland), Intel UHD 620 (VAAPI via RPM Fusion `intel-media-driver`). Viewer: iMac 27" Mid 2011 (i5, Radeon HD 6770M, 2560×1440) on macOS 15 Sequoia via OpenCore Legacy Patcher. | Every performance decision is judged on these two machines, not on a fast dev box. |
+| D13 | **Linux is Wayland-first.** Native Wayland is the target for presenter and viewer. X11 that comes for free (winit's X11 backend, Flatpak `--socket=fallback-x11`) stays, but no X11-specific code paths or workarounds are written (no Xlib/XCB, X11 clipboard, or X11 capture). The app only *reports* which window system it runs on. | The owner's decision (2026-11). Fedora KDE is Wayland; X11 branches cost testing time and drift. Example: the clipboard uses egui/winit (smithay-clipboard on Wayland), not an X11 clipboard. |
 | D12 | **Push policy:** direct pushes to `main` are allowed (no PR required); never force-push or rewrite history; commit identity `Thomas Grok Bot Barth <windwerfer@gmail.com>`. | Small single-owner project; the owner wants fast iteration but an intact history. |
 
 ## Not goals (decided)
 
-- WebAssembly: capture and codecs are native; out of scope.
+- WebAssembly *presenter*: capture is native. A browser *viewer* (WebTransport + WebCodecs) is
+  planned, see [roadmap.md](roadmap.md); not built yet.
 - AirPlay receiver/sender: proprietary, and old Macs can't receive it anyway.
 - Uncompressed video (~2.9 Gbit/s at 2000×1000@60): infeasible over Wi-Fi/USB networking.
 - Root-based capture (KMS grab) for lower latency: conflicts with D1.
@@ -29,6 +31,13 @@ agrees, update the entry (status, date, reason) in the same commit as the change
 ## Decision log
 
 Newest first. Add an entry when the owner decides something non-obvious.
+
+- **2026-11 (Wayland-first, D13):** after "Copy log" failed on the T480s (arboard tried an X11
+  connection in the Flatpak), the owner fixed Linux as Wayland-first: keep free X11 fallback,
+  never write X11-specific code. Clipboard now goes through egui/winit (smithay-clipboard).
+- **2026-11 (Android viewer):** the owner wants an installable APK (thin Kotlin/Java shell that
+  is never touched, loading the Rust viewer, the neurofeed pattern), and later a browser
+  viewer for people who don't want to install anything.
 
 - **2026-11 (SonarCloud CI analysis):** the owner added a `SONAR_TOKEN` repository
   secret and wants scans to run from GitHub Actions (Clippy report + lcov)

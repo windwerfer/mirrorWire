@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds a minimal static FFmpeg (plus x264 on Linux) with only what MirrorWire uses:
 # the H.264 decoder/parser, swscale, and the platform's hardware encoder
-# (VideoToolbox on macOS, VAAPI + libx264 on Linux).
+# (VideoToolbox on macOS, VAAPI + libdrm + libx264 on Linux).
 #
 # usage: packaging/build-ffmpeg.sh <prefix>
 # env:   MACOSX_DEPLOYMENT_TARGET (macOS), JOBS
@@ -65,6 +65,9 @@ else
   platform=(
     --enable-gpl --enable-libx264 --enable-encoder=libx264
     --enable-vaapi --enable-encoder=h264_vaapi --enable-hwaccel=h264_vaapi
+    # libdrm: DRM-PRIME (DMA-BUF) frames can be mapped into VAAPI, so the
+    # portal capture reaches the encoder without a CPU copy.
+    --enable-libdrm
     --enable-filter=buffer,buffersink,format,scale,hwupload,hwdownload,hwmap,null,scale_vaapi,vpp_vaapi
     --pkg-config-flags=--static
   )

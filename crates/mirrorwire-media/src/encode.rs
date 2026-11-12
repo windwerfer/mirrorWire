@@ -163,6 +163,7 @@ enum Upload {
         _device: HwRef,
         frames: HwRef,
         vpp: Option<VaapiVpp>,
+        dma: Option<DmaImport>,
     },
 }
 
@@ -171,6 +172,42 @@ struct VaapiVpp {
     src_format: Pixel,
     src_w: u32,
     src_h: u32,
+}
+
+/// DMA-BUF import: a VAAPI frames context at the capture size (the DRM-PRIME
+/// buffers are mapped into it as VAAPI surfaces) and a VPP graph that scales
+/// and converts those surfaces to NV12 on the GPU.
+struct DmaImport {
+    frames: HwRef,
+    key: (PixelFormat, u32, u32),
+    graph: ffmpeg_next::filter::Graph,
+}
+
+unsafe impl Send for DmaImport {}
+
+/// The encoder could not use a DMA-BUF frame. The capture should switch to
+/// shared memory (`FrameSource::disable_dmabuf`); the frame is dropped.
+#[derive(Debug)]
+pub struct DmaBufError(pub String);
+
+impl std::fmt::Display for DmaBufError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DmaBufError {}
+
+/// Capture/convert path labels shown in the presenter status and log.
+pub mod path {
+    /// Compositor GPU buffer imported into VAAPI, converted by VPP, encoded. No CPU copy.
+    pub const DMABUF_ZERO_COPY: &str = "dmabuf-zero-copy";
+    /// Shared-memory frame uploaded to the GPU, converted by VAAPI VPP.
+    pub const SHM_VPP: &str = "shm+upload (vaapi-vpp)";
+    /// Shared-memory frame converted to NV12 on the CPU, then uploaded.
+    pub const SHM_CPU_UPLOAD: &str = "shm+upload (cpu convert)";
+    /// Software encoder: CPU conversion, no GPU.
+    pub const SHM_CPU: &str = "shm (cpu)";
 }
 
 struct Scaler {
@@ -195,6 +232,11 @@ pub struct Encoder {
     conversion: &'static str,
     rc_summary: String,
     start_us: Option<u64>,
+    last_pts: Option<i64>,
+    /// A converted frame is ready in `packed`/`staging` (for repeats).
+    have_frame: bool,
+    /// Why the VPP or DMA-BUF path was dropped, for the status line.
+    fallback_note: Option<String>,
     last_pack_us: u64,
     last_convert_us: u64,
     last_upload_us: u64,
@@ -319,6 +361,7 @@ impl Encoder {
                 apply_vaapi_opts(&mut opts, rc, bitrate, config);
                 Upload::Vaapi {
                     vpp: None,
+                    dma: None,
                     _device: device,
                     frames,
                 }
@@ -360,7 +403,7 @@ impl Encoder {
             .open_as_with(codec, opts)
             .with_context(|| format!("opening {codec_name}"))?;
 
-        let mut conversion = "cpu";
+        let mut conversion = path::SHM_CPU;
         if let Upload::Vaapi {
             _device: ref device,
             ..
@@ -371,13 +414,13 @@ impl Encoder {
                     // Built for the output size; rebuilt on the first frame if
                     // the capture size differs. Probe succeeded, so the path
                     // is available.
-                    conversion = "vaapi-vpp";
+                    conversion = path::SHM_VPP;
                 }
                 Err(e) => {
                     tracing::info!(
                         "VAAPI VPP (hwupload/scale_vaapi) unavailable ({e:#}); using CPU BGRx→NV12"
                     );
-                    conversion = "cpu+vaapi-upload";
+                    conversion = path::SHM_CPU_UPLOAD;
                 }
             }
         }
@@ -385,7 +428,7 @@ impl Encoder {
         // Attach a real VPP graph only when the path is enabled; the probe
         // graph above was dropped. The first convert() builds one for the
         // source size.
-        if conversion == "vaapi-vpp" {
+        if conversion == path::SHM_VPP {
             if let Upload::Vaapi { vpp, _device, .. } = &mut upload {
                 *vpp = None; // built lazily for the actual capture size/format
                 let _ = _device;
@@ -406,6 +449,9 @@ impl Encoder {
             conversion,
             rc_summary,
             start_us: None,
+            last_pts: None,
+            have_frame: false,
+            fallback_note: None,
             last_pack_us: 0,
             last_convert_us: 0,
             last_upload_us: 0,
@@ -413,11 +459,50 @@ impl Encoder {
         })
     }
 
+    /// Whether this encoder can take DMA-BUF frames (VAAPI only).
+    pub fn accepts_dmabuf(&self) -> bool {
+        matches!(self.upload, Upload::Vaapi { .. })
+    }
+
+    /// Why a faster path (VPP, DMA-BUF) was dropped, if it was.
+    pub fn fallback_note(&self) -> Option<&str> {
+        self.fallback_note.as_deref()
+    }
+
     pub fn encode(&mut self, raw: &RawFrame, force_keyframe: bool) -> Result<Vec<EncodedFrame>> {
-        self.convert(raw)?;
+        if raw.dmabuf.is_some() {
+            self.convert_dmabuf(raw)?;
+        } else {
+            self.convert(raw)?;
+        }
+        self.have_frame = true;
+        self.submit(raw.seq, raw.capture_us, force_keyframe)
+    }
+
+    /// Encode the last converted frame again with a new timestamp. Used when
+    /// the compositor only sends frames on damage, so the viewer keeps getting
+    /// a steady (cheap, mostly skip-block) stream. Returns nothing before the
+    /// first real frame.
+    pub fn encode_repeat(&mut self, seq: u64, capture_us: u64, force_keyframe: bool) -> Result<Vec<EncodedFrame>> {
+        if !self.have_frame {
+            return Ok(Vec::new());
+        }
+        self.last_pack_us = 0;
+        self.last_convert_us = 0;
+        self.submit(seq, capture_us, force_keyframe)
+    }
+
+    fn submit(&mut self, seq: u64, capture_us: u64, force_keyframe: bool) -> Result<Vec<EncodedFrame>> {
         let t_upload0 = now_us();
-        let start = *self.start_us.get_or_insert(raw.capture_us);
-        let pts = raw.capture_us.saturating_sub(start) as i64;
+        let start = *self.start_us.get_or_insert(capture_us);
+        let mut pts = capture_us.saturating_sub(start) as i64;
+        // Repeats and real frames interleave; keep PTS strictly increasing.
+        if let Some(last) = self.last_pts {
+            if pts <= last {
+                pts = last + 1;
+            }
+        }
+        self.last_pts = Some(pts);
         let kind = if force_keyframe {
             ffmpeg_next::picture::Type::I
         } else {
@@ -431,14 +516,14 @@ impl Encoder {
                 self.inner.send_frame(&self.staging)?;
                 self.last_upload_us = 0;
             }
-            Upload::Vaapi { frames, vpp, .. } => {
+            Upload::Vaapi { frames, .. } => {
                 let frames_ptr = frames.as_ptr();
-                let have_vpp = vpp.is_some() && is_vaapi_pixel(self.packed.format());
-                if have_vpp {
+                if is_vaapi_pixel(self.packed.format()) {
+                    // Already a GPU surface (VPP output, from shared memory or DMA-BUF).
                     self.packed.set_pts(Some(pts));
                     self.packed.set_kind(kind);
                     self.inner.send_frame(&self.packed)?;
-                    self.last_upload_us = 0; // upload happened inside VPP
+                    self.last_upload_us = 0; // upload (if any) happened inside VPP
                 } else {
                     // Prefer the VPP/CPU output in `packed` when it holds NV12
                     // system memory, otherwise the CPU scaler output in `staging`.
@@ -454,16 +539,106 @@ impl Encoder {
         while self.inner.receive_packet(&mut packet).is_ok() {
             if let Some(data) = packet.data() {
                 out.push(EncodedFrame {
-                    seq: raw.seq,
+                    seq,
                     keyframe: packet.is_key(),
                     data: Bytes::copy_from_slice(data),
-                    capture_us: raw.capture_us,
+                    capture_us,
                     encoded_us: now_us(),
                 });
             }
         }
         self.last_encode_us = now_us().saturating_sub(t_enc0);
         Ok(out)
+    }
+
+    /// Map a DMA-BUF into VAAPI and convert it with VPP. Any failure is a
+    /// `DmaBufError`, so the caller switches the capture to shared memory.
+    fn convert_dmabuf(&mut self, raw: &RawFrame) -> Result<()> {
+        match self.try_convert_dmabuf(raw) {
+            Ok(()) => {
+                self.conversion = path::DMABUF_ZERO_COPY;
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                tracing::warn!("DMA-BUF import failed: {msg}");
+                if let Upload::Vaapi { dma, .. } = &mut self.upload {
+                    *dma = None;
+                }
+                self.fallback_note = Some(format!("DMA-BUF off: {msg}"));
+                Err(DmaBufError(msg).into())
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn try_convert_dmabuf(&mut self, raw: &RawFrame) -> Result<()> {
+        let dmabuf = raw.dmabuf.as_ref().ok_or_else(|| anyhow!("frame has no DMA-BUF"))?;
+        let device = match &self.upload {
+            Upload::Vaapi { _device, .. } => _device.as_ptr(),
+            Upload::Software => bail!("encoder {} cannot import DMA-BUF (needs VAAPI)", self.name),
+        };
+        let (out_w, out_h) = (self.config.width, self.config.height);
+        let key = (raw.format, raw.width, raw.height);
+        let rebuild = match &self.upload {
+            Upload::Vaapi { dma: Some(d), .. } => d.key != key,
+            _ => true,
+        };
+        if rebuild {
+            let frames = hw::create_frames_sized(
+                device,
+                ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
+                raw.format.to_ffmpeg().into(),
+                raw.width,
+                raw.height,
+                0,
+            )
+            .context("VAAPI frames context for DMA-BUF import")?;
+            let graph = VaapiVpp::build_graph(
+                device,
+                VppInput::Vaapi(frames.as_ptr()),
+                raw.width,
+                raw.height,
+                out_w,
+                out_h,
+            )?;
+            tracing::info!(
+                "DMA-BUF import: {:?} {}x{} modifier {:#x} → VAAPI VPP → nv12 {out_w}x{out_h}",
+                raw.format,
+                raw.width,
+                raw.height,
+                dmabuf.modifier
+            );
+            if let Upload::Vaapi { dma, .. } = &mut self.upload {
+                *dma = Some(DmaImport { frames, key, graph });
+            }
+        }
+        let Upload::Vaapi { dma: Some(import), .. } = &mut self.upload else {
+            bail!("DMA-BUF import state missing");
+        };
+
+        let t_map = now_us();
+        let mapped = map_dmabuf(import.frames.as_ptr(), raw, dmabuf)?;
+        self.last_pack_us = now_us().saturating_sub(t_map);
+
+        let t_vpp = now_us();
+        let mut src = import.graph.get("in").ok_or_else(|| anyhow!("vpp missing in"))?;
+        src.source().add(&mapped)?;
+        drop(mapped);
+        let mut sink = import.graph.get("out").ok_or_else(|| anyhow!("vpp missing out"))?;
+        let mut out = ffmpeg_next::frame::Video::empty();
+        sink.sink().frame(&mut out)?;
+        if !is_vaapi_pixel(out.format()) {
+            bail!("VPP returned system memory ({})", format_pixel(out.format()));
+        }
+        self.last_convert_us = now_us().saturating_sub(t_vpp);
+        self.packed = out;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn try_convert_dmabuf(&mut self, _raw: &RawFrame) -> Result<()> {
+        bail!("DMA-BUF is only supported on Linux")
     }
 
     fn transfer_to_vaapi_ptr(
@@ -496,14 +671,20 @@ impl Encoder {
     }
 
     fn convert(&mut self, raw: &RawFrame) -> Result<()> {
-        if self.conversion == "vaapi-vpp" {
+        // After a DMA-BUF fallback the label still says zero-copy; shared
+        // memory frames use VPP when the device has it.
+        if self.conversion == path::DMABUF_ZERO_COPY {
+            self.conversion = if self.vpp_failed() { path::SHM_CPU_UPLOAD } else { path::SHM_VPP };
+        }
+        if self.conversion == path::SHM_VPP {
             match self.convert_vaapi_vpp(raw) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     tracing::warn!(
                         "VAAPI VPP convert failed ({e:#}); falling back to CPU BGRx→NV12 for this session"
                     );
-                    self.conversion = "cpu+vaapi-upload";
+                    self.fallback_note = Some(format!("VPP off: {e:#}"));
+                    self.conversion = path::SHM_CPU_UPLOAD;
                     if let Upload::Vaapi { vpp, .. } = &mut self.upload {
                         *vpp = None;
                     }
@@ -511,6 +692,11 @@ impl Encoder {
             }
         }
         self.convert_cpu(raw)
+    }
+
+    fn vpp_failed(&self) -> bool {
+        self.fallback_note.as_deref().is_some_and(|n| n.starts_with("VPP off"))
+            || !matches!(self.upload, Upload::Vaapi { .. })
     }
 
     fn convert_vaapi_vpp(&mut self, raw: &RawFrame) -> Result<()> {
@@ -569,6 +755,11 @@ impl Encoder {
     fn convert_cpu(&mut self, raw: &RawFrame) -> Result<()> {
         let t0 = now_us();
         self.last_pack_us = 0;
+        if is_vaapi_pixel(self.packed.format()) {
+            // Drop a stale GPU surface from an earlier VPP/DMA-BUF frame so
+            // `submit` uploads the new CPU output instead.
+            self.packed = ffmpeg_next::frame::Video::empty();
+        }
         let key = (raw.format, raw.width, raw.height);
         if self.scaler.as_ref().is_none_or(|s| s.src != key) {
             let same = raw.width == self.config.width && raw.height == self.config.height;
@@ -677,14 +868,31 @@ impl VaapiVpp {
         dst_w: u32,
         dst_h: u32,
     ) -> Result<Self> {
+        let graph = Self::build_graph(device, VppInput::System(src), src_w, src_h, dst_w, dst_h)?;
+        Ok(Self {
+            graph,
+            src_format: src,
+            src_w,
+            src_h,
+        })
+    }
+
+    /// buffer → [hwupload] → scale_vaapi (to NV12, output size) → buffersink.
+    /// System-memory input gets an hwupload; VAAPI input (mapped DMA-BUF)
+    /// goes straight to VPP.
+    fn build_graph(
+        device: *mut ffi::AVBufferRef,
+        input: VppInput,
+        src_w: u32,
+        src_h: u32,
+        dst_w: u32,
+        dst_h: u32,
+    ) -> Result<ffmpeg_next::filter::Graph> {
         let Some(buffer) = ffmpeg_next::filter::find("buffer") else {
             bail!("libavfilter buffer is not in this FFmpeg");
         };
         let Some(sink) = ffmpeg_next::filter::find("buffersink") else {
             bail!("libavfilter buffersink is not in this FFmpeg");
-        };
-        let Some(hwupload) = ffmpeg_next::filter::find("hwupload") else {
-            bail!("hwupload filter is not in this FFmpeg");
         };
         let vpp = ffmpeg_next::filter::find("scale_vaapi")
             .or_else(|| ffmpeg_next::filter::find("vpp_vaapi"))
@@ -692,13 +900,19 @@ impl VaapiVpp {
         let vpp_name = vpp.name().to_owned();
 
         let mut graph = ffmpeg_next::filter::Graph::new();
-        let buf_args = format!(
-            "video_size={src_w}x{src_h}:pix_fmt={}:time_base=1/1000000:pixel_aspect=1/1",
-            format_pixel(src)
-        );
         let vpp_args = format!("w={dst_w}:h={dst_h}:format=nv12");
-        let mut in_ctx = graph.add(&buffer, "in", &buf_args)?;
-        let mut up_ctx = alloc_hw_filter(&mut graph, &hwupload, "upload", "", device)?;
+        let mut in_ctx = match input {
+            VppInput::System(src) => {
+                // Pixel formats by number: FFmpeg names (bgr0) differ from
+                // the Rust enum names (BGRZ).
+                let buf_args = format!(
+                    "video_size={src_w}x{src_h}:pix_fmt={}:time_base=1/1000000:pixel_aspect=1/1",
+                    ffi::AVPixelFormat::from(src) as i32
+                );
+                graph.add(&buffer, "in", &buf_args)?
+            }
+            VppInput::Vaapi(frames) => alloc_vaapi_buffersrc(&mut graph, &buffer, src_w, src_h, frames)?,
+        };
         let mut vpp_ctx = alloc_hw_filter(&mut graph, &vpp, "vpp", &vpp_args, device)?;
         let mut out_ctx = graph.add(&sink, "out", "")?;
         // Keep the result on a VAAPI surface so we do not download and
@@ -723,18 +937,144 @@ impl VaapiVpp {
                 tracing::warn!("could not pin buffersink to VAAPI ({})", ffmpeg_next::Error::from(ret));
             }
         }
-        in_ctx.link(0, &mut up_ctx, 0);
-        up_ctx.link(0, &mut vpp_ctx, 0);
+        if matches!(input, VppInput::System(_)) {
+            let Some(hwupload) = ffmpeg_next::filter::find("hwupload") else {
+                bail!("hwupload filter is not in this FFmpeg");
+            };
+            let mut up_ctx = alloc_hw_filter(&mut graph, &hwupload, "upload", "", device)?;
+            in_ctx.link(0, &mut up_ctx, 0);
+            up_ctx.link(0, &mut vpp_ctx, 0);
+        } else {
+            in_ctx.link(0, &mut vpp_ctx, 0);
+        }
         vpp_ctx.link(0, &mut out_ctx, 0);
         graph
             .validate()
             .with_context(|| format!("configuring {vpp_name} graph"))?;
-        Ok(Self {
-            graph,
-            src_format: src,
-            src_w,
-            src_h,
-        })
+        Ok(graph)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum VppInput {
+    System(Pixel),
+    Vaapi(*mut ffi::AVBufferRef),
+}
+
+/// A buffer source that takes VAAPI frames from `frames`.
+fn alloc_vaapi_buffersrc(
+    graph: &mut ffmpeg_next::filter::Graph,
+    buffer: &ffmpeg_next::filter::Filter,
+    w: u32,
+    h: u32,
+    frames: *mut ffi::AVBufferRef,
+) -> Result<ffmpeg_next::filter::Context> {
+    unsafe {
+        let ctx = ffi::avfilter_graph_alloc_filter(graph.as_mut_ptr(), buffer.as_ptr(), c"in".as_ptr());
+        if ctx.is_null() {
+            bail!("allocating buffer source");
+        }
+        let par = ffi::av_buffersrc_parameters_alloc();
+        if par.is_null() {
+            bail!("av_buffersrc_parameters_alloc failed");
+        }
+        (*par).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
+        (*par).width = w as i32;
+        (*par).height = h as i32;
+        (*par).time_base = ffi::AVRational { num: 1, den: 1_000_000 };
+        (*par).sample_aspect_ratio = ffi::AVRational { num: 1, den: 1 };
+        (*par).hw_frames_ctx = frames; // av_buffersrc_parameters_set takes its own reference
+        let ret = ffi::av_buffersrc_parameters_set(ctx, par);
+        ffi::av_free(par.cast());
+        if ret < 0 {
+            bail!("buffer source parameters: {}", ffmpeg_next::Error::from(ret));
+        }
+        let ret = ffi::avfilter_init_str(ctx, std::ptr::null());
+        if ret < 0 {
+            bail!("init buffer source: {}", ffmpeg_next::Error::from(ret));
+        }
+        Ok(ffmpeg_next::filter::Context::wrap(ctx))
+    }
+}
+
+/// Keeps our duplicate of the DMA-BUF fd alive for as long as FFmpeg holds
+/// the DRM-PRIME frame (until the mapped VAAPI surface is released).
+#[cfg(unix)]
+struct DrmHolder {
+    desc: ffi::AVDRMFrameDescriptor,
+    _fd: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+unsafe extern "C" fn free_drm_holder(opaque: *mut std::ffi::c_void, _data: *mut u8) {
+    if !opaque.is_null() {
+        drop(Box::from_raw(opaque as *mut DrmHolder));
+    }
+}
+
+/// Wrap a DMA-BUF as an `AV_PIX_FMT_DRM_PRIME` frame and map it into a VAAPI
+/// surface from `frames` (`av_hwframe_map`, no copy). Needs FFmpeg built with
+/// libdrm; otherwise this fails with "Function not implemented".
+#[cfg(unix)]
+fn map_dmabuf(
+    frames: *mut ffi::AVBufferRef,
+    raw: &RawFrame,
+    dmabuf: &crate::frame::DmaBufFrame,
+) -> Result<ffmpeg_next::frame::Video> {
+    use std::os::fd::AsRawFd;
+    let fd = dmabuf.fd.try_clone().context("duplicating DMA-BUF fd")?;
+    let size = if dmabuf.size > 0 {
+        dmabuf.size
+    } else {
+        (dmabuf.offset as usize).saturating_add((dmabuf.pitch as usize).saturating_mul(raw.height as usize))
+    };
+    // SAFETY: AVDRMFrameDescriptor is plain old data; all-zero is valid.
+    let mut desc: ffi::AVDRMFrameDescriptor = unsafe { std::mem::zeroed() };
+    desc.nb_objects = 1;
+    desc.objects[0].fd = fd.as_raw_fd();
+    desc.objects[0].size = size;
+    desc.objects[0].format_modifier = dmabuf.modifier;
+    desc.nb_layers = 1;
+    desc.layers[0].format = raw.format.drm_fourcc();
+    desc.layers[0].nb_planes = 1;
+    desc.layers[0].planes[0].object_index = 0;
+    desc.layers[0].planes[0].offset = dmabuf.offset as isize;
+    desc.layers[0].planes[0].pitch = dmabuf.pitch as isize;
+
+    let holder = Box::into_raw(Box::new(DrmHolder { desc, _fd: fd }));
+    unsafe {
+        let buf = ffi::av_buffer_create(
+            std::ptr::addr_of_mut!((*holder).desc).cast(),
+            std::mem::size_of::<ffi::AVDRMFrameDescriptor>(),
+            Some(free_drm_holder),
+            holder.cast(),
+            0,
+        );
+        if buf.is_null() {
+            drop(Box::from_raw(holder));
+            bail!("av_buffer_create failed");
+        }
+        let mut drm = ffmpeg_next::frame::Video::empty();
+        let f = drm.as_mut_ptr();
+        (*f).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+        (*f).width = raw.width as i32;
+        (*f).height = raw.height as i32;
+        (*f).buf[0] = buf; // the frame now owns the holder
+        (*f).data[0] = std::ptr::addr_of_mut!((*holder).desc).cast();
+
+        let mut mapped = ffmpeg_next::frame::Video::empty();
+        let m = mapped.as_mut_ptr();
+        (*m).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
+        (*m).hw_frames_ctx = ffi::av_buffer_ref(frames);
+        let ret = ffi::av_hwframe_map(m, f, ffi::AV_HWFRAME_MAP_READ as i32);
+        if ret < 0 {
+            bail!(
+                "VAAPI could not import the DMA-BUF (modifier {:#x}): {}",
+                dmabuf.modifier,
+                ffmpeg_next::Error::from(ret)
+            );
+        }
+        Ok(mapped)
     }
 }
 
@@ -773,9 +1113,13 @@ fn alloc_hw_filter(
     }
 }
 
+/// FFmpeg's own name for a pixel format ("bgr0", not the Rust enum's "BGRZ").
 fn format_pixel(p: Pixel) -> String {
-
-    format!("{p:?}").to_ascii_lowercase()
+    let name = unsafe { ffi::av_get_pix_fmt_name(p.into()) };
+    if name.is_null() {
+        return format!("{p:?}").to_ascii_lowercase();
+    }
+    unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned()
 }
 
 fn is_vaapi_pixel(p: Pixel) -> bool {
@@ -928,6 +1272,15 @@ mod tests {
         c.width = 1280;
         c.height = 720;
         assert_eq!(c.resolved_size(1920, 1080), (1280, 720));
+    }
+
+    #[test]
+    fn ffmpeg_pixel_names_are_ffmpeg_names() {
+        // The VPP buffer source once got "bgrz" (Rust enum name), which FFmpeg
+        // rejects, so every BGRx capture fell back to the CPU path.
+        assert_eq!(format_pixel(Pixel::BGRZ), "bgr0");
+        assert_eq!(format_pixel(Pixel::BGRA), "bgra");
+        assert_eq!(format_pixel(Pixel::RGBZ), "rgb0");
     }
 
     #[test]

@@ -2,6 +2,7 @@ mod applog;
 #[cfg(feature = "gui")]
 mod gui;
 mod presenter;
+mod session;
 mod viewer;
 #[cfg(feature = "gui")]
 mod yuv_glow;

@@ -32,19 +32,17 @@ impl Decoder {
                         tracing::warn!(
                             "{label} H.264 decode failed to open ({e:#}); falling back to software"
                         );
-                        Self::open(None)
+                        let mut d = Self::open(None)?;
+                        d.name = format!("h264 (software: {label} could not open the H.264 decoder)");
+                        Ok(d)
                     }
                 },
                 Err(e) => {
-                    let kind = if cfg!(target_os = "macos") {
-                        "VideoToolbox"
-                    } else {
-                        "VAAPI"
-                    };
-                    tracing::info!(
-                        "{kind} H.264 hardware decode unavailable ({e:#}); using software decoder"
-                    );
-                    Self::open(None)
+                    let note = software_reason();
+                    tracing::info!("{note} ({e:#}); using the software decoder");
+                    let mut d = Self::open(None)?;
+                    d.name = format!("h264 (software: {note})");
+                    Ok(d)
                 }
             },
         }
@@ -95,6 +93,13 @@ impl Decoder {
         })
     }
 
+    /// Software decoder used after the hardware one failed while decoding.
+    pub fn software_after_hw_failure() -> Result<Self> {
+        let mut d = Self::open(None)?;
+        d.name = format!("h264 (software: {})", software_reason());
+        Ok(d)
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -128,16 +133,28 @@ impl Decoder {
             }
             Ok(Some(&self.sw_frame))
         } else {
-            if self._hw.is_some() && !self.name.contains("fallback") {
+            if self._hw.is_some() && !self.name.contains("software") {
                 tracing::warn!(
                     "{} did not produce a hardware frame (format {:?}); using software pixels",
                     self.name,
                     self.hw_frame.format()
                 );
-                self.name.push_str(" + software fallback");
+                self.name = format!("h264 (software: {})", software_reason());
             }
             Ok(Some(&self.hw_frame))
         }
+    }
+}
+
+/// Why hardware decode is not there, in words for the viewer overlay.
+fn software_reason() -> &'static str {
+    if cfg!(target_os = "macos") {
+        // Pre-2012 Macs (e.g. the iMac 2011's Radeon HD 6770M, also under
+        // OpenCore Legacy Patcher) have no VideoToolbox H.264 decoder.
+        // Software decode of a 1080p desktop stream takes a few ms there.
+        "this Mac's GPU has no VideoToolbox H.264 decoder (normal for pre-2012 Macs); software decode is fine"
+    } else {
+        "no VAAPI H.264 decoder on this machine"
     }
 }
 

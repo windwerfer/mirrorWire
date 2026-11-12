@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [features]
 default = ["gui", "portal"]
-gui = ["dep:eframe", "dep:arboard"]
+gui = ["dep:eframe"]
 portal = ["mirrorwire-media/portal"]
 static-ffmpeg = ["mirrorwire-media/static-ffmpeg"]
 
@@ -28,7 +28,6 @@ clap = { version = "4", features = ["derive"] }
 mirrorwire-proto = { path = "../mirrorwire-proto" }
 mirrorwire-media = { path = "../mirrorwire-media" }
 mirrorwire-net = { path = "../mirrorwire-net" }
-eframe = { version = "0.37", optional = true, default-features = false, features = ["glow", "wgpu", "default_fonts", "wayland", "x11"] }
-arboard = { version = "3", optional = true }
+eframe = { version = "0.37", optional = true, default-features = false, features = ["glow", "wgpu", "default_fonts", "wayland", "x11", "clipboard"] }
 dirs = "7"
 libc = "0.2"

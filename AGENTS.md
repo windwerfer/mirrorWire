@@ -56,7 +56,13 @@ sharp text, and no special privileges.
 9. **Don't crash on hostile input.** Datagrams, control messages, mDNS records, QR/URI strings
    and config files come from outside. Bound lengths, use `get()`/checked arithmetic, return
    errors. A malformed packet is dropped and counted, never a panic.
-10. **Licences.** The source is `MIT OR Apache-2.0`. New dependencies must be permissive (MIT,
+10. **Linux is Wayland-first.** The presenter and viewer target native Wayland. X11 support
+    that comes for free stays (winit's X11 backend, the Flatpak `--socket=fallback-x11`), but
+    never write X11-specific code: no X11 workarounds, no Xlib/XCB calls, no X11 clipboard or
+    capture paths, no "if X11 then…" branches beyond reporting which window system is in use.
+    Fix a Wayland problem on Wayland (portals, smithay/winit, wayland-data-control). See
+    [decisions.md](docs/agents/decisions.md) D13.
+11. **Licences.** The source is `MIT OR Apache-2.0`. New dependencies must be permissive (MIT,
     Apache-2.0, BSD, ISC, Zlib, Unicode, CC0, MPL-2.0 unmodified). GPL code is only ever
     *linked at build time by packaging* (x264 in the Linux release builds), never vendored or
     copied into the source tree. See [decisions.md](docs/agents/decisions.md) D8.

@@ -359,7 +359,7 @@ fn decode_loop(
                 }
                 if decoder.is_hardware() && (transfer_fail || consecutive_hw_errors >= 3) {
                     tracing::warn!("hardware decode failed ({e}); falling back to software H.264");
-                    decoder = Decoder::new(HwDecode::None)?;
+                    decoder = Decoder::software_after_hw_failure()?;
                     decoder_name = decoder.name().to_owned();
                     status.lock().expect("status lock").decoder = decoder_name.clone();
                     consecutive_hw_errors = 0;

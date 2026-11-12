@@ -98,6 +98,13 @@ first frame) plus a copyable log. After a timeout it suggests
 `sudo firewall-cmd --add-port=47800/udp`. The CLI subcommands (`present`, `view`,
 `discover`) still work, including headless tests.
 
+The presenter shows its **Capture path**: `dmabuf-zero-copy` (compositor GPU buffer
+straight into the VAAPI encoder, no CPU copy) or `shm+upload (…)` (shared memory, with
+the reason DMA-BUF was turned off), plus the real capture fps and the repeats sent while
+the screen is still. Both windows show the window system in the footer
+(`Wayland (native)` or `X11 via XWayland`); Linux is Wayland-first. **Copy** buttons use
+the Wayland clipboard (the text stays selectable if pasting fails).
+
 Logs are written to `~/Library/Logs/MirrorWire/mirrorwire.log` on macOS and to
 `$XDG_STATE_HOME/mirrorwire/mirrorwire.log` on Linux (under
 `~/.var/app/io.github.windwerfer.MirrorWire/` for the Flatpak). The path is shown
@@ -148,7 +155,8 @@ cargo build --release
 
 Useful presenter options: `--fps 60 --bitrate-kbps 40000` (or `--bitrate-mbps 40`),
 `--rc auto|cbr|vbr|cqp|icq`, `--qp 18`, `--keyint` (frames; 0 = 10 s),
-`--encoder auto|vaapi|x264`, `--intra-refresh`, `--source test`, `--no-pairing`, `--port`.
+`--encoder auto|vaapi|x264`, `--intra-refresh`, `--source test`, `--no-pairing`, `--port`,
+`--no-dmabuf` (capture through shared memory instead of zero-copy GPU buffers).
 The default size is the native capture. `--size 1920x1080` (or `--width` / `--height`)
 overrides it and scales. If a viewer finds the presenter but cannot connect, open
 the port on Fedora: `sudo firewall-cmd --add-port=47800/udp`.
@@ -225,7 +233,7 @@ when the portal only sent 6.8 fps, because PTS advanced by 1/60 s per frame.
 | pinned TLS, pairing code, paired-viewer memory | tested: wrong fingerprint and missing code are rejected |
 | mDNS announce/browse | tested on one host |
 | egui viewer | runs on the VM (llvmpipe, X11) and on a 2011 iMac (OpenGL / glow, macOS 15 via OCLP) |
-| portal + PipeWire capture | tested on Fedora KDE (T480s, 1920×1080) |
+| portal + PipeWire capture | tested on Fedora KDE (T480s, 1920×1080), shared memory; DMA-BUF zero-copy built, untested on hardware |
 | VAAPI encode | tested on T480s UHD 620 (`h264_vaapi`); default is now 40 Mbit/s CBR, High profile, native size |
 | VAAPI decode | compiles, unused on the iMac (software H.264 there) |
 | VideoToolbox encode/decode, macOS build | software H.264 decode works on the 2011 iMac |
@@ -269,8 +277,9 @@ builds use only FFmpeg's LGPL parts plus VideoToolbox.
    `--permanent` and reload to keep it).
 3. Forward error correction (Reed-Solomon parity per frame) so single packet
    losses on Wi-Fi do not cost a keyframe or artifacts.
-4. Zero-copy: PipeWire DMA-BUF -> VAAPI surface; VideoToolbox -> Metal texture,
-   YUV->RGB in a wgpu shader instead of swscale + egui texture upload.
+4. Zero-copy on the viewer: VideoToolbox -> texture, YUV->RGB in a wgpu shader
+   (the presenter's PipeWire DMA-BUF -> VAAPI path is built; the presenter shows
+   "Capture path: dmabuf-zero-copy" when it is active).
 5. Adaptive bitrate from QUIC RTT/loss stats.
 6. Vendor cargo sources (flatpak-cargo-generator) for a Flathub submission; notarized Mac builds.
 7. QR scanning with the viewer's camera, virtual-monitor (extend) mode via portal.
