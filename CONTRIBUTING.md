@@ -15,6 +15,8 @@ Thanks for helping. Before you start:
    cargo clippy --workspace --all-targets -- -D warnings
    cargo test --workspace
    scripts/loopback-test.sh 10 --encoder x264
+   cargo audit
+   cargo deny --all-features --locked check advisories bans licenses sources
    ```
 
 5. Keep commits small and focused. Say what you tested and on which hardware. Latency or quality

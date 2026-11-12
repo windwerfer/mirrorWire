@@ -11,6 +11,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  audit:
+    name: Audit
+    uses: ./.github/workflows/audit.yml
+
   test:
     name: Test (Linux)
     runs-on: ubuntu-24.04

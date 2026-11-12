@@ -7,6 +7,10 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/windwerfer/mirrorWire"
+# The binary is distributed as a Flatpak, AppImage or DMG, not as crates.io
+# packages. This also lets cargo-deny treat in-tree path deps as private
+# (allow-wildcard-paths) rather than as version = "*".
+publish = false
 
 [workspace.dependencies]
 anyhow = "1"

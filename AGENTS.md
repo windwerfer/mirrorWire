@@ -85,11 +85,16 @@ cargo fmt --all                                    # see the formatting note in 
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 scripts/loopback-test.sh 10 --encoder x264         # end to end on localhost
+cargo audit                                        # RustSec advisories; fail on vulnerabilities
+cargo deny --all-features --locked check advisories bans licenses sources
 ```
 
-CI (`.github/workflows/ci.yml`) runs clippy, tests and a 5 s loopback. The build workflow
-(`build.yml`) must also stay green for all four artifacts. Details:
-[testing.md](docs/agents/testing.md).
+Install `cargo-audit` and `cargo-deny` once (`cargo install cargo-audit cargo-deny`).
+CI (`.github/workflows/ci.yml`) runs clippy, tests, a 5 s loopback, and the audit
+workflow (`.github/workflows/audit.yml`) on every push and pull request. The build
+workflow (`build.yml`) waits for that same audit to pass before it produces any
+artifact. Audit also runs weekly on a schedule so new advisories against existing
+pins are caught. Details: [testing.md](docs/agents/testing.md).
 
 ## 4. Git
 

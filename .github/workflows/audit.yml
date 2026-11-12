@@ -1,0 +1,44 @@
+# Reusable supply-chain checks. Called from CI (every push and PR) and from
+# Build (artifacts are not produced unless this passes). Also runs weekly so
+# new advisories against existing pins are caught without a lockfile change.
+name: Audit
+
+on:
+  schedule:
+    # Monday 06:27 UTC. Off the hour to dodge the shared Actions rush.
+    - cron: "27 6 * * 1"
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    name: cargo audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # cargo-audit refreshes the crates.io index when checking yanked crates.
+      - uses: dtolnay/rust-toolchain@stable
+      # rustsec/audit-check has no Node 24 release tag yet (v2.0.0 is Node 20).
+      # Install the CLI with a Node-24-compatible composite action instead.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Default cargo-audit: fail on vulnerabilities, warn (do not fail) on
+      # yanked, unmaintained and unsound advisories.
+      - name: cargo audit
+        run: cargo audit
+
+  cargo-deny:
+    name: cargo deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny
+        run: cargo deny --all-features --locked check advisories bans licenses sources

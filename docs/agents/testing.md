@@ -7,10 +7,15 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 scripts/loopback-test.sh 10 --encoder x264
+cargo audit
+cargo deny --all-features --locked check advisories bans licenses sources
 ```
 
+`cargo-audit` and `cargo-deny` are not part of the Rust toolchain; install them
+with `cargo install cargo-audit cargo-deny` (or `taiki-e/install-action` in CI).
+
 Build dependencies (Fedora and Ubuntu package lists) are in the README and in
-`.github/workflows/ci.yml`. A headless box without a GPU or a portal can run all four gates.
+`.github/workflows/ci.yml`. A headless box without a GPU or a portal can run all of these gates.
 
 **Formatting note.** `main` is not yet `cargo fmt`-clean (the code was written to a wider line
 width and there is no `rustfmt.toml`), and CI does not check formatting. Until the owner picks
@@ -86,11 +91,23 @@ screen**, not logs. So:
 
 ## 5. CI and artifacts
 
-- `ci.yml` (push to `main`, PRs): clippy `-D warnings`, `cargo test`, 5 s loopback with x264.
-- `build.yml` (push to `main`, `v*` tags): macOS arm64 DMG (`macos-15`), macOS x86_64 DMG
-  (`macos-15-intel`, min 10.13), Flatpak, AppImage (Ubuntu 24.04); a `v*` tag creates a GitHub
-  Release with all four. The Intel Mac job is the slowest (static FFmpeg build on older runners);
-  that is normal.
+- `ci.yml` (push to `main`, PRs): clippy `-D warnings`, `cargo test`, 5 s loopback with x264,
+  and the reusable audit workflow.
+- `audit.yml` (called from CI and Build; also `workflow_dispatch` and a weekly Monday cron):
+  `cargo audit` against the RustSec advisory DB, and
+  `cargo deny check advisories bans licenses sources` with `deny.toml`.
+  `cargo audit` fails only on vulnerabilities; yanked and unmaintained crates are warnings.
+  `cargo-deny` does the same for yanked crates, ignores unmaintained advisories (it has no
+  warn-only level for them; `cargo audit` still prints those), fails on unsound crates and
+  on any licence or source outside the allow-list, and warns on duplicate crate versions.
+  Only crates.io is an allowed source. If an advisory hits a transitive dependency with no
+  fix yet, add a justified `{ id = "RUSTSEC-…", reason = "…" }` ignore in `deny.toml` (and
+  `--ignore` for `cargo audit` if needed) and report it; do not silently pass a vulnerability.
+- `build.yml` (push to `main`, `v*` tags): the macOS, AppImage and Flatpak jobs all `needs:
+  audit`, so a vulnerable or policy-violating lockfile never produces an artifact. Then:
+  macOS arm64 DMG (`macos-15`), macOS x86_64 DMG (`macos-15-intel`, min 10.13), Flatpak,
+  AppImage (Ubuntu 24.04); a `v*` tag creates a GitHub Release with all four. The Intel Mac
+  job is the slowest (static FFmpeg build on older runners); that is normal.
 - Artifacts are uploaded with `archive: false`, so each download is the bare `.dmg` /
   `.flatpak` / `.AppImage`.
 - **Re-runs hide artifacts:** if a job is re-run, the run page shows the latest attempt, which

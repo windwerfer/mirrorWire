@@ -10,8 +10,13 @@ permissions:
   contents: read
 
 jobs:
+  audit:
+    name: Audit
+    uses: ./.github/workflows/audit.yml
+
   macos:
     name: macOS ${{ matrix.arch }}
+    needs: audit
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -69,6 +74,7 @@ jobs:
 
   appimage:
     name: Linux AppImage
+    needs: audit
     # pipewire-rs 0.10 needs PipeWire >= 1.0 headers; Ubuntu 22.04 ships 0.3.48.
     runs-on: ubuntu-24.04
     env:
@@ -109,6 +115,7 @@ jobs:
 
   flatpak:
     name: Linux Flatpak
+    needs: audit
     runs-on: ubuntu-24.04
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08

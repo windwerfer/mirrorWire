@@ -1,0 +1,68 @@
+# Supply-chain policy for cargo-deny.
+# Policy: licences in AGENTS.md §1.10, crates.io only, no wildcard deps.
+# Run: cargo deny --all-features --locked check advisories bans licenses sources
+#
+# Dual-licensed crates are accepted if at least one licence is on the allow
+# list. That covers self_cell (Apache-2.0 OR GPL-2.0-only) and r-efi
+# (MIT OR Apache-2.0 OR LGPL-2.1-or-later) without allowing GPL/LGPL
+# generally. GPL is only ever linked at packaging time (x264), never as a
+# crate licence we accept for source (decision D8).
+
+[graph]
+# Match CI: check every optional feature (gui, portal, static-ffmpeg, …).
+all-features = true
+
+[advisories]
+# Vulnerabilities always fail (cargo-deny 0.20 has no lint level for them).
+# Yanked crates and unmaintained advisories should warn, not fail the build,
+# unless the advisory is an actual vulnerability. cargo-deny 0.20 can only
+# fail or ignore unmaintained crates (no "warn" level), so they are ignored
+# here; `cargo audit` still prints them as warnings without failing.
+yanked = "warn"
+unmaintained = "none"
+# Unsound is a real defect, not a maintenance warning.
+unsound = "all"
+# Ignored advisories go here with the RUSTSEC id and a reason, and must be
+# reported to the owner. Remove an ignore once a fixed version is in use.
+ignore = []
+
+[licenses]
+# Allow-list verified against `cargo deny --all-features list` on this tree.
+# Permissive licences from AGENTS.md §1.10, plus ones the current graph
+# actually needs (LLVM exception, 0BSD, Unlicense, Boost, CDLA for rustls
+# roots, WTFPL for the ffmpeg-next bindings).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "0BSD",
+    "Unlicense",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "WTFPL",
+]
+confidence-threshold = 0.8
+# egui's default fonts: source is MIT OR Apache-2.0, the bundled font files
+# are OFL-1.1 and Ubuntu Font Licence 1.0. Keep these off the global list.
+exceptions = [
+    { crate = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Path deps between unpublished workspace crates have no version. That is not
+# a wildcard on crates.io; allow those, still deny version = "*" elsewhere.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
