@@ -5,7 +5,8 @@
 # Needs: python3, ANDROID_HOME (platforms;android-35, build-tools;35.0.0), ANDROID_NDK_HOME,
 # a JDK 17 on PATH, cargo-ndk and the aarch64-linux-android Rust target.
 # Usage: packaging/android/build-apk.sh [out-dir]
-# Optional: MIRRORWIRE_KEYSTORE=path (a debug key is generated when missing),
+# Optional: ANDROID_ABI (default arm64-v8a; x86_64 for the emulator),
+#           MIRRORWIRE_KEYSTORE=path (a debug key is generated when missing),
 #           VERSION_CODE (default 1).
 set -euo pipefail
 
@@ -14,6 +15,7 @@ OUT="$(mkdir -p "${1:-dist}" && cd "${1:-dist}" && pwd)"
 HERE="$ROOT/packaging/android"
 PLATFORM="${ANDROID_PLATFORM:-android-35}"
 BUILD_TOOLS="${ANDROID_BUILD_TOOLS:-35.0.0}"
+ABI="${ANDROID_ABI:-arm64-v8a}"
 : "${ANDROID_HOME:?set ANDROID_HOME to the Android SDK}"
 : "${ANDROID_NDK_HOME:?set ANDROID_NDK_HOME to the Android NDK}"
 BT="$ANDROID_HOME/build-tools/$BUILD_TOOLS"
@@ -27,12 +29,12 @@ VERSION_CODE="${VERSION_CODE:-1}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-echo "== Rust library (arm64-v8a)"
-(cd "$ROOT" && cargo ndk -t arm64-v8a --platform 26 -o "$WORK/apk/lib" build --release --locked -p mirrorwire-android)
-SO="$WORK/apk/lib/arm64-v8a/libmirrorwire_android.so"
+echo "== Rust library ($ABI)"
+(cd "$ROOT" && cargo ndk -t "$ABI" --platform 26 -o "$WORK/apk/lib" build --release --locked -p mirrorwire-android)
+SO="$WORK/apk/lib/$ABI/libmirrorwire_android.so"
 [ -f "$SO" ] || { echo "cargo-ndk did not produce $SO" >&2; exit 1; }
 "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-strip --strip-debug "$SO"
-ls -la "$WORK/apk/lib/arm64-v8a"
+ls -la "$WORK/apk/lib/$ABI"
 
 echo "== Java shell"
 mkdir -p "$WORK/classes" "$WORK/dex"
@@ -72,7 +74,7 @@ if [ ! -f "$KEYSTORE" ]; then
     -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
     -dname "CN=MirrorWire Debug,O=MirrorWire,C=DE" >/dev/null
 fi
-APK="$OUT/MirrorWire-arm64-v8a.apk"
+APK="$OUT/MirrorWire-$ABI.apk"
 "$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android \
   --ks-key-alias androiddebugkey --out "$APK" "$WORK/aligned.apk"
 "$BT/apksigner" verify --verbose "$APK" | head -n 4
