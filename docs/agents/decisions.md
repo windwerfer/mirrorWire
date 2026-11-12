@@ -37,7 +37,10 @@ Newest first. Add an entry when the owner decides something non-obvious.
   never write X11-specific code. Clipboard now goes through egui/winit (smithay-clipboard).
 - **2026-11 (Android viewer):** the owner wants an installable APK (thin Kotlin/Java shell that
   is never touched, loading the Rust viewer, the neurofeed pattern), and later a browser
-  viewer for people who don't want to install anything.
+  viewer for people who don't want to install anything. Built as: one `NativeActivity`
+  subclass in Java (multicast lock, link hand-off), all logic in `crates/mirrorwire-android`
+  (egui/glow, MediaCodec, no FFmpeg), APK built without Gradle, debug-signed arm64-v8a,
+  minSdk 26. The browser viewer (WebTransport + WebCodecs) is a roadmap sketch, not built.
 
 - **2026-11 (GitHub CodeQL):** the owner wants CodeQL as a second, separate
   security check next to SonarCloud, on every push to `main`, on pull

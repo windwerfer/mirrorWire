@@ -15,7 +15,9 @@ target), **planned**, **idea**. Update this file when an item moves.
 | Viewer on the iMac (OpenGL, DMG x86_64) | works on the target iMac |
 | Pairing, pinned TLS, mDNS | works between the target machines (after opening 47800/udp) |
 | Flatpak, AppImage, DMGs in CI | built; Flatpak and x86_64 DMG run on target |
-| Camera QR scan, Android | not started |
+| Android viewer APK (arm64-v8a, MediaCodec) | built (2026-11-13), untested on a device |
+| Browser (WebAssembly) viewer | design sketch below, not started |
+| Camera QR scan in the desktop viewer | not started (Android: the phone's camera app opens the `mirrorwire://` link) |
 
 ## Next (owner-agreed order)
 
@@ -46,7 +48,26 @@ target), **planned**, **idea**. Update this file when an item moves.
   the owner decides when to tag).
 - Flathub (vendored cargo sources), notarized Mac builds (needs a paid Apple account).
 - Miracast sink as a second `VideoSink`.
-- **Android** presenter/viewer later (MediaProjection + MediaCodec via JNI).
+- **Android viewer polish:** zero-copy MediaCodec → `SurfaceTexture`/`AHardwareBuffer` → GL
+  texture instead of the CPU YUV→RGBA copy; soft keyboard for the link field (today: QR via
+  the camera app, or the keypad + mDNS list); a stable release keystore so updates install
+  over each other (CI debug keys change per run).
+- **Android presenter** later (MediaProjection + MediaCodec encode; needs Java/JNI glue).
+- **Browser viewer (WebAssembly), sketch:**
+  - Presenter: add an HTTP/3 WebTransport endpoint on the same UDP port family (e.g. `wtransport`
+    or `h3` + `quinn`), serving a static page + wasm. Video goes as WebTransport datagrams with
+    the existing fragment header; control messages on a bidirectional stream.
+  - Trust: browsers reject self-signed certs unless pinned via
+    `serverCertificateHashes` (cert valid ≤ 14 days, ECDSA P-256). The presenter would mint a
+    short-lived WebTransport cert signed by nothing and put its hash in the QR/URL
+    (`https://<ip>:<port>/#cert=<sha256>&code=<pairing>`); pairing code as today.
+  - Page: egui compiled to wasm (or plain JS) + **WebCodecs** `VideoDecoder` (`avc1.42E0xx`,
+    `optimizeForLatency: true`), drawing `VideoFrame`s onto a canvas. Needs a secure context:
+    serving the page itself over HTTPS with the same pinned cert is the open problem
+    (browsers do not pin for page loads), so a small hosted loader page (GitHub Pages) that
+    only opens WebTransport to the LAN address may be required.
+  - Wire: reuse `mirrorwire-proto` compiled to wasm (it has no I/O by design, see architecture.md §1).
+
 
 ## Open questions
 

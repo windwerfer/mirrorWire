@@ -2,7 +2,7 @@
 
 ## 1. Crates and layering
 
-A Cargo workspace with four crates. Lower layers never depend on higher ones.
+A Cargo workspace with five crates. Lower layers never depend on higher ones.
 
 | Layer | Crate | Job | May depend on |
 |---|---|---|---|
@@ -10,12 +10,13 @@ A Cargo workspace with four crates. Lower layers never depend on higher ones.
 | L1 | `mirrorwire-media` | Frame sources (test pattern, portal + PipeWire), H.264 encoder and decoder via FFmpeg (VAAPI / VideoToolbox / x264), YUV→RGBA conversion, the capture→encode loop and the `VideoSink` trait. | `mirrorwire-proto` |
 | L1 | `mirrorwire-net` | Identity (self-signed cert), pinned TLS verifiers, QUIC presenter/viewer sessions, pairing (`paired_viewers.json`, pairing code, `mirrorwire://` URI, QR), mDNS announce/browse. | `mirrorwire-proto` |
 | L2 | `mirrorwire-app` | The `mirrorwire` binary: CLI (`present`, `view`, `view --headless`, `discover`), presenter and viewer glue, the egui GUI (start screen, presenter status, viewer list, video, stats overlay). | all of the above |
+| L2 | `mirrorwire-android` | The Android viewer: `libmirrorwire_android.so` loaded by the APK. egui (glow) via `android-activity` NativeActivity, MediaCodec decode (`ndk` crate, `AImageReader` → CPU BT.709 → texture), the viewer receive loop. No FFmpeg. On non-Android targets only its pure helpers (`h264`, `yuv`) compile, so host `cargo test` covers them. | `mirrorwire-proto`, `mirrorwire-net` |
 
 ```
 mirrorwire-proto  <-  mirrorwire-media
                   <-  mirrorwire-net
                          ^       ^
-                         mirrorwire-app
+                         mirrorwire-app   mirrorwire-android (proto + net only)
 ```
 
 Rules:
@@ -23,7 +24,8 @@ Rules:
 - **`mirrorwire-media` and `mirrorwire-net` never depend on each other.** The presenter pushes
   encoded frames into a `VideoSink`; QUIC is one sink. A Miracast/RTSP sink or a file sink can be
   added beside it without touching the encoder.
-- **Only `mirrorwire-app` knows about egui/eframe, clap and tracing-subscriber.** Library crates
+- **Only `mirrorwire-app` and `mirrorwire-android` know about egui/eframe** (and only the app
+  about clap and tracing-subscriber). Library crates
   log through `tracing` and return `anyhow::Result`.
 - **Only `mirrorwire-media` touches FFmpeg and `unsafe`.** The `unsafe` is FFmpeg FFI
   (hardware frame contexts, raw `AVCodecContext` fields, `Send` impls for FFmpeg wrappers). Keep
@@ -110,3 +112,22 @@ x264 on Linux only). `packaging/macos/` makes the `.app` and a UDZO DMG (ad-hoc 
 `packaging/flatpak/` the Flatpak (runtime `org.freedesktop.Platform//25.08`),
 `packaging/appimage/` the AppImage (built on Ubuntu 24.04, needs glibc 2.39+). See
 [testing.md](testing.md) §5 for CI.
+
+## Android viewer (APK)
+
+```
+packaging/android/MainActivity.java   extends NativeActivity; the only Java. Holds the Wi-Fi
+                                      MulticastLock (mDNS), keeps the screen on, writes an
+                                      opened mirrorwire:// link to files/pending_uri.txt
+crates/mirrorwire-android             android_main -> eframe (glow) -> ViewerApp
+  app.rs      home (mDNS list, 6-digit keypad, link field), connecting steps, video + overlay;
+              polls pending_uri.txt every 500 ms (QR scanned with the camera app opens the link)
+  session.rs  QUIC receive loop (same as mirrorwire-app's viewer) + a decode thread
+  codec.rs    AMediaCodec "video/avc" (hardware first, then c2.android.avc.decoder /
+              OMX.google.h264.decoder) -> AImageReader YUV_420_888 -> yuv.rs -> RGBA
+packaging/android/build-apk.sh        cargo-ndk + javac/d8 + aapt2 + zipalign + apksigner (no Gradle)
+```
+
+The Java shell is deliberately frozen: new features go into the Rust crate. Debug output:
+`adb logcat -s mirrorwire`.
+

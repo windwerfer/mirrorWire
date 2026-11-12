@@ -13,7 +13,7 @@ show). The main job: put a Fedora KDE laptop's screen on an old iMac with near-H
 sharp text, and no special privileges.
 
 **Non-goals:** remote desktop control (no input injection), internet/relay streaming, audio
-(not yet planned), WebAssembly builds, AirPlay or Miracast *sources*, anything that needs root,
+(not yet planned), a WebAssembly *presenter* (a browser viewer is planned), AirPlay or Miracast *sources*, anything that needs root,
 `setcap`, kernel modules or a display-server hack.
 
 ## Orientation, in this order

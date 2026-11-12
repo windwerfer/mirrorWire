@@ -78,9 +78,16 @@ then Artifacts). A `v*` tag also attaches them to a GitHub Release:
 | `MirrorWire-<ver>-macos-arm64.dmg` | Apple Silicon Macs, macOS 11 or newer | FFmpeg statically linked |
 | `MirrorWire-x86_64.flatpak` | Linux (Fedora, …) | `flatpak install --user MirrorWire-x86_64.flatpak` |
 | `MirrorWire-x86_64.AppImage` | Linux, glibc 2.39 or newer (Fedora 40+, Ubuntu 24.04+) | needs `libva` and `libpipewire` from the system |
+| `MirrorWire-arm64-v8a.apk` | Android 8+ phones and tablets (64-bit ARM), **viewer only** | debug-signed: allow "install unknown apps"; uninstall an older build first |
 
 `<ver>` is the version on a tagged release, or the short commit SHA on a
 `main`-branch build. Each artifact is a single file (not a zip).
+
+**Android viewer.** Install the APK, open MirrorWire, and either tap a presenter in the
+list (same Wi-Fi), type the 6-digit pairing code on the keypad the first time, or scan the
+presenter's QR code with the phone's camera app: the `mirrorwire://` link opens MirrorWire
+and connects. Tap the video to show or hide the stats and **Disconnect**. Logs:
+`adb logcat -s mirrorwire`.
 
 **Opening the unsigned Mac app.** The builds are ad-hoc signed, not notarized.
 Open the DMG, drag `MirrorWire.app` to Applications, then right-click it and
@@ -241,7 +248,9 @@ when the portal only sent 6.8 fps, because PTS advanced by 1/60 s per frame.
 | VideoToolbox encode/decode, macOS build | software H.264 decode works on the 2011 iMac |
 | Flatpak, AppImage, macOS .app / DMG builds | built in CI; Flatpak presenter and Intel DMG viewer start on the real machines |
 | camera QR scanning | not started |
-| Android presenter/viewer | later (MediaProjection + MediaCodec via JNI) |
+| Android viewer (APK) | built, untested on devices: arm64-v8a, Android 8+, MediaCodec decode |
+| Android presenter | later (MediaProjection) |
+| Browser viewer (WebAssembly) | planned (WebTransport + WebCodecs) |
 
 
 ## Security
@@ -290,7 +299,8 @@ builds use only FFmpeg's LGPL parts plus VideoToolbox.
 6. Vendor cargo sources (flatpak-cargo-generator) for a Flathub submission; notarized Mac builds.
 7. QR scanning with the viewer's camera, virtual-monitor (extend) mode via portal.
 8. Optional Miracast sink as a second `VideoSink`.
-9. Android comes later. WebAssembly is out of scope (capture and codecs are native).
+9. The Android APK is a viewer only, debug-signed (each CI build has a new key: uninstall the old
+   one before installing a newer build). No browser viewer yet.
 
 ## Contributing
 

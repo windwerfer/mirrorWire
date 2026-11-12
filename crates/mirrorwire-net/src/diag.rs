@@ -317,6 +317,7 @@ impl FirewallHint {
         );
 
         #[cfg(not(target_os = "linux"))]
+        #[allow(clippy::needless_return)] // only "needless" when the linux block is compiled out
         {
             let _ = static_msg;
             return Self {
