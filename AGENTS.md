@@ -96,11 +96,14 @@ cargo deny --all-features --locked check advisories bans licenses sources
 ```
 
 Install `cargo-audit` and `cargo-deny` once (`cargo install cargo-audit cargo-deny`).
-CI (`.github/workflows/ci.yml`) runs clippy, tests, a 5 s loopback, and the audit
-workflow (`.github/workflows/audit.yml`) on every push and pull request. The build
-workflow (`build.yml`) waits for that same audit to pass before it produces any
-artifact. Audit also runs weekly on a schedule so new advisories against existing
-pins are caught. Details: [testing.md](docs/agents/testing.md).
+CI (`.github/workflows/ci.yml`) runs clippy, tests, a 5 s loopback, the audit
+workflow (`.github/workflows/audit.yml`), and SonarCloud on every push and pull
+request. CodeQL (`.github/workflows/codeql.yml`) is a second, separate scan
+of the Rust code and GitHub Actions workflows on those same events, plus a
+weekly schedule. The build workflow (`build.yml`) waits for that same audit
+to pass before it produces any artifact. Audit also runs weekly on a
+schedule so new advisories against existing pins are caught. Details:
+[testing.md](docs/agents/testing.md).
 
 ## 4. Git
 

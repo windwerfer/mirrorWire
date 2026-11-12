@@ -105,6 +105,16 @@ screen**, not logs. So:
   be off** under SonarCloud Administration › Analysis method for
   `windwerfer_mirrorWire`; if it is still on, the upload fails and should
   not be worked around in the workflow.
+- `codeql.yml` (push to `main`, pull requests, weekly Wednesday cron, and
+  `workflow_dispatch`; also called from Build on `v*` tags and
+  `workflow_dispatch`): GitHub CodeQL advanced setup for `rust` and
+  `actions`, both with `build-mode: none` (no Linux media deps, no workspace
+  compile). `github/codeql-action` init/analyze are pinned to a full SHA.
+  Results upload to Security › Code scanning. **CodeQL default setup must
+  be off** under Settings › Code security › Code scanning; if it is still
+  on, the advanced workflow fails and should not be worked around.
+  Branch-push Builds do not re-run this job, because the standalone
+  workflow already ran on the same push.
 - `audit.yml` (called from CI and Build; also `workflow_dispatch` and a weekly Monday cron):
   `cargo audit` against the RustSec advisory DB, and
   `cargo deny check advisories bans licenses sources` with `deny.toml`.

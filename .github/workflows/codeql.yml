@@ -1,0 +1,60 @@
+# GitHub CodeQL (advanced setup) for Rust and GitHub Actions.
+# Rust uses build-mode: none (GA since 2025), so this job does not install
+# Linux media deps or compile the workspace. Default setup must stay off:
+# Settings › Code security › Code scanning; an enabled default setup rejects
+# this advanced workflow.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Wednesday 07:27 UTC, staggered from the Monday 06:27 audit cron.
+    - cron: "27 7 * * 3"
+  workflow_dispatch:
+  # Tags and manual Build runs are not covered by ci.yml or the push-to-main
+  # trigger above when the event is a tag; Build calls this job then.
+  workflow_call:
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+      # Official starter also grants packages: read so CodeQL can fetch packs.
+      packages: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+            build-mode: none
+          - language: actions
+            build-mode: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: "/language:${{ matrix.language }}"

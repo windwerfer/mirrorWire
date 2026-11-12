@@ -25,7 +25,11 @@ beyond current `main`.
   repository (a Clippy report and unit-test lcov coverage are uploaded with
   the scan). Fork pull requests skip the upload when `SONAR_TOKEN` is
   unavailable. Automatic Analysis must stay off on the SonarCloud project,
-  or the CI upload is rejected.
+  or the CI upload is rejected. [GitHub CodeQL](https://github.com/windwerfer/mirrorWire/security/code-scanning)
+  is a second, separate scan of the Rust code and GitHub Actions workflows
+  (`build-mode: none`) on `main`, pull requests, and a weekly schedule.
+  Results appear under the repository's Security › Code scanning tab.
+  CodeQL default setup must stay off, or the advanced workflow is rejected.
 - **Dependency and licence checks.** `cargo audit` (RustSec) and `cargo deny`
   (advisories, bans, licences, sources) run on every push and pull request,
   and on a weekly schedule so new advisories against existing pins are

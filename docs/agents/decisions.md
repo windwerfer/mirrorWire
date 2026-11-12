@@ -39,6 +39,11 @@ Newest first. Add an entry when the owner decides something non-obvious.
   is never touched, loading the Rust viewer, the neurofeed pattern), and later a browser
   viewer for people who don't want to install anything.
 
+- **2026-11 (GitHub CodeQL):** the owner wants CodeQL as a second, separate
+  security check next to SonarCloud, on every push to `main`, on pull
+  requests, and as part of tag/manual Builds, plus a weekly schedule.
+  Rust and GitHub Actions are analyzed with `build-mode: none`. Default
+  setup must stay off so the advanced workflow can upload results.
 - **2026-11 (SonarCloud CI analysis):** the owner added a `SONAR_TOKEN` repository
   secret and wants scans to run from GitHub Actions (Clippy report + lcov)
   instead of Automatic Analysis. Automatic Analysis must be turned off under

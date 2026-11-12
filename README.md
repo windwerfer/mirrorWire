@@ -7,6 +7,7 @@
   <br>
   <a href="https://sonarcloud.io/project/overview?id=windwerfer_mirrorWire"><img alt="Scanned by SonarCloud" src="https://img.shields.io/badge/Scanned_by-SonarCloud-4b9fd5?style=flat-square&logo=sonarqubecloud&logoColor=white"></a>
   <a href="https://sonarcloud.io/summary/new_code?id=windwerfer_mirrorWire"><img alt="Quality Gate Status" src="https://sonarcloud.io/api/project_badges/measure?project=windwerfer_mirrorWire&metric=alert_status"></a>
+  <a href="https://github.com/windwerfer/mirrorWire/security/code-scanning"><img alt="CodeQL" src="https://github.com/windwerfer/mirrorWire/actions/workflows/codeql.yml/badge.svg?branch=main&style=flat-square"></a>
 </p>
 
 Low-latency screen mirroring over a LAN, written in Rust. One binary (`mirrorwire`) runs in
@@ -61,6 +62,7 @@ packaging/
   ci.yml             clippy, unit tests, loopback test, supply-chain audit, SonarCloud
   audit.yml          cargo audit and cargo-deny (also a weekly scheduled run)
   sonarcloud.yml     CI SonarCloud scan (clippy report + lcov); also called from Build on tags
+  codeql.yml         GitHub CodeQL (Rust + Actions); also called from Build on tags
   build.yml          macOS arm64 + Intel DMG, Flatpak, AppImage; Release on v* tags
 .github/dependabot.yml  weekly updates for Actions SHA pins and Cargo
 ```
@@ -248,7 +250,11 @@ SonarQube Cloud analysis runs from GitHub Actions on `main` and on pull
 requests from this repository (clippy report and unit-test coverage are
 uploaded with the scan). Fork pull requests skip the upload, because GitHub
 does not pass `SONAR_TOKEN`. Automatic Analysis on the SonarCloud project
-must stay off, or the CI upload is rejected. `cargo audit` and `cargo deny` run on every
+must stay off, or the CI upload is rejected. GitHub CodeQL also runs on
+`main`, on pull requests, and on a weekly schedule (Rust and GitHub Actions,
+`build-mode: none`); results appear under Security › Code scanning. Default
+setup for CodeQL must stay off, or this advanced workflow is rejected.
+`cargo audit` and `cargo deny` run on every
 push and pull request, and again on a weekly schedule; the Build workflow
 waits for those checks and will not publish artifacts if they fail. GitHub
 Actions are pinned to full commit SHAs and updated by Dependabot. Downloads

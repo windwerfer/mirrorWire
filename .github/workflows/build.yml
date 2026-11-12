@@ -26,6 +26,17 @@ jobs:
     secrets:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
+  # CI / the standalone CodeQL workflow already scan branch pushes. Tags and
+  # manual Build runs would otherwise have no scan.
+  codeql:
+    name: CodeQL
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    uses: ./.github/workflows/codeql.yml
+
   macos:
     name: macOS ${{ matrix.arch }}
     needs: audit
