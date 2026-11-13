@@ -13,6 +13,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use mirrorwire_proto::clock::{now_us, ClockSync};
 use mirrorwire_proto::control::{Control, StreamInfo};
+use mirrorwire_proto::cursor::{
+    is_pointer_datagram, CursorEvent, CursorImage, PointerUpdate, ViewerCursor, CAP_CURSOR_METADATA,
+    MAX_IMAGE_STREAM,
+};
 use mirrorwire_proto::fragment::{fragment, FrameTiming};
 use mirrorwire_proto::stats::StageStats;
 use mirrorwire_proto::PROTOCOL_VERSION;
@@ -24,10 +28,21 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 
+/// Presenter datagram queue. At Wi-Fi rates 2 MiB is ~100–150 ms of video.
+pub const DATAGRAM_SEND_BUFFER: usize = 2 << 20;
+
+/// Whether a delta frame of `frame_len` bytes should be dropped because the
+/// datagram queue is too full to take it (a keyframe is always queued).
+pub fn should_drop_for_backlog(keyframe: bool, frame_len: usize, free_space: usize) -> bool {
+    !keyframe && free_space < frame_len + frame_len / 16 + 4096
+}
+
 fn transport_config() -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
     t.datagram_receive_buffer_size(Some(32 << 20));
-    t.datagram_send_buffer_size(16 << 20);
+    // Bounded so frames can't pile up inside QUIC: the send loop drops a
+    // delta frame (and asks for a keyframe) instead of queueing behind this.
+    t.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
     t.send_window(8 * 1024 * 1024);
     t.receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
     t.stream_receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024));
@@ -72,14 +87,30 @@ pub struct PresenterConfig {
     pub config_dir: PathBuf,
     /// Incoming handshake / pairing attempts for the presenter GUI.
     pub attempts: std::sync::Arc<Mutex<Vec<IncomingAttempt>>>,
+    /// Called when a viewer is accepted, with whether it can draw a
+    /// separately sent cursor ([`CAP_CURSOR_METADATA`]).
+    pub on_viewer: Option<Arc<dyn Fn(bool) + Send + Sync>>,
+    /// Cursor position and image changes from the capture source (the
+    /// sending half lives with the capture thread). Sent only to viewers that
+    /// can draw them.
+    pub cursor_events: Option<mpsc::Receiver<CursorEvent>>,
 }
 
 type Callback = Arc<dyn Fn() + Send + Sync>;
+
+/// The viewer currently receiving the stream.
+#[derive(Clone)]
+struct ActiveViewer {
+    conn: Connection,
+    /// Listed [`CAP_CURSOR_METADATA`] in its hello.
+    cursor: bool,
+}
 
 pub struct Presenter {
     pub frames: mpsc::Sender<OutgoingFrame>,
     pub local_addr: SocketAddr,
     pub viewer_connected: watch::Receiver<bool>,
+    stream_info: Arc<watch::Sender<StreamInfo>>,
     endpoint: Endpoint,
 }
 
@@ -92,19 +123,24 @@ impl Presenter {
         let local_addr = endpoint.local_addr()?;
 
         let (frames, frames_rx) = mpsc::channel::<OutgoingFrame>(8);
-        let (current_tx, current_rx) = watch::channel::<Option<Connection>>(None);
+        let (current_tx, current_rx) = watch::channel::<Option<ActiveViewer>>(None);
         let (connected_tx, viewer_connected) = watch::channel(false);
         let current_tx = Arc::new(current_tx);
+        let stream_info = Arc::new(watch::channel(cfg.stream_info).0);
 
-        tokio::spawn(send_loop(frames_rx, current_rx));
+        tokio::spawn(send_loop(frames_rx, current_rx.clone(), on_keyframe_request.clone()));
+        if let Some(cursor_rx) = cfg.cursor_events {
+            tokio::spawn(cursor_loop(cursor_rx, current_rx));
+        }
 
         let shared = Arc::new(SessionShared {
-            stream_info: Mutex::new(cfg.stream_info),
+            stream_info: stream_info.clone(),
             pairing_code: cfg.pairing_code,
             paired: Mutex::new(PairedViewers::load(&cfg.config_dir)),
             current: current_tx,
             connected: connected_tx,
             on_keyframe_request,
+            on_viewer: cfg.on_viewer,
             attempts: cfg.attempts,
         });
         let ep = endpoint.clone();
@@ -119,7 +155,17 @@ impl Presenter {
             }
         });
 
-        Ok(Self { frames, local_addr, viewer_connected, endpoint })
+        Ok(Self { frames, local_addr, viewer_connected, stream_info, endpoint })
+    }
+
+    /// Change the stream description; connected viewers get a fresh
+    /// `stream_info` (older viewers ignore it), new viewers get the new one.
+    pub fn update_stream_info(&self, f: impl FnOnce(&mut StreamInfo)) {
+        self.stream_info.send_if_modified(|info| {
+            let before = info.clone();
+            f(info);
+            *info != before
+        });
     }
 
     pub fn close(&self) {
@@ -128,12 +174,13 @@ impl Presenter {
 }
 
 struct SessionShared {
-    stream_info: Mutex<StreamInfo>,
+    stream_info: Arc<watch::Sender<StreamInfo>>,
     pairing_code: Option<String>,
     paired: Mutex<PairedViewers>,
-    current: Arc<watch::Sender<Option<Connection>>>,
+    current: Arc<watch::Sender<Option<ActiveViewer>>>,
     connected: watch::Sender<bool>,
     on_keyframe_request: Callback,
+    on_viewer: Option<Arc<dyn Fn(bool) + Send + Sync>>,
     attempts: Arc<Mutex<Vec<IncomingAttempt>>>,
 }
 
@@ -162,7 +209,7 @@ async fn handle_viewer(incoming: quinn::Incoming, shared: Arc<SessionShared>) ->
     };
     let (mut send, mut recv) = conn.accept_bi().await?;
 
-    let Control::Hello { protocol, name, pairing_code } = read_msg(&mut recv).await? else {
+    let Control::Hello { protocol, name, pairing_code, caps } = read_msg(&mut recv).await? else {
         push_attempt(
             &shared.attempts,
             IncomingAttempt::new(remote, None, false, "expected hello on control stream"),
@@ -205,18 +252,49 @@ async fn handle_viewer(incoming: quinn::Incoming, shared: Arc<SessionShared>) ->
         bail!("rejected unpaired viewer {name} at {remote}");
     }
 
-    let stream_info = shared.stream_info.lock().expect("stream info").clone();
+    let viewer_cursor = caps.iter().any(|c| c == CAP_CURSOR_METADATA);
+    let mut info_rx = shared.stream_info.subscribe();
+    let stream_info = info_rx.borrow_and_update().clone();
     write_msg(&mut send, &Control::StreamInfo(stream_info)).await?;
     push_attempt(
         &shared.attempts,
         IncomingAttempt::new(remote, Some(name.clone()), true, "connected"),
     );
-    tracing::info!("viewer {name} connected from {remote}");
-    if let Some(old) = shared.current.send_replace(Some(conn.clone())) {
-        old.close(1u32.into(), b"replaced by another viewer");
+    tracing::info!(
+        "viewer {name} connected from {remote} (cursor as coordinates: {})",
+        if viewer_cursor { "supported" } else { "not supported, older viewer" }
+    );
+    if let Some(old) = shared.current.send_replace(Some(ActiveViewer { conn: conn.clone(), cursor: viewer_cursor })) {
+        old.conn.close(1u32.into(), b"replaced by another viewer");
     }
     shared.connected.send_replace(true);
+    if let Some(cb) = &shared.on_viewer {
+        cb(viewer_cursor);
+    }
     (shared.on_keyframe_request)();
+
+    // One writer owns the send half: pongs from the reader below, and a
+    // fresh stream_info whenever the presenter changes it.
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Control>();
+    let writer = tokio::spawn(async move {
+        loop {
+            let msg = tokio::select! {
+                m = out_rx.recv() => match m {
+                    Some(m) => m,
+                    None => return,
+                },
+                changed = info_rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    Control::StreamInfo(info_rx.borrow_and_update().clone())
+                }
+            };
+            if write_msg(&mut send, &msg).await.is_err() {
+                return;
+            }
+        }
+    });
 
     let result = async {
         loop {
@@ -227,7 +305,7 @@ async fn handle_viewer(incoming: quinn::Incoming, shared: Arc<SessionShared>) ->
             };
             match msg {
                 Control::Ping { t_viewer_us } => {
-                    write_msg(&mut send, &Control::Pong { t_viewer_us, t_presenter_us: now_us() }).await?;
+                    let _ = out_tx.send(Control::Pong { t_viewer_us, t_presenter_us: now_us() });
                 }
                 Control::RequestKeyframe { reason } => {
                     tracing::debug!("keyframe requested: {reason}");
@@ -239,9 +317,10 @@ async fn handle_viewer(incoming: quinn::Incoming, shared: Arc<SessionShared>) ->
         }
     }
     .await;
+    writer.abort();
 
     shared.current.send_if_modified(|cur| {
-        if cur.as_ref().is_some_and(|c| c.stable_id() == conn.stable_id()) {
+        if cur.as_ref().is_some_and(|c| c.conn.stable_id() == conn.stable_id()) {
             *cur = None;
             true
         } else {
@@ -255,14 +334,98 @@ async fn handle_viewer(incoming: quinn::Incoming, shared: Arc<SessionShared>) ->
     result
 }
 
-async fn send_loop(mut frames: mpsc::Receiver<OutgoingFrame>, current: watch::Receiver<Option<Connection>>) {
+/// Forwards cursor changes to the current viewer: positions as datagrams
+/// (with a fresh sequence number), images on their own unidirectional
+/// stream. A newly connected viewer first gets every cached image and the
+/// last position, so it can draw the cursor before it moves.
+async fn cursor_loop(mut events: mpsc::Receiver<CursorEvent>, mut current: watch::Receiver<Option<ActiveViewer>>) {
+    const CACHE: usize = 32;
+    let mut seq = 0u32;
+    let mut last: Option<PointerUpdate> = None;
+    let mut images: std::collections::VecDeque<Arc<CursorImage>> = Default::default();
+    let target = |current: &watch::Receiver<Option<ActiveViewer>>| {
+        current.borrow().as_ref().filter(|v| v.cursor).map(|v| v.conn.clone())
+    };
+    loop {
+        tokio::select! {
+            ev = events.recv() => match ev {
+                None => return,
+                Some(CursorEvent::Image(img)) => {
+                    let img = Arc::new(img);
+                    images.retain(|i| i.id != img.id);
+                    if images.len() >= CACHE {
+                        images.pop_front();
+                    }
+                    images.push_back(img.clone());
+                    if let Some(conn) = target(&current) {
+                        send_cursor_image(conn, img);
+                    }
+                }
+                Some(CursorEvent::Pointer(mut p)) => {
+                    seq = seq.wrapping_add(1);
+                    p.seq = seq;
+                    last = Some(p);
+                    if let Some(conn) = target(&current) {
+                        let _ = conn.send_datagram(Bytes::copy_from_slice(&p.encode()));
+                    }
+                }
+            },
+            changed = current.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let Some(conn) = target(&current) else { continue };
+                for img in &images {
+                    send_cursor_image(conn.clone(), img.clone());
+                }
+                if let Some(mut p) = last {
+                    seq = seq.wrapping_add(1);
+                    p.seq = seq;
+                    last = Some(p);
+                    let _ = conn.send_datagram(Bytes::copy_from_slice(&p.encode()));
+                }
+            }
+        }
+    }
+}
+
+fn send_cursor_image(conn: Connection, img: Arc<CursorImage>) {
+    tokio::spawn(async move {
+        let result = async {
+            let mut s = conn.open_uni().await?;
+            s.write_all(&img.encode()).await?;
+            s.finish()?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(e) = result {
+            tracing::debug!("cursor image {} not sent: {e:#}", img.id);
+        }
+    });
+}
+
+async fn send_loop(
+    mut frames: mpsc::Receiver<OutgoingFrame>,
+    current: watch::Receiver<Option<ActiveViewer>>,
+    on_keyframe_request: Callback,
+) {
     let mut stats = StageStats::new(&["capture_to_encoded", "encoded_to_sent", "send"]);
     let mut window_start = Instant::now();
     let (mut window_frames, mut window_bytes, mut window_keyframes) = (0u32, 0usize, 0u32);
+    let mut backlog_drops = 0u32;
 
     while let Some(frame) = frames.recv().await {
-        let Some(conn) = current.borrow().clone() else { continue };
+        let Some(conn) = current.borrow().as_ref().map(|v| v.conn.clone()) else { continue };
         let Some(max) = conn.max_datagram_size() else { continue };
+        if should_drop_for_backlog(frame.keyframe, frame.data.len(), conn.datagram_send_buffer_space()) {
+            // The network is behind (big scene change on Wi-Fi). Sending this
+            // frame would only add latency; the viewer recovers with the
+            // keyframe we ask for instead.
+            backlog_drops += 1;
+            tracing::debug!("network backlog: dropped frame {} ({} bytes)", frame.frame_id, frame.data.len());
+            on_keyframe_request();
+            continue;
+        }
         let sent_us = now_us();
         let timing = FrameTiming {
             capture_us: frame.capture_us,
@@ -303,13 +466,15 @@ async fn send_loop(mut frames: mpsc::Receiver<OutgoingFrame>, current: watch::Re
         if elapsed >= Duration::from_secs(1) {
             let secs = elapsed.as_secs_f64();
             tracing::info!(
-                "presenter: {:.1} fps, {:.2} Mbit/s, {} keyframes, mtu {}, ms mean/p95/max:{}",
+                "presenter: {:.1} fps, {:.2} Mbit/s, {} keyframes, {} dropped for backlog, mtu {}, ms mean/p95/max:{}",
                 window_frames as f64 / secs,
                 window_bytes as f64 * 8.0 / secs / 1e6,
                 window_keyframes,
+                backlog_drops,
                 max,
                 stats.report()
             );
+            backlog_drops = 0;
             stats.clear();
             window_start = Instant::now();
             (window_frames, window_bytes, window_keyframes) = (0, 0, 0);
@@ -324,6 +489,11 @@ pub fn ms(later_us: u64, earlier_us: u64) -> f64 {
 pub struct ViewerSession {
     pub conn: Connection,
     pub stream_info: StreamInfo,
+    /// Newest `stream_info` (the presenter re-sends it when e.g. the cursor
+    /// mode changes).
+    pub stream_updates: watch::Receiver<StreamInfo>,
+    /// Cursor sent as coordinates: latest position and cached images.
+    pub cursor: Arc<Mutex<ViewerCursor>>,
     pub clock: Arc<Mutex<ClockSync>>,
     control: mpsc::UnboundedSender<Control>,
     _endpoint: Endpoint,
@@ -389,6 +559,28 @@ impl ViewerSession {
 
     pub fn request_keyframe(&self, reason: &str) {
         let _ = self.control.send(Control::RequestKeyframe { reason: reason.to_owned() });
+    }
+
+    /// If `datagram` is a pointer update, apply it and return true (the
+    /// caller then skips video reassembly). Malformed ones are dropped.
+    pub fn handle_pointer_datagram(&self, datagram: &[u8]) -> bool {
+        if !is_pointer_datagram(datagram) {
+            return false;
+        }
+        if let Some(p) = PointerUpdate::decode(datagram) {
+            self.cursor.lock().unwrap_or_else(|e| e.into_inner()).apply(p);
+        }
+        true
+    }
+
+    /// The cursor mode the presenter currently reports (`separate`,
+    /// `embedded`, `hidden`); older presenters report nothing (= embedded).
+    pub fn cursor_mode(&self) -> String {
+        self.stream_updates
+            .borrow()
+            .cursor
+            .clone()
+            .unwrap_or_else(|| mirrorwire_proto::control::CURSOR_EMBEDDED.to_owned())
     }
 
     pub fn control_sender(&self) -> mpsc::UnboundedSender<Control> {
@@ -486,6 +678,7 @@ async fn connect_one(
             protocol: PROTOCOL_VERSION,
             name: viewer_name.to_owned(),
             pairing_code: target.pairing_code.clone(),
+            caps: vec![CAP_CURSOR_METADATA.to_owned()],
         },
     )
     .await?;
@@ -520,14 +713,35 @@ async fn connect_one(
 
     let clock = Arc::new(Mutex::new(ClockSync::default()));
     let (control, control_rx) = mpsc::unbounded_channel();
-    tokio::spawn(control_loop(send, recv, control_rx, clock.clone()));
+    let (info_tx, stream_updates) = watch::channel(stream_info.clone());
+    tokio::spawn(control_loop(send, recv, control_rx, clock.clone(), info_tx));
+    let cursor = Arc::new(Mutex::new(ViewerCursor::default()));
+    tokio::spawn(accept_cursor_images(conn.clone(), cursor.clone()));
     Ok(ViewerSession {
         conn,
         stream_info,
+        stream_updates,
+        cursor,
         clock,
         control,
         _endpoint: endpoint,
     })
+}
+
+/// Cursor images arrive one per unidirectional stream (bounded size).
+async fn accept_cursor_images(conn: Connection, cursor: Arc<Mutex<ViewerCursor>>) {
+    while let Ok(mut stream) = conn.accept_uni().await {
+        let cursor = cursor.clone();
+        tokio::spawn(async move {
+            match stream.read_to_end(MAX_IMAGE_STREAM).await {
+                Ok(bytes) => match CursorImage::decode(&bytes) {
+                    Ok(img) => cursor.lock().unwrap_or_else(|e| e.into_inner()).add_image(img),
+                    Err(e) => tracing::debug!("dropping cursor image: {e:#}"),
+                },
+                Err(e) => tracing::debug!("cursor image stream failed: {e}"),
+            }
+        });
+    }
 }
 
 async fn control_loop(
@@ -535,12 +749,17 @@ async fn control_loop(
     mut recv: RecvStream,
     mut outgoing: mpsc::UnboundedReceiver<Control>,
     clock: Arc<Mutex<ClockSync>>,
+    stream_info: watch::Sender<StreamInfo>,
 ) {
     let reader = async {
         loop {
             match read_msg(&mut recv).await {
                 Ok(Control::Pong { t_viewer_us, t_presenter_us }) => {
                     clock.lock().expect("clock lock").add_sample(t_viewer_us, t_presenter_us, now_us());
+                }
+                Ok(Control::StreamInfo(info)) => {
+                    tracing::info!("presenter updated stream info: cursor {:?}, {} fps", info.cursor, info.fps);
+                    stream_info.send_replace(info);
                 }
                 Ok(other) => tracing::debug!("ignoring {other:?}"),
                 Err(e) => {
@@ -613,6 +832,97 @@ mod tests {
         assert!(msg.contains(&format!("{addr} (UDP)")), "{msg}");
         assert!(msg.contains("firewall-cmd"), "{msg}");
         assert!(msg.contains("QUIC"), "{msg}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cursor_reaches_a_capable_viewer() {
+        use mirrorwire_proto::cursor::PointerTool;
+        let dir = std::env::temp_dir().join(format!("mirrorwire-cursor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let presenter_id = Identity::generate().unwrap();
+        let (cursor_tx, cursor_rx) = mpsc::channel(16);
+        let seen_caps = Arc::new(Mutex::new(None));
+        let caps_slot = seen_caps.clone();
+        let presenter = Presenter::start(
+            &presenter_id,
+            PresenterConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                stream_info: StreamInfo {
+                    width: 64,
+                    height: 64,
+                    fps: 60,
+                    codec: "h264".into(),
+                    encoder: "test".into(),
+                    bitrate_kbps: 1,
+                    intra_refresh: false,
+                    cursor: Some("separate".into()),
+                },
+                pairing_code: None,
+                config_dir: dir.clone(),
+                attempts: Default::default(),
+                on_viewer: Some(Arc::new(move |ok| *caps_slot.lock().unwrap() = Some(ok))),
+                cursor_events: Some(cursor_rx),
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        // Sent before anyone connects: cached and replayed on connect.
+        let image = CursorImage { id: 5, width: 2, height: 2, hotspot_x: 1, hotspot_y: 1, rgba: vec![255; 16] };
+        cursor_tx.send(CursorEvent::Image(image.clone())).await.unwrap();
+        let pointer = PointerUpdate {
+            seq: 0,
+            tool: PointerTool::Cursor,
+            visible: true,
+            x: 10,
+            y: 20,
+            frame_w: 64,
+            frame_h: 64,
+            image_id: 5,
+            capture_us: 1,
+        };
+        cursor_tx.send(CursorEvent::Pointer(pointer)).await.unwrap();
+
+        let target = ConnectInfo {
+            addr: presenter.local_addr,
+            addrs: Vec::new(),
+            fingerprint: presenter_id.fingerprint(),
+            pairing_code: None,
+            name: None,
+        };
+        let viewer = ViewerSession::connect(&Identity::generate().unwrap(), &target, "test").await.unwrap();
+        assert_eq!(viewer.cursor_mode(), "separate");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while viewer.cursor.lock().unwrap().current().is_none() {
+            assert!(Instant::now() < deadline, "cursor never arrived");
+            if let Ok(Ok(d)) = tokio::time::timeout(Duration::from_millis(50), viewer.conn.read_datagram()).await {
+                assert!(viewer.handle_pointer_datagram(&d));
+            }
+        }
+        let (p, img) = viewer.cursor.lock().unwrap().current().unwrap();
+        assert_eq!((p.x, p.y, p.image_id), (10, 20, 5));
+        assert_eq!(*img, image);
+        assert_eq!(*seen_caps.lock().unwrap(), Some(true));
+
+        // A changed cursor mode reaches the connected viewer.
+        presenter.update_stream_info(|i| i.cursor = Some("embedded".into()));
+        let mut updates = viewer.stream_updates.clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while updates.borrow_and_update().cursor.as_deref() != Some("embedded") {
+                updates.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("stream_info update");
+        viewer.close();
+        presenter.close();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn backlog_drops_only_delta_frames() {
+        assert!(!should_drop_for_backlog(false, 50_000, DATAGRAM_SEND_BUFFER));
+        assert!(should_drop_for_backlog(false, 50_000, 40_000));
+        assert!(!should_drop_for_backlog(true, 500_000, 0), "keyframes always go out");
     }
 
     #[test]

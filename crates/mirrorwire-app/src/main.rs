@@ -1,4 +1,5 @@
 mod applog;
+mod capture_prefs;
 #[cfg(feature = "gui")]
 mod gui;
 mod presenter;
@@ -137,6 +138,8 @@ fn main() -> Result<()> {
         ),
         Some(Command::Present(mut args)) => {
             args.port = port;
+            let cli_cursor = if args.hide_cursor { Some(capture_prefs::CursorPref::Hidden) } else { args.cursor };
+            args.capture = capture_prefs::resolve(cli_cursor, args.fps, &config_dir);
             presenter::run(args, &config_dir)
         }
         Some(Command::View(args)) if args.headless => viewer::run_headless(args, &config_dir),

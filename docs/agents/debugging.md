@@ -63,6 +63,18 @@ line `fps, Mbit/s, rtt, ms mean/p95/max: …stages…`.
 - `decode` high on the iMac: software decode; try `--hwdec` / the View checkbox.
 - `convert` high: CPU YUV→RGBA at large sizes (a GPU shader is on the roadmap).
 - Frames queueing anywhere is a bug: every media-path channel is bounded and drops old frames.
+  The viewer's decode queue holds 2 frames; when it overflows it is flushed and a keyframe is
+  requested (log: `decoder behind: dropped N queued frames`). The presenter drops delta frames
+  when the QUIC datagram queue is full (`dropped for backlog` in the per-second line).
+- Cursor lag: presenter *Cursor* line says `separate` (sent as coordinates) or `embedded`; an
+  orange note says why it fell back (portal without metadata cursor, older viewer). Viewer
+  overlay: `cursor separate (N updates/s)`; N should follow mouse movement (KWin caps it at the
+  frame rate). If the cursor misbehaves, switch Quality › Cursor to `embedded`.
+- Frame rate: presenter line `Frame rate: asked up to N fps · compositor allows M`. M below N
+  means the compositor capped it; "not reported" means KWin did not send a maxFramerate.
+- Freeze on click (fixed 2026-11-13): egui `Response` methods must not be called inside
+  `ctx.input(|i| …)`; `double_clicked()` re-locks the context and deadlocks against the decode
+  thread's `request_repaint()`.
 
 ## Presenter side
 

@@ -15,7 +15,9 @@ Everything here lives in `mirrorwire-proto` (constants, framing) and `mirrorwire
   - The presenter accepts any client cert at the TLS layer, then authorizes in the handshake:
     the fingerprint is in `paired_viewers.json`, or the `Hello` carries the right pairing code
     (then the fingerprint is added), or pairing is off (`--no-pairing`).
-- Idle timeout 10 s. Datagram send buffer 4 MiB.
+- Idle timeout 10 s. Datagram send buffer 2 MiB (`DATAGRAM_SEND_BUFFER`); when it is too full
+  for a delta frame, the presenter drops that frame and forces a keyframe instead of queueing
+  (keyframes are always queued). Pacing 500 Mbit/s (`lan_cc.rs`).
 
 ## 2. Control stream
 
@@ -25,9 +27,9 @@ followed by a JSON body (`serde`, `tag = "type"`, `snake_case`). Bodies over
 
 | `type` | Direction | Fields |
 |---|---|---|
-| `hello` | viewer → presenter | `protocol` (u32, must equal `PROTOCOL_VERSION`), `name`, `pairing_code` (optional) |
+| `hello` | viewer → presenter | `protocol` (u32, must equal `PROTOCOL_VERSION`), `name`, `pairing_code` (optional), `caps` (optional list; `cursor-metadata` = can draw a separately sent cursor) |
 | `rejected` | presenter → viewer | `reason` (shown to the user) |
-| `stream_info` | presenter → viewer | `width`, `height`, `fps`, `codec`, `encoder`, `bitrate_kbps`, `intra_refresh` |
+| `stream_info` | presenter → viewer | `width`, `height`, `fps`, `codec`, `encoder`, `bitrate_kbps`, `intra_refresh`, `cursor` (optional: `separate`, `embedded`, `hidden`; absent = embedded). Sent after `hello`, and **again** whenever it changes (older viewers ignore the repeat) |
 | `request_keyframe` | viewer → presenter | `reason` |
 | `ping` / `pong` | viewer ↔ presenter | `t_viewer_us`, `t_presenter_us` (clock offset + RTT) |
 | `bye` | either | — |
@@ -54,6 +56,42 @@ Each encoded frame (H.264 Annex B access unit) is split into fragments that fit
 
 The receiver reassembles by `frame_id`, drops incomplete frames that are overtaken, reports the
 loss, and asks for a keyframe unless the stream uses intra refresh.
+
+## 3a. Cursor as coordinates (capability `cursor-metadata`)
+
+Only for viewers that listed `cursor-metadata` in `hello.caps`; older viewers never see these
+and get the cursor in the video (the presenter reopens the capture with an embedded cursor
+while such a viewer is connected). All in `mirrorwire-proto/src/cursor.rs`. No
+`PROTOCOL_VERSION`/`WIRE_VERSION` bump: nothing an old peer receives changed.
+
+**Pointer datagram** (unreliable, one per change, not tied to video frames). The first byte
+`0xC1` can't collide with a video fragment (whose first byte is `WIRE_VERSION` = 1).
+32 bytes, big endian; receivers ignore extra trailing bytes (reserved for later tools such as
+a pen with pressure/tilt):
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | kind `0xC1` |
+| 1 | 1 | version 1 (other values dropped) |
+| 2 | 1 | flags: bit 0 visible |
+| 3 | 1 | tool: 0 = cursor (future: pen, touch) |
+| 4 | 4 | `seq` (u32, wrapping; the viewer drops older/duplicate ones) |
+| 8 | 4 | `x` (i32, hotspot position in captured-frame pixels) |
+| 12 | 4 | `y` (i32) |
+| 16 | 2 | `frame_w` (captured frame width, before encoder scaling) |
+| 18 | 2 | `frame_h` |
+| 20 | 4 | `image_id` (0 = none yet) |
+| 24 | 8 | `capture_us` (presenter clock) |
+
+**Cursor image**: one unidirectional QUIC stream per shape (presenter → viewer), at most
+`MAX_IMAGE_STREAM` bytes: magic `MWCI`, version 1, 3 reserved, `id` u32, `width` u16, `height`
+u16 (each ≤ 512), `hotspot_x` i32, `hotspot_y` i32, 4 reserved, then `width*height*4` bytes of
+premultiplied RGBA. 0×0 = invisible cursor. The viewer caches the last 32 images by id; a new
+viewer gets every cached image and the last position on connect.
+
+**Drawing**: `cursor_rect()` maps `(x - hotspot, y - hotspot)` and the image size through the
+rectangle the video is drawn in (`video.w / frame_w`), so fit, letterbox and 1:1 modes all
+line up. The same message is meant to carry the future pen/Wacom mode.
 
 ## 4. Versioning rules
 

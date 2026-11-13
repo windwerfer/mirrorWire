@@ -170,7 +170,9 @@ cargo build --release
 ./target/release/mirrorwire present          # portal dialog appears once, then a QR code
 ```
 
-Useful presenter options: `--fps 60 --bitrate-kbps 40000` (or `--bitrate-mbps 40`),
+Useful presenter options: `--fps 30|60|max` (frame-rate cap asked of the compositor; default
+60, `max` = the display refresh rate; also `MIRRORWIRE_FPS`), `--cursor separate|embedded|hidden`
+(default `separate`, also `MIRRORWIRE_CURSOR`), `--bitrate-kbps 40000` (or `--bitrate-mbps 40`),
 `--rc auto|cbr|vbr|cqp|icq`, `--qp 18`, `--keyint` (frames; 0 = 10 s),
 `--encoder auto|vaapi|x264|filmcraft`, `--intra-refresh`, `--source test`, `--no-pairing`,
 `--port` (or `MIRRORWIRE_PORT`; the GUI also saves the port in `settings.json`),
@@ -180,6 +182,18 @@ and AppImage; from source add `--features filmcraft`). It can also be switched l
 presenter window under Quality › Encoder. FFmpeg (VAAPI, then x264) stays the default.
 The default size is the native capture. `--size 1920x1080` (or `--width` / `--height`)
 overrides it and scales.
+
+**Cursor as coordinates.** With `--cursor separate` (the default) the compositor leaves the
+mouse cursor out of the video and reports its position and shape separately; the presenter
+sends each move as a tiny datagram, and the viewer draws the cursor itself on top of the
+video. The cursor then moves as fast as the network allows instead of waiting for the next
+encoded frame. No extra permission is needed anywhere: the viewer only draws inside its own
+window. It falls back to `embedded` (cursor drawn into the video, the old way) when the
+screen-cast portal offers no metadata cursor, or for a viewer older than this feature.
+The presenter window shows the active mode under *Cursor*; the viewer overlay shows
+`cursor separate (N updates/s)` or `cursor embedded (in video)`. Cursor and *Max fps* can be
+changed in the presenter's Quality panel (saved in `settings.json`; the capture restarts
+without a dialog). Typing still goes through the video, so only 60 fps helps there.
 
 ## Build and run: viewer on macOS
 

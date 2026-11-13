@@ -12,8 +12,12 @@ use std::time::Instant;
 
 /// 4 MiB, enough for several 1080p I-frames on the wire at once.
 pub const LAN_WINDOW: u64 = 4 * 1024 * 1024;
-/// 8 Gbit/s pacing — above a typical 1 Gbit LAN, so a frame is sent as a burst.
-const LAN_PACING_BITS_PER_SEC: u64 = 8_000_000_000;
+/// 500 Mbit/s pacing: a normal P-frame (tens of KB) still leaves as a burst
+/// in under a millisecond, but a large IDR or scene-change frame is spread
+/// over a few ms instead of hitting a Wi-Fi access point as one multi-MB
+/// burst (which overflows its queue, loses fragments, triggers a keyframe
+/// request and so another big frame).
+const LAN_PACING_BITS_PER_SEC: u64 = 500_000_000;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LanBurstConfig;

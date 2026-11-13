@@ -1,8 +1,9 @@
-use super::FrameSource;
+use super::{CursorCapture, CursorSink, FrameSource};
 use crate::frame::{PixelFormat, RawFrame};
 use crate::pattern::{stamp_marker, MARKER_BLOCK};
 use anyhow::Result;
 use mirrorwire_proto::clock::now_us;
+use mirrorwire_proto::cursor::{CursorEvent, CursorImage, PointerTool, PointerUpdate};
 use std::time::{Duration, Instant};
 
 /// Moving diagonal gradient with a bouncing box and a frame-number marker,
@@ -16,6 +17,9 @@ pub struct TestPattern {
     gradient: Vec<u8>,
     spare: Option<Vec<u8>>,
     limit: Option<u64>,
+    /// With a sink, a synthetic cursor circles over the pattern and is sent
+    /// as coordinates (exercises the separate-cursor path in loopback tests).
+    cursor: Option<CursorSink>,
 }
 
 impl TestPattern {
@@ -40,7 +44,41 @@ impl TestPattern {
             gradient,
             spare: None,
             limit,
+            cursor: None,
         }
+    }
+
+    /// Report a synthetic moving cursor through `sink` instead of drawing none.
+    pub fn with_cursor(mut self, sink: CursorSink) -> Self {
+        let (w, h) = (16u32, 16u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..=y.min(w - 1) {
+                let i = ((y * w + x) * 4) as usize;
+                rgba[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+        sink(CursorEvent::Image(CursorImage { id: 1, width: w, height: h, hotspot_x: 0, hotspot_y: 0, rgba }));
+        self.cursor = Some(sink);
+        self
+    }
+
+    fn send_cursor(&self, seq: u64, capture_us: u64) {
+        let Some(sink) = &self.cursor else { return };
+        let t = seq as f32 / self.fps as f32;
+        let (cx, cy) = (self.width as f32 / 2.0, self.height as f32 / 2.0);
+        let r = cx.min(cy) * 0.6;
+        sink(CursorEvent::Pointer(PointerUpdate {
+            seq: 0,
+            tool: PointerTool::Cursor,
+            visible: true,
+            x: (cx + r * t.cos()) as i32,
+            y: (cy + r * t.sin()) as i32,
+            frame_w: self.width.min(u16::MAX as u32) as u16,
+            frame_h: self.height.min(u16::MAX as u32) as u16,
+            image_id: 1,
+            capture_us,
+        }));
     }
 
     fn render(&self, data: &mut [u8], seq: u64) {
@@ -82,6 +120,7 @@ impl FrameSource for TestPattern {
         let len = self.width as usize * self.height as usize * 4;
         let mut data = self.spare.take().filter(|b| b.len() == len).unwrap_or_else(|| vec![0; len]);
         self.render(&mut data, self.seq);
+        self.send_cursor(self.seq, capture_us);
         let frame = RawFrame {
             seq: self.seq,
             width: self.width,
@@ -106,5 +145,17 @@ impl FrameSource for TestPattern {
 
     fn describe(&self) -> String {
         format!("test pattern {}x{}@{}", self.width, self.height, self.fps)
+    }
+
+    fn cursor_capture(&self) -> CursorCapture {
+        if self.cursor.is_some() {
+            CursorCapture::Metadata
+        } else {
+            CursorCapture::Hidden
+        }
+    }
+
+    fn negotiated_fps(&self) -> Option<u32> {
+        Some(self.fps)
     }
 }

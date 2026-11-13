@@ -7,27 +7,36 @@
 //! imports without any CPU copy. Shared memory (MemFd/MemPtr) stays offered
 //! as the second choice, and the encoder can ask for a renegotiation to shared
 //! memory at runtime (`FrameSource::disable_dmabuf`).
+//!
+//! With [`CursorCapture::Metadata`] the cursor is left out of the video: the
+//! stream asks for `SPA_META_Cursor`, and every buffer's cursor position and
+//! (changed) bitmap go to a [`CursorSink`], independent of video frames. When
+//! the portal does not offer metadata cursors, it falls back to embedded.
 
-use super::FrameSource;
+use super::{CursorCapture, CursorSink, FrameSource};
 use crate::frame::{DmaBufFrame, PixelFormat, RawFrame, DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR};
 use anyhow::{anyhow, bail, Context, Result};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
 use ashpd::desktop::PersistMode;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use mirrorwire_proto::clock::now_us;
+use mirrorwire_proto::cursor::{CursorEvent, CursorImage, PointerTool, PointerUpdate, MAX_CURSOR_SIDE};
 use pipewire as pw;
 use pw::spa;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PortalOptions {
     pub restore_token_path: PathBuf,
-    pub show_cursor: bool,
+    /// Requested cursor delivery. `Metadata` needs `cursor_sink`.
+    pub cursor: CursorCapture,
+    pub cursor_sink: Option<CursorSink>,
     pub allow_virtual: bool,
+    /// Highest frame rate to ask the compositor for.
     pub fps: u32,
     /// Offer DMA-BUF (zero-copy) before shared memory. Only useful when the
     /// encoder can import DMA-BUFs (VAAPI); x264 needs shared memory.
@@ -56,12 +65,16 @@ struct Shared {
     dmabuf_reason: Mutex<Option<String>>,
     /// Human-readable negotiated buffer type, e.g. "DMA-BUF modifier 0x…".
     negotiated: Mutex<String>,
+    /// Negotiated maximum frame rate (rounded), 0 until known.
+    max_fps: AtomicU32,
 }
 
 struct Negotiated {
     fd: OwnedFd,
     node_id: u32,
     size: Option<(i32, i32)>,
+    cursor: CursorCapture,
+    cursor_note: Option<String>,
 }
 
 pub struct PortalSource {
@@ -73,6 +86,8 @@ pub struct PortalSource {
     threads: Vec<JoinHandle<()>>,
     finished: bool,
     shared: Arc<Shared>,
+    cursor: CursorCapture,
+    cursor_note: Option<String>,
 }
 
 impl PortalSource {
@@ -109,9 +124,13 @@ impl PortalSource {
             .recv()
             .map_err(|_| anyhow!("portal thread exited"))??;
         let description = format!(
-            "portal screencast node {} {:?}",
-            negotiated.node_id, negotiated.size
+            "portal screencast node {} {:?}, cursor {}",
+            negotiated.node_id,
+            negotiated.size,
+            negotiated.cursor.as_str()
         );
+        let (cursor, cursor_note) = (negotiated.cursor, negotiated.cursor_note.clone());
+        let sink = if cursor == CursorCapture::Metadata { options.cursor_sink.clone() } else { None };
 
         let (frames_tx, frames) = bounded::<RawFrame>(2);
         let (pool, pool_rx) = bounded::<Vec<u8>>(4);
@@ -123,7 +142,7 @@ impl PortalSource {
         let pw_thread = std::thread::Builder::new()
             .name("pipewire".into())
             .spawn(move || {
-                let cfg = PwConfig { fps, dmabuf, shared: pw_shared };
+                let cfg = PwConfig { fps, dmabuf, shared: pw_shared, cursor: sink };
                 if let Err(e) = run_pipewire(negotiated, cfg, frames_tx, pool_rx, stop_pw_rx) {
                     tracing::error!("pipewire capture failed: {e:#}");
                 }
@@ -138,6 +157,8 @@ impl PortalSource {
             threads: vec![portal_thread, pw_thread],
             finished: false,
             shared,
+            cursor,
+            cursor_note,
         })
     }
 }
@@ -185,6 +206,21 @@ impl FrameSource for PortalSource {
         }
         out
     }
+
+    fn cursor_capture(&self) -> CursorCapture {
+        self.cursor
+    }
+
+    fn cursor_note(&self) -> Option<String> {
+        self.cursor_note.clone()
+    }
+
+    fn negotiated_fps(&self) -> Option<u32> {
+        match self.shared.max_fps.load(Ordering::Acquire) {
+            0 => None,
+            n => Some(n),
+        }
+    }
 }
 
 impl Drop for PortalSource {
@@ -218,7 +254,22 @@ async fn start_session(
     if opts.allow_virtual && proxy.available_source_types().await?.contains(SourceType::VIRTUAL) {
         sources |= SourceType::VIRTUAL;
     }
-    let cursor = if opts.show_cursor { CursorMode::EMBEDDED } else { CursorMode::HIDDEN };
+    let available = proxy.available_cursor_modes().await.unwrap_or_else(|e| {
+        tracing::warn!("portal AvailableCursorModes unreadable ({e}); assuming embedded only");
+        CursorMode::EMBEDDED
+    });
+    let (cursor_capture, cursor_note) = pick_cursor_mode(opts.cursor, opts.cursor_sink.is_some(), available);
+    tracing::info!(
+        "portal cursor modes {available:?}; requested {}, using {}{}",
+        opts.cursor.as_str(),
+        cursor_capture.as_str(),
+        cursor_note.as_deref().map(|n| format!(" ({n})")).unwrap_or_default()
+    );
+    let cursor = match cursor_capture {
+        CursorCapture::Hidden => CursorMode::HIDDEN,
+        CursorCapture::Embedded => CursorMode::EMBEDDED,
+        CursorCapture::Metadata => CursorMode::METADATA,
+    };
     proxy
         .select_sources(
             &session,
@@ -253,14 +304,51 @@ async fn start_session(
         node_id: stream.pipe_wire_node_id(),
         size: stream.size(),
         fd: proxy.open_pipe_wire_remote(&session, Default::default()).await?,
+        cursor: cursor_capture,
+        cursor_note,
     };
     Ok((proxy, session, negotiated))
+}
+
+/// Choose what to ask the portal for. Metadata falls back to embedded when
+/// the portal does not offer it (or nobody would receive the cursor).
+fn pick_cursor_mode(want: CursorCapture, have_sink: bool, available: CursorMode) -> (CursorCapture, Option<String>) {
+    match want {
+        CursorCapture::Metadata if !have_sink => {
+            (CursorCapture::Embedded, Some("no cursor receiver; cursor stays in the video".into()))
+        }
+        CursorCapture::Metadata if available.contains(CursorMode::METADATA) => (CursorCapture::Metadata, None),
+        CursorCapture::Metadata => (
+            CursorCapture::Embedded,
+            Some(format!(
+                "the screen-cast portal offers no metadata cursor (modes {available:?}); cursor stays in the video"
+            )),
+        ),
+        CursorCapture::Hidden if !available.contains(CursorMode::HIDDEN) && !available.is_empty() => {
+            (CursorCapture::Embedded, Some("the portal cannot hide the cursor".into()))
+        }
+        other => (other, None),
+    }
 }
 
 struct PwConfig {
     fps: u32,
     dmabuf: bool,
     shared: Arc<Shared>,
+    /// Set when the portal delivers cursor metadata.
+    cursor: Option<CursorSink>,
+}
+
+/// Turns `SPA_META_Cursor` into [`CursorEvent`]s, sending only changes.
+struct CursorTrack {
+    sink: CursorSink,
+    /// (visible, x, y, image id) of the last pointer sent.
+    last: Option<(bool, i32, i32, u32)>,
+    image_id: u32,
+    /// Hash → id of images already sent, so shapes that come back reuse ids.
+    known: Vec<(u64, u32)>,
+    next_id: u32,
+    unsupported_format_logged: bool,
 }
 
 struct StreamState {
@@ -275,6 +363,7 @@ struct StreamState {
     shm_pod: Vec<u8>,
     renegotiated: bool,
     dropped_busy: u64,
+    cursor: Option<CursorTrack>,
 }
 
 fn map_format(f: spa::param::video::VideoFormat) -> Option<PixelFormat> {
@@ -325,6 +414,14 @@ fn run_pipewire(
         shm_pod: shm_pod.clone(),
         renegotiated: false,
         dropped_busy: 0,
+        cursor: cfg.cursor.clone().map(|sink| CursorTrack {
+            sink,
+            last: None,
+            image_id: 0,
+            known: Vec::new(),
+            next_id: 1,
+            unsupported_format_logged: false,
+        }),
     };
 
     let _listener = stream
@@ -365,20 +462,31 @@ fn run_pipewire(
                 max_fr.num,
                 max_fr.denom,
             );
-            set_negotiated(&state.shared, kind);
+            let fps = negotiated_fps(max_fr.num, max_fr.denom, fr.num, fr.denom);
+            state.shared.max_fps.store(fps.unwrap_or(0), Ordering::Release);
+            let fps_text = fps.map(|f| format!(", max {f} fps")).unwrap_or_else(|| ", frame rate unknown".into());
+            set_negotiated(&state.shared, format!("{kind}{fps_text}"));
+            let mut pods = Vec::with_capacity(2);
             match build_buffers_pod(has_modifier) {
-                Ok(pod) => {
-                    if let Some(pod) = spa::pod::Pod::from_bytes(&pod) {
-                        if let Err(e) = stream.update_params(&mut [pod]) {
-                            tracing::warn!("pipewire: setting buffer params failed: {e}");
-                        }
-                    }
-                }
+                Ok(pod) => pods.push(pod),
                 Err(e) => tracing::warn!("pipewire: buffer params: {e:#}"),
+            }
+            if state.cursor.is_some() {
+                match build_cursor_meta_pod() {
+                    Ok(pod) => pods.push(pod),
+                    Err(e) => tracing::warn!("pipewire: cursor meta params: {e:#}"),
+                }
+            }
+            let mut params: Vec<&spa::pod::Pod> = pods.iter().filter_map(|p| spa::pod::Pod::from_bytes(p)).collect();
+            if !params.is_empty() {
+                if let Err(e) = stream.update_params(&mut params) {
+                    tracing::warn!("pipewire: setting buffer params failed: {e}");
+                }
             }
         })
         .process(|stream, state| {
             if state.is_dmabuf && state.shared.dmabuf_disabled.load(Ordering::Acquire) {
+                let size = state.format.size();
                 if !state.renegotiated {
                     state.renegotiated = true;
                     if let Some(pod) = spa::pod::Pod::from_bytes(&state.shm_pod) {
@@ -389,10 +497,20 @@ fn run_pipewire(
                     }
                 }
                 // Drain without using DMA-BUF frames until the new format lands.
-                let _ = stream.dequeue_buffer();
+                if let Some(buffer) = stream.dequeue_buffer() {
+                    if let Some(track) = state.cursor.as_mut() {
+                        track.update(&buffer, size.width, size.height);
+                    }
+                }
                 return;
             }
             let Some(mut buffer) = stream.dequeue_buffer() else { return };
+            // Cursor metadata first: cursor-only buffers carry no new video
+            // (their chunk is marked corrupted or empty) and are dropped below.
+            if let Some(track) = state.cursor.as_mut() {
+                let size = state.format.size();
+                track.update(&buffer, size.width, size.height);
+            }
             let Some(format) = map_format(state.format.format()) else { return };
             let size = state.format.size();
             let datas = buffer.datas_mut();
@@ -505,6 +623,158 @@ fn run_pipewire(
     let _stop = stop.attach(mainloop.loop_(), move |_| quit.quit());
     mainloop.run();
     Ok(())
+}
+
+/// Frames per second from the negotiated `maxFramerate`, else `framerate`
+/// (0/1 means variable, i.e. unknown).
+fn negotiated_fps(max_num: u32, max_den: u32, num: u32, den: u32) -> Option<u32> {
+    let rate = |n: u32, d: u32| (n > 0 && d > 0).then(|| ((n as f64 / d as f64).round() as u32).max(1));
+    rate(max_num, max_den).or_else(|| rate(num, den))
+}
+
+impl CursorTrack {
+    fn update(&mut self, buffer: &pw::buffer::Buffer<'_>, frame_w: u32, frame_h: u32) {
+        use spa::buffer::meta::MetaCursor;
+        let Some(meta) = buffer.find_meta::<MetaCursor>() else { return };
+        // id 0: no cursor on this stream right now (e.g. on another monitor).
+        let visible = meta.id() != 0;
+        if visible {
+            // A bitmap with format 0 carries no new shape; offset 0 means an
+            // invisible cursor shape.
+            if let Some(bitmap) = meta.bitmap().filter(|b| b.format().0 != 0) {
+                let hotspot = meta.hotspot();
+                if let Some(image) = self.convert_bitmap(bitmap, hotspot.x, hotspot.y) {
+                    self.image_id = image.id;
+                    if let Some(image) = image.fresh {
+                        (self.sink)(CursorEvent::Image(image));
+                    }
+                }
+            }
+        }
+        let pos = meta.position();
+        let key = (visible, pos.x, pos.y, self.image_id);
+        if self.last == Some(key) {
+            return;
+        }
+        // While hidden, only the first "hidden" update matters.
+        if !visible && self.last.is_some_and(|l| !l.0) {
+            return;
+        }
+        self.last = Some(key);
+        (self.sink)(CursorEvent::Pointer(PointerUpdate {
+            seq: 0,
+            tool: PointerTool::Cursor,
+            visible,
+            x: pos.x,
+            y: pos.y,
+            frame_w: frame_w.min(u16::MAX as u32) as u16,
+            frame_h: frame_h.min(u16::MAX as u32) as u16,
+            image_id: self.image_id,
+            capture_us: now_us(),
+        }));
+    }
+
+    fn convert_bitmap(&mut self, bitmap: &spa::buffer::meta::MetaBitmap, hot_x: i32, hot_y: i32) -> Option<ConvertedCursor> {
+        use spa::param::video::VideoFormat as V;
+        let size = bitmap.size();
+        let (mut w, mut h) = (size.width, size.height);
+        let rgba = if bitmap.offset() == 0 || w == 0 || h == 0 {
+            (w, h) = (0, 0);
+            Vec::new()
+        } else {
+            if w > MAX_CURSOR_SIDE || h > MAX_CURSOR_SIDE {
+                return None;
+            }
+            let order: [usize; 4] = match bitmap.format() {
+                V::RGBA | V::RGBx => [0, 1, 2, 3],
+                V::BGRA | V::BGRx => [2, 1, 0, 3],
+                V::ARGB | V::xRGB => [1, 2, 3, 0],
+                V::ABGR | V::xBGR => [3, 2, 1, 0],
+                other => {
+                    if !self.unsupported_format_logged {
+                        self.unsupported_format_logged = true;
+                        tracing::warn!("cursor bitmap format {other:?} not supported; cursor shape not sent");
+                    }
+                    return None;
+                }
+            };
+            let opaque = matches!(bitmap.format(), V::RGBx | V::BGRx | V::xRGB | V::xBGR);
+            let data = bitmap.bitmap_data()?;
+            let stride = bitmap.stride().unsigned_abs() as usize;
+            let row = w as usize * 4;
+            if stride < row || data.len() < stride * (h as usize - 1) + row {
+                return None;
+            }
+            let mut out = Vec::with_capacity(row * h as usize);
+            for y in 0..h as usize {
+                for px in data[y * stride..y * stride + row].as_chunks::<4>().0 {
+                    let a = if opaque { 255 } else { px[order[3]] };
+                    out.extend_from_slice(&[px[order[0]], px[order[1]], px[order[2]], a]);
+                }
+            }
+            out
+        };
+        let hash = fnv1a(&rgba, &[w, h, hot_x as u32, hot_y as u32]);
+        if let Some(&(_, id)) = self.known.iter().find(|(h, _)| *h == hash) {
+            return Some(ConvertedCursor { id, fresh: None });
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        if self.known.len() >= 32 {
+            self.known.remove(0);
+        }
+        self.known.push((hash, id));
+        Some(ConvertedCursor {
+            id,
+            fresh: Some(CursorImage { id, width: w, height: h, hotspot_x: hot_x, hotspot_y: hot_y, rgba }),
+        })
+    }
+}
+
+struct ConvertedCursor {
+    id: u32,
+    /// The image, when this shape has not been sent before.
+    fresh: Option<CursorImage>,
+}
+
+fn fnv1a(bytes: &[u8], extra: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in extra.iter().flat_map(|v| v.to_le_bytes()).chain(bytes.iter().copied()) {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// Meta param asking for `SPA_META_Cursor` with room for a bitmap of up to
+/// 256×256 (the default 64×64 covers normal cursors).
+fn build_cursor_meta_pod() -> Result<Vec<u8>> {
+    use spa::pod::{ChoiceValue, Property, PropertyFlags, Value};
+    use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id, SpaTypes};
+    let meta_size = |side: usize| {
+        (std::mem::size_of::<spa::sys::spa_meta_cursor>() + std::mem::size_of::<spa::sys::spa_meta_bitmap>() + side * side * 4)
+            as i32
+    };
+    let obj = spa::pod::Object {
+        type_: SpaTypes::ObjectParamMeta.as_raw(),
+        id: spa::sys::SPA_PARAM_Meta,
+        properties: vec![
+            Property {
+                key: spa::sys::SPA_PARAM_META_type,
+                flags: PropertyFlags::empty(),
+                value: Value::Id(Id(spa::sys::SPA_META_Cursor)),
+            },
+            Property {
+                key: spa::sys::SPA_PARAM_META_size,
+                flags: PropertyFlags::empty(),
+                value: Value::Choice(ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range { default: meta_size(64), min: meta_size(1), max: meta_size(256) },
+                ))),
+            },
+        ],
+    };
+    serialize_object(obj)
 }
 
 fn serialize_object(obj: spa::pod::Object) -> Result<Vec<u8>> {
@@ -641,5 +911,27 @@ mod tests {
         assert!(spa::pod::Pod::from_bytes(&dma).is_some());
         assert!(spa::pod::Pod::from_bytes(&build_buffers_pod(true).unwrap()).is_some());
         assert!(spa::pod::Pod::from_bytes(&build_buffers_pod(false).unwrap()).is_some());
+        assert!(spa::pod::Pod::from_bytes(&build_cursor_meta_pod().unwrap()).is_some());
+    }
+
+    #[test]
+    fn cursor_mode_falls_back_to_embedded() {
+        let all = CursorMode::HIDDEN | CursorMode::EMBEDDED | CursorMode::METADATA;
+        let no_meta = CursorMode::HIDDEN | CursorMode::EMBEDDED;
+        assert_eq!(pick_cursor_mode(CursorCapture::Metadata, true, all), (CursorCapture::Metadata, None));
+        let (mode, note) = pick_cursor_mode(CursorCapture::Metadata, true, no_meta);
+        assert_eq!(mode, CursorCapture::Embedded);
+        assert!(note.unwrap().contains("no metadata cursor"));
+        assert_eq!(pick_cursor_mode(CursorCapture::Metadata, false, all).0, CursorCapture::Embedded);
+        assert_eq!(pick_cursor_mode(CursorCapture::Embedded, true, all), (CursorCapture::Embedded, None));
+    }
+
+    #[test]
+    fn fps_from_negotiated_format() {
+        assert_eq!(negotiated_fps(60, 1, 0, 1), Some(60));
+        assert_eq!(negotiated_fps(60000, 1001, 0, 1), Some(60));
+        assert_eq!(negotiated_fps(0, 1, 30, 1), Some(30));
+        assert_eq!(negotiated_fps(0, 1, 0, 1), None);
+        assert_eq!(negotiated_fps(5, 0, 0, 0), None);
     }
 }

@@ -15,6 +15,12 @@ pub struct Settings {
     /// one-shot "pick an ephemeral port" CLI choice).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// Presenter cursor mode: `separate`, `embedded` or `hidden`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Presenter frame-rate cap: `30`, `60` (or another number) or `max`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<String>,
 }
 
 impl Settings {
@@ -44,6 +50,17 @@ impl Settings {
         std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
         Ok(())
     }
+}
+
+/// Persist the presenter's cursor mode and frame-rate cap for the next start.
+pub fn save_capture(config_dir: &Path, cursor: &str, fps: &str) -> Result<()> {
+    let mut settings = Settings::load(config_dir);
+    if settings.cursor.as_deref() == Some(cursor) && settings.fps.as_deref() == Some(fps) {
+        return Ok(());
+    }
+    settings.cursor = Some(cursor.to_owned());
+    settings.fps = Some(fps.to_owned());
+    settings.save(config_dir)
 }
 
 /// `MIRRORWIRE_PORT` when it is set to a valid `u16` (including `0`).
@@ -142,7 +159,7 @@ mod tests {
     #[test]
     fn save_and_load_roundtrip() {
         let dir = temp_dir();
-        let settings = Settings { port: Some(47901) };
+        let settings = Settings { port: Some(47901), cursor: Some("embedded".into()), fps: Some("max".into()) };
         settings.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), settings);
         std::fs::remove_dir_all(&dir).ok();
@@ -153,6 +170,16 @@ mod tests {
         let dir = temp_dir();
         std::fs::write(Settings::path(&dir), r#"{"port": 47001, "future": true}"#).unwrap();
         assert_eq!(Settings::load(&dir).port, Some(47001));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn capture_settings_keep_the_port() {
+        let dir = temp_dir();
+        save_port(&dir, 47555).unwrap();
+        save_capture(&dir, "separate", "60").unwrap();
+        let s = Settings::load(&dir);
+        assert_eq!((s.port, s.cursor.as_deref(), s.fps.as_deref()), (Some(47555), Some("separate"), Some("60")));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -189,7 +216,7 @@ mod tests {
     #[test]
     fn saved_zero_is_ignored() {
         let dir = temp_dir();
-        Settings { port: Some(0) }.save(&dir).unwrap();
+        Settings { port: Some(0), ..Default::default() }.save(&dir).unwrap();
         with_env(None, || {
             assert_eq!(resolve_port(None, &dir), DEFAULT_PORT);
         });

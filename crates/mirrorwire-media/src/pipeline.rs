@@ -26,6 +26,9 @@ pub trait VideoSink: Send {
 pub struct Controls {
     pub keyframe_requested: Arc<AtomicBool>,
     pub stop: Arc<AtomicBool>,
+    /// Ask the encode loop to hand back the encoder so the capture source can
+    /// be reopened (new cursor mode or frame rate), see [`CaptureExit`].
+    pub restart_source: Arc<AtomicBool>,
 }
 
 impl Controls {
@@ -40,6 +43,19 @@ impl Controls {
     pub fn stopped(&self) -> bool {
         self.stop.load(Ordering::Acquire)
     }
+
+    pub fn request_source_restart(&self) {
+        self.restart_source.store(true, Ordering::Release);
+    }
+}
+
+/// Why [`continue_capture_encode`] returned.
+pub enum CaptureExit {
+    /// Stopped, or the source ended.
+    Finished,
+    /// [`Controls::request_source_restart`] was called: reopen the source and
+    /// continue with this encoder.
+    RestartSource(Box<Encoder>),
 }
 
 /// Pulls frames from `source`, opens (and re-opens) the encoder to follow
@@ -281,7 +297,7 @@ pub fn continue_capture_encode(
     settings: Arc<Mutex<EncoderConfig>>,
     mut on_reopen: impl FnMut(&Encoder) -> Result<()>,
     mut on_tick: impl FnMut(&Encoder, u32, u32, Tick),
-) -> Result<()> {
+) -> Result<CaptureExit> {
     let mut first_for_viewer = true;
     let mut last_sent = Instant::now();
     let mut last_size = (0u32, 0u32);
@@ -289,6 +305,12 @@ pub fn continue_capture_encode(
     loop {
         if controls.stopped() {
             break;
+        }
+        if controls.restart_source.swap(false, Ordering::AcqRel) {
+            if let Some(old) = held.take() {
+                source.recycle(old.data);
+            }
+            return Ok(CaptureExit::RestartSource(Box::new(encoder)));
         }
         let poll = REPEAT_AFTER
             .saturating_sub(last_sent.elapsed())
@@ -341,7 +363,7 @@ pub fn continue_capture_encode(
             }
         }
     }
-    Ok(())
+    Ok(CaptureExit::Finished)
 }
 
 fn maybe_replace_encoder(

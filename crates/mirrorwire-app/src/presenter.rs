@@ -5,11 +5,14 @@ use mirrorwire_media::encode::{
     DEFAULT_QP,
 };
 use mirrorwire_media::frame::EncodedFrame;
+use crate::capture_prefs::{parse_fps_arg, CapturePrefs, CursorPref, FpsPref};
 use mirrorwire_media::pipeline::{
-    continue_capture_encode, open_encoder_for, wait_first_frame, Controls, Tick, VideoSink,
+    continue_capture_encode, open_encoder_for, wait_first_frame, CaptureExit, Controls, Tick,
+    VideoSink,
 };
 use mirrorwire_media::source::testpattern::TestPattern;
-use mirrorwire_media::source::FrameSource;
+use mirrorwire_media::source::{CursorCapture, CursorSink, FrameSource};
+use mirrorwire_proto::cursor::CursorEvent;
 use mirrorwire_net::diag::FirewallHint;
 use mirrorwire_net::diag::IncomingAttempt;
 use mirrorwire_net::discovery::Advertisement;
@@ -47,8 +50,20 @@ pub struct PresentArgs {
     /// Output size as WIDTHxHEIGHT. Overrides --width/--height. Default: native capture size.
     #[arg(long, value_name = "WxH")]
     size: Option<String>,
-    #[arg(long, default_value_t = 60)]
-    fps: u32,
+    /// Highest frame rate to ask the compositor for: 30, 60 (default), another
+    /// number, or max (the display's refresh rate). Also MIRRORWIRE_FPS or the
+    /// saved setting.
+    #[arg(long, value_parser = parse_fps_arg, value_name = "30|60|max")]
+    pub fps: Option<FpsPref>,
+    /// How the mouse cursor is sent: separate (as coordinates, drawn by the
+    /// viewer; default), embedded (drawn into the video) or hidden. Also
+    /// MIRRORWIRE_CURSOR or the saved setting. separate falls back to embedded
+    /// when the portal or the viewer can't do it.
+    #[arg(long, value_enum)]
+    pub cursor: Option<CursorPref>,
+    /// Resolved from --fps / --cursor / env / settings.json in `main`.
+    #[arg(skip)]
+    pub capture: CapturePrefs,
     /// Target bitrate in kbit/s (default: 40000 = 40 Mbit/s).
     #[arg(long, default_value_t = DEFAULT_BITRATE_KBPS)]
     bitrate_kbps: u32,
@@ -95,9 +110,9 @@ pub struct PresentArgs {
     /// Stop after this many frames (test source only).
     #[arg(long)]
     frames: Option<u64>,
-    /// Hide the mouse cursor in the capture (portal source).
+    /// Hide the mouse cursor in the capture (same as --cursor hidden).
     #[arg(long)]
-    hide_cursor: bool,
+    pub hide_cursor: bool,
     /// Don't offer DMA-BUF (zero-copy GPU buffers) to the compositor; always
     /// capture through shared memory. For debugging driver problems.
     #[arg(long)]
@@ -119,7 +134,8 @@ impl PresentArgs {
         Ok(EncoderConfig {
             width,
             height,
-            fps: self.fps,
+            // Corrected to the negotiated rate once the capture is running.
+            fps: self.capture.fps.request().min(60),
             bitrate_kbps,
             backend: self.encoder,
             rate_control: self.rc,
@@ -137,7 +153,9 @@ impl PresentArgs {
             width: 0,
             height: 0,
             size: None,
-            fps: 60,
+            fps: None,
+            cursor: None,
+            capture: CapturePrefs::default(),
             bitrate_kbps: DEFAULT_BITRATE_KBPS,
             bitrate_mbps: None,
             encoder: EncoderBackend::Auto,
@@ -231,6 +249,7 @@ pub struct PresentStatus {
     pub attempts: Vec<IncomingAttempt>,
     pub hud: EncodeHud,
     pub settings: EncoderConfig,
+    pub capture: CaptureStatus,
 }
 
 #[cfg(feature = "gui")]
@@ -255,6 +274,7 @@ impl PresentStatus {
             attempts: Vec::new(),
             hud: EncodeHud::default(),
             settings,
+            capture: CaptureStatus::default(),
         }
     }
 }
@@ -267,6 +287,8 @@ pub struct PresenterHandle {
     settings: Arc<Mutex<EncoderConfig>>,
     attempts: Arc<Mutex<Vec<IncomingAttempt>>>,
     hud: Arc<Mutex<EncodeHudShim>>,
+    capture: Arc<Mutex<CaptureCtl>>,
+    config_dir: PathBuf,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -279,6 +301,24 @@ impl PresenterHandle {
     pub fn apply_settings(&self, cfg: EncoderConfig) {
         *self.settings.lock().expect("encoder settings") = cfg;
         self.controls.request_keyframe();
+    }
+
+    /// Change the cursor mode or frame-rate cap: saved for the next start,
+    /// and the capture is reopened (silently, with the portal restore token)
+    /// when it changes what is asked of the compositor.
+    pub fn apply_capture(&self, prefs: CapturePrefs) {
+        if let Err(e) = mirrorwire_net::settings::save_capture(&self.config_dir, prefs.cursor.as_str(), &prefs.fps.label()) {
+            tracing::warn!("could not save capture settings: {e:#}");
+        }
+        let restart = {
+            let mut c = self.capture.lock().expect("capture ctl");
+            c.prefs = prefs;
+            c.needs_restart()
+        };
+        if restart {
+            tracing::info!("capture settings changed (cursor {}, fps {}); reopening the capture", prefs.cursor.as_str(), prefs.fps.label());
+            self.controls.request_source_restart();
+        }
     }
 
     pub fn refresh_firewall(&self) {
@@ -295,6 +335,11 @@ impl PresenterHandle {
         s.attempts = self.attempts.lock().expect("attempts").clone();
         s.hud = self.hud.lock().expect("hud").to_hud();
         s.settings = self.settings.lock().expect("encoder settings").clone();
+        let c = self.capture.lock().expect("capture ctl");
+        s.capture = c.status();
+        if !c.source_desc.is_empty() {
+            s.source = Some(c.source_desc.clone());
+        }
         s
     }
 }
@@ -341,28 +386,173 @@ impl VideoSink for QuicSink {
     }
 }
 
-fn open_source(args: &PresentArgs, config_dir: &Path) -> Result<Box<dyn FrameSource>> {
-    match args.source {
+/// Live capture settings and what the running source actually does. Shared
+/// between the encode thread, the transport's viewer callback and the GUI.
+#[derive(Debug, Clone)]
+pub struct CaptureCtl {
+    /// What the user asked for.
+    pub prefs: CapturePrefs,
+    /// The connected viewer cannot draw a separate cursor (older build).
+    pub legacy_viewer: bool,
+    /// What the current source was opened with (before portal fallback).
+    asked_cursor: CursorCapture,
+    asked_fps: u32,
+    /// What the current source delivers.
+    active_cursor: CursorCapture,
+    cursor_note: Option<String>,
+    negotiated_fps: Option<u32>,
+    source_desc: String,
+}
+
+impl CaptureCtl {
+    fn new(prefs: CapturePrefs) -> Self {
+        Self {
+            prefs,
+            legacy_viewer: false,
+            asked_cursor: CursorCapture::Embedded,
+            asked_fps: 0,
+            active_cursor: CursorCapture::Embedded,
+            cursor_note: None,
+            negotiated_fps: None,
+            source_desc: String::new(),
+        }
+    }
+
+    /// The cursor mode to ask the capture source for right now.
+    fn wanted_cursor(&self) -> CursorCapture {
+        match self.prefs.cursor {
+            CursorPref::Separate if self.legacy_viewer => CursorCapture::Embedded,
+            CursorPref::Separate => CursorCapture::Metadata,
+            CursorPref::Embedded => CursorCapture::Embedded,
+            CursorPref::Hidden => CursorCapture::Hidden,
+        }
+    }
+
+    fn needs_restart(&self) -> bool {
+        self.wanted_cursor() != self.asked_cursor || self.prefs.fps.request() != self.asked_fps
+    }
+
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    fn status(&self) -> CaptureStatus {
+        let mut note = self.cursor_note.clone();
+        if self.legacy_viewer && self.prefs.cursor == CursorPref::Separate {
+            note = Some("the connected viewer is an older version: cursor drawn into the video for it".into());
+        }
+        CaptureStatus {
+            prefs: self.prefs,
+            cursor_mode: self.active_cursor.as_str().to_owned(),
+            cursor_note: note,
+            fps_requested: self.asked_fps,
+            fps_negotiated: self.negotiated_fps,
+        }
+    }
+}
+
+/// Capture settings as shown in the presenter window.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub struct CaptureStatus {
+    pub prefs: CapturePrefs,
+    /// `separate`, `embedded` or `hidden`: what the viewer actually gets.
+    pub cursor_mode: String,
+    pub cursor_note: Option<String>,
+    pub fps_requested: u32,
+    pub fps_negotiated: Option<u32>,
+}
+
+impl Default for CaptureStatus {
+    fn default() -> Self {
+        CaptureCtl::new(CapturePrefs::default()).status()
+    }
+}
+
+/// Open the capture source for the current wanted cursor mode and frame
+/// rate, and record what it delivers.
+fn open_source(
+    args: &PresentArgs,
+    config_dir: &Path,
+    ctl: &Mutex<CaptureCtl>,
+    sink: &CursorSink,
+) -> Result<Box<dyn FrameSource>> {
+    let (cursor, fps) = {
+        let c = ctl.lock().expect("capture ctl");
+        (c.wanted_cursor(), c.prefs.fps.request())
+    };
+    let source: Box<dyn FrameSource> = match args.source {
         SourceKind::Test => {
             let (w, h) = if let Some(s) = &args.size {
                 parse_size(s).unwrap_or((args.width, args.height))
             } else {
                 (args.width, args.height)
             };
-            Ok(Box::new(TestPattern::new(w, h, args.fps, args.frames)))
+            let pattern = TestPattern::new(w, h, fps.min(60), args.frames);
+            if cursor == CursorCapture::Metadata {
+                Box::new(pattern.with_cursor(sink.clone()))
+            } else {
+                Box::new(pattern)
+            }
         }
-        SourceKind::Portal => open_portal(args, config_dir),
+        SourceKind::Portal => open_portal(args, config_dir, cursor, fps, sink)?,
+    };
+    let mut c = ctl.lock().expect("capture ctl");
+    c.asked_cursor = cursor;
+    c.asked_fps = fps;
+    c.active_cursor = source.cursor_capture();
+    c.cursor_note = source.cursor_note();
+    c.negotiated_fps = None;
+    c.source_desc = source.describe();
+    tracing::info!(
+        "capture: cursor {} (asked {}){}, frame rate up to {fps}",
+        c.active_cursor.as_str(),
+        cursor.as_str(),
+        c.cursor_note.as_deref().map(|n| format!(" [{n}]")).unwrap_or_default()
+    );
+    Ok(source)
+}
+
+/// After the first frame the compositor's rate is known: run the encoder at
+/// min(asked, negotiated) and keep a custom keyframe interval in seconds.
+fn apply_negotiated_fps(source: &dyn FrameSource, ctl: &Mutex<CaptureCtl>, settings: &Mutex<EncoderConfig>) -> u32 {
+    let mut c = ctl.lock().expect("capture ctl");
+    c.negotiated_fps = source.negotiated_fps();
+    c.source_desc = source.describe();
+    let fps = effective_fps(c.asked_fps, c.negotiated_fps);
+    let mut s = settings.lock().expect("encoder settings");
+    if s.fps != fps {
+        if let Some(k) = s.keyint {
+            s.keyint = Some((k as u64 * fps as u64 / s.fps.max(1) as u64).max(1) as u32);
+        }
+        tracing::info!("encoder frame rate {} -> {fps} fps (compositor allows {:?})", s.fps, c.negotiated_fps);
+        s.fps = fps;
+    }
+    fps
+}
+
+/// The encoder's nominal rate: what we asked for, capped by what the
+/// compositor agreed to; 60 when "max" is asked and nothing is known.
+fn effective_fps(asked: u32, negotiated: Option<u32>) -> u32 {
+    let asked = asked.max(1);
+    match negotiated {
+        Some(n) => asked.min(n).max(1),
+        None => asked.min(60),
     }
 }
 
 #[cfg(all(target_os = "linux", feature = "portal"))]
-fn open_portal(args: &PresentArgs, config_dir: &Path) -> Result<Box<dyn FrameSource>> {
+fn open_portal(
+    args: &PresentArgs,
+    config_dir: &Path,
+    cursor: CursorCapture,
+    fps: u32,
+    sink: &CursorSink,
+) -> Result<Box<dyn FrameSource>> {
     use mirrorwire_media::source::portal::{PortalOptions, PortalSource};
     Ok(Box::new(PortalSource::open(PortalOptions {
         restore_token_path: config_dir.join("portal_restore_token"),
-        show_cursor: !args.hide_cursor,
+        cursor,
+        cursor_sink: Some(sink.clone()),
         allow_virtual: true,
-        fps: args.fps,
+        fps,
         // Only VAAPI can import DMA-BUFs. With `auto` the encoder may still
         // turn out to be x264; the pipeline then asks the source to switch
         // to shared memory.
@@ -373,7 +563,13 @@ fn open_portal(args: &PresentArgs, config_dir: &Path) -> Result<Box<dyn FrameSou
 }
 
 #[cfg(not(all(target_os = "linux", feature = "portal")))]
-fn open_portal(_args: &PresentArgs, _config_dir: &Path) -> Result<Box<dyn FrameSource>> {
+fn open_portal(
+    _args: &PresentArgs,
+    _config_dir: &Path,
+    _cursor: CursorCapture,
+    _fps: u32,
+    _sink: &CursorSink,
+) -> Result<Box<dyn FrameSource>> {
     bail!("portal capture is only available on Linux builds with the `portal` feature; use --source test")
 }
 
@@ -390,7 +586,7 @@ struct ReadyInfo {
     conversion: String,
 }
 
-fn stream_info_from(encoder: &Encoder, fps: u32) -> StreamInfo {
+fn stream_info_from(encoder: &Encoder, fps: u32, cursor: CursorCapture) -> StreamInfo {
     let (w, h) = encoder.output_size();
     StreamInfo {
         width: w,
@@ -400,6 +596,7 @@ fn stream_info_from(encoder: &Encoder, fps: u32) -> StreamInfo {
         encoder: encoder.name().into(),
         bitrate_kbps: encoder.config().bitrate_kbps,
         intra_refresh: encoder.config().intra_refresh,
+        cursor: Some(cursor.as_str().to_owned()),
     }
 }
 
@@ -415,14 +612,23 @@ fn present_session(
     settings: Arc<Mutex<EncoderConfig>>,
     attempts: Arc<Mutex<Vec<IncomingAttempt>>>,
     hud: Arc<Mutex<EncodeHudShim>>,
+    ctl: Arc<Mutex<CaptureCtl>>,
     mut on_ready: impl FnMut(ReadyInfo, watch::Receiver<bool>) -> Result<()>,
 ) -> Result<()> {
-    let mut source = open_source(&args, &config_dir)?;
+    // Cursor changes go straight from the capture thread to the network,
+    // independent of video frames. Full channel = drop (a newer one follows).
+    let (cursor_tx, cursor_rx) = mpsc::channel::<CursorEvent>(256);
+    let cursor_sink: CursorSink = Arc::new(move |ev| {
+        let _ = cursor_tx.try_send(ev);
+    });
+    let mut source = open_source(&args, &config_dir, &ctl, &cursor_sink)?;
     let Some(first) = wait_first_frame(source.as_mut(), &controls)? else {
         bail!("capture source ended before the first frame");
     };
+    let fps = apply_negotiated_fps(source.as_ref(), &ctl, &settings);
     let cfg = settings.lock().expect("encoder settings").clone();
     let encoder = open_encoder_for(&first, &cfg)?;
+    let active_cursor = ctl.lock().expect("capture ctl").active_cursor;
 
     let _guard = runtime.enter();
     let pairing_code = if args.no_pairing {
@@ -431,6 +637,8 @@ fn present_session(
         Some(random_pairing_code()?)
     };
     let keyframe_controls = controls.clone();
+    let viewer_ctl = ctl.clone();
+    let viewer_controls = controls.clone();
     let presenter = Presenter::start(
         &identity,
         PresenterConfig {
@@ -438,10 +646,25 @@ fn present_session(
                 args.bind.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
                 args.port,
             ),
-            stream_info: stream_info_from(&encoder, args.fps),
+            stream_info: stream_info_from(&encoder, fps, active_cursor),
             pairing_code: pairing_code.clone(),
-            config_dir,
+            config_dir: config_dir.clone(),
             attempts: attempts.clone(),
+            // An older viewer can't draw a separate cursor: reopen the
+            // capture with the cursor in the video while it is connected.
+            on_viewer: Some(Arc::new(move |cursor_ok| {
+                let mut c = viewer_ctl.lock().expect("capture ctl");
+                c.legacy_viewer = !cursor_ok;
+                if c.needs_restart() {
+                    tracing::info!(
+                        "viewer {} draw a separate cursor; reopening the capture with cursor {}",
+                        if cursor_ok { "can" } else { "cannot" },
+                        c.wanted_cursor().as_str()
+                    );
+                    viewer_controls.request_source_restart();
+                }
+            })),
+            cursor_events: Some(cursor_rx),
         },
         Arc::new(move || keyframe_controls.request_keyframe()),
     )?;
@@ -513,31 +736,59 @@ fn present_session(
         controls: controls.clone(),
         next_id: 0,
     };
-    let hud_reopen = hud.clone();
-    let hud_tick = hud.clone();
-    let result = continue_capture_encode(
-        source.as_mut(),
-        Some(first),
-        encoder,
-        &mut sink,
-        &controls,
-        settings,
-        move |enc| {
-            if let Ok(mut h) = hud_reopen.lock() {
-                let (cw, ch) = (h.capture_w, h.capture_h);
-                h.note_frame(enc, cw, ch);
-            }
-            Ok(())
-        },
-        move |enc, cw, ch, tick| {
-            if let Ok(mut h) = hud_tick.lock() {
-                match tick {
-                    Tick::Captured => h.note_frame(enc, cw, ch),
-                    Tick::Repeated => h.note_repeat(),
+    let mut held = Some(first);
+    let mut encoder = encoder;
+    let result = loop {
+        let hud_reopen = hud.clone();
+        let hud_tick = hud.clone();
+        let exit = continue_capture_encode(
+            source.as_mut(),
+            held.take(),
+            encoder,
+            &mut sink,
+            &controls,
+            settings.clone(),
+            move |enc| {
+                if let Ok(mut h) = hud_reopen.lock() {
+                    let (cw, ch) = (h.capture_w, h.capture_h);
+                    h.note_frame(enc, cw, ch);
                 }
+                Ok(())
+            },
+            move |enc, cw, ch, tick| {
+                if let Ok(mut h) = hud_tick.lock() {
+                    match tick {
+                        Tick::Captured => h.note_frame(enc, cw, ch),
+                        Tick::Repeated => h.note_repeat(),
+                    }
+                }
+            },
+        );
+        match exit {
+            Ok(CaptureExit::Finished) => break Ok(()),
+            Err(e) => break Err(e),
+            Ok(CaptureExit::RestartSource(enc)) => {
+                encoder = *enc;
+                // Close the old portal session before opening the new one.
+                drop(source);
+                source = match open_source(&args, &config_dir, &ctl, &cursor_sink) {
+                    Ok(s) => s,
+                    Err(e) => break Err(e.context("reopening the capture with new settings")),
+                };
+                match wait_first_frame(source.as_mut(), &controls) {
+                    Ok(Some(f)) => held = Some(f),
+                    Ok(None) => break Ok(()),
+                    Err(e) => break Err(e),
+                }
+                let fps = apply_negotiated_fps(source.as_ref(), &ctl, &settings);
+                let cursor = ctl.lock().expect("capture ctl").active_cursor;
+                presenter.update_stream_info(|info| {
+                    info.fps = fps;
+                    info.cursor = Some(cursor.as_str().to_owned());
+                });
             }
-        },
-    );
+        }
+    };
     presenter.close();
     drop(sink);
     result
@@ -667,6 +918,8 @@ pub fn run(args: PresentArgs, config_dir: &Path) -> Result<()> {
     let settings = Arc::new(Mutex::new(args.encoder_config()?));
     let attempts = Arc::new(Mutex::new(Vec::new()));
     let hud = Arc::new(Mutex::new(EncodeHudShim::default()));
+    let ctl = Arc::new(Mutex::new(CaptureCtl::new(args.capture)));
+    let ctl_print = ctl.clone();
 
     let result = present_session(
         args,
@@ -678,6 +931,7 @@ pub fn run(args: PresentArgs, config_dir: &Path) -> Result<()> {
         settings,
         attempts,
         hud,
+        ctl,
         |ready, _connected| {
             println!("{}", qr_terminal(&ready.uri)?);
             println!(
@@ -698,6 +952,16 @@ pub fn run(args: PresentArgs, config_dir: &Path) -> Result<()> {
                 );
             }
             println!("encoder {}  source {}", ready.encoder, ready.source);
+            {
+                let c = ctl_print.lock().expect("capture ctl");
+                println!(
+                    "cursor {}{}  frame rate asked {} fps, compositor allows {}",
+                    c.active_cursor.as_str(),
+                    c.cursor_note.as_deref().map(|n| format!(" ({n})")).unwrap_or_default(),
+                    c.asked_fps,
+                    c.negotiated_fps.map(|f| format!("{f} fps")).unwrap_or_else(|| "?".into())
+                );
+            }
             println!("{}", ready.rc_summary);
             println!("colour conversion {}", ready.conversion);
             println!("fingerprint {}", short_fingerprint(&ready.fingerprint));
@@ -732,6 +996,7 @@ pub fn spawn_for_gui(
     let mut args = PresentArgs::gui_defaults();
     args.name = Some(name);
     args.port = port;
+    args.capture = crate::capture_prefs::resolve(None, None, &config_dir);
     spawn(runtime, args, config_dir, identity, on_update)
 }
 
@@ -752,6 +1017,9 @@ pub fn spawn(
     ));
     let attempts = Arc::new(Mutex::new(Vec::new()));
     let hud = Arc::new(Mutex::new(EncodeHudShim::default()));
+    let capture = Arc::new(Mutex::new(CaptureCtl::new(args.capture)));
+    let handle_capture = capture.clone();
+    let handle_config_dir = config_dir.clone();
     let initial_settings = settings.lock().expect("encoder settings").clone();
     let status = Arc::new(Mutex::new(PresentStatus::new(
         name.clone(),
@@ -802,6 +1070,7 @@ pub fn spawn(
                     settings,
                     attempts,
                     hud,
+                    capture,
                     move |ready, rx| {
                         {
                             let mut s = status_ready.lock().expect("present status");
@@ -852,6 +1121,8 @@ pub fn spawn(
         settings: handle_settings,
         attempts: handle_attempts,
         hud: handle_hud,
+        capture: handle_capture,
+        config_dir: handle_config_dir,
         thread: Some(thread),
     }
 }
@@ -868,4 +1139,34 @@ fn ctrlc_like(on_signal: impl Fn() + Send + 'static) {
             on_signal();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoder_rate_follows_compositor() {
+        assert_eq!(effective_fps(60, Some(60)), 60);
+        assert_eq!(effective_fps(60, Some(30)), 30);
+        assert_eq!(effective_fps(240, Some(144)), 144);
+        assert_eq!(effective_fps(240, None), 60);
+        assert_eq!(effective_fps(30, None), 30);
+    }
+
+    #[test]
+    fn old_viewer_forces_embedded_cursor() {
+        let mut c = CaptureCtl::new(CapturePrefs::default());
+        c.asked_cursor = CursorCapture::Metadata;
+        c.asked_fps = 60;
+        assert!(!c.needs_restart());
+        c.legacy_viewer = true;
+        assert_eq!(c.wanted_cursor(), CursorCapture::Embedded);
+        assert!(c.needs_restart());
+        // A portal without metadata already falls back; no restart loop.
+        c.asked_cursor = CursorCapture::Embedded;
+        assert!(!c.needs_restart());
+        c.prefs.fps = FpsPref::Max;
+        assert!(c.needs_restart());
+    }
 }

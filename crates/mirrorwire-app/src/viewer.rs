@@ -9,6 +9,7 @@ use mirrorwire_net::diag::{ConnectStepId, ConnectTrace, HANDSHAKE_TIMEOUT};
 use mirrorwire_net::transport::{ms, ViewerSession};
 use mirrorwire_proto::clock::{now_us, ClockSync};
 use mirrorwire_proto::control::StreamInfo;
+use mirrorwire_proto::cursor::ViewerCursor;
 use mirrorwire_proto::fragment::{AssembledFrame, Reassembler};
 use mirrorwire_proto::stats::StageStats;
 use std::path::Path;
@@ -75,6 +76,10 @@ pub struct ViewerStatus {
     pub native_width: u32,
     pub native_height: u32,
     pub first_frame: bool,
+    /// How the presenter sends the cursor: `separate`, `embedded`, `hidden`.
+    pub cursor_mode: String,
+    /// Cursor sent as coordinates (position + cached images), once connected.
+    pub cursor: Option<Arc<Mutex<ViewerCursor>>>,
 }
 
 #[derive(Default)]
@@ -88,6 +93,10 @@ pub struct Totals {
     pub marker_mismatch: u64,
     pub keyframe_requests: u64,
     pub decode_errors: u64,
+    pub cursor_mode: String,
+    pub cursor_updates: u64,
+    pub cursor_stale: u64,
+    pub cursor_images: u64,
 }
 
 pub struct ViewerOptions {
@@ -158,6 +167,18 @@ struct ToDecode {
     frame: AssembledFrame,
 }
 
+/// Frames that may wait for the decoder (bounded; see `session`).
+const DECODE_QUEUE: usize = 2;
+
+/// Drop everything waiting for the decoder; returns how many were dropped.
+fn flush_backlog<T>(rx: &Receiver<T>) -> usize {
+    let mut n = 0;
+    while rx.try_recv().is_ok() {
+        n += 1;
+    }
+    n
+}
+
 async fn session(
     identity: Arc<Identity>,
     target: ConnectInfo,
@@ -195,12 +216,22 @@ async fn session(
         s.stream = Some(session.stream_info.clone());
         s.native_width = session.stream_info.width;
         s.native_height = session.stream_info.height;
+        s.cursor_mode = session.cursor_mode();
+        s.cursor = Some(session.cursor.clone());
     }
+    tracing::info!("cursor from presenter: {}", session.cursor_mode());
+    let mut stream_updates = session.stream_updates.clone();
+    let repaint = on_frame.clone();
 
     let opts_loss = opts.simulate_loss;
     let self_healing = session.stream_info.intra_refresh;
     let need_keyframe = Arc::new(AtomicBool::new(true));
-    let (decode_tx, decode_rx) = bounded::<ToDecode>(4);
+    // At most one frame waits while another decodes. When the decoder falls
+    // behind (big scene-change frames on a software decoder), the queue is
+    // flushed and we wait for a fresh keyframe instead of decoding a backlog
+    // of stale frames (that backlog was the >200 ms capture->texture spikes).
+    let (decode_tx, decode_rx) = bounded::<ToDecode>(DECODE_QUEUE);
+    let decode_flush = decode_rx.clone();
     let control = session.control_sender();
     let clock = session.clock.clone();
     let decode_status = status.clone();
@@ -257,6 +288,19 @@ async fn session(
                 continue;
             }
         }
+        if stream_updates.has_changed().unwrap_or(false) {
+            let info = stream_updates.borrow_and_update().clone();
+            let mut s = status.lock().expect("status lock");
+            s.cursor_mode = info.cursor.clone().unwrap_or_else(|| "embedded".into());
+            s.stream = Some(info);
+        }
+        if session.handle_pointer_datagram(&datagram) {
+            // Draw the moved cursor now, not with the next video frame.
+            if let Some(cb) = &repaint {
+                cb();
+            }
+            continue;
+        }
         let Some((frame, event)) = reassembler.push(datagram, now_us()) else {
             continue;
         };
@@ -281,13 +325,23 @@ async fn session(
         match decode_tx.try_send(ToDecode { frame }) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
-                tracing::debug!("decoder backlog, dropping frame");
+                let flushed = flush_backlog(&decode_flush);
+                tracing::info!("decoder behind: dropped {} queued frames + this one, waiting for a keyframe", flushed);
                 need_keyframe.store(true, Ordering::Release);
+                if last_request.elapsed() > Duration::from_millis(100) {
+                    session.request_keyframe("decoder backlog");
+                    last_request = Instant::now();
+                    requests += 1;
+                }
             }
             Err(TrySendError::Disconnected(_)) => break Some("decoder stopped".into()),
         }
     };
     let elapsed = started.elapsed().as_secs_f64();
+    let cursor_summary = {
+        let c = session.cursor.lock().expect("cursor lock");
+        (c.updates, c.stale, c.images_received)
+    };
     session.close();
     drop(decode_tx);
     let (mut totals, all) = decode_thread
@@ -296,6 +350,8 @@ async fn session(
     totals.lost = lost;
     totals.skipped_waiting_keyframe = skipped;
     totals.keyframe_requests += requests;
+    (totals.cursor_updates, totals.cursor_stale, totals.cursor_images) = cursor_summary;
+    totals.cursor_mode = session.cursor_mode();
     if let Some(reason) = close_reason {
         tracing::info!("connection closed: {reason}");
     }
@@ -579,6 +635,14 @@ fn print_summary((totals, stats, secs): &(Totals, StageStats, f64)) {
         totals.marker_checked, totals.marker_mismatch
     );
     println!(
+        "cursor {}  pointer updates {} ({:.1}/s)  stale {}  images {}",
+        totals.cursor_mode,
+        totals.cursor_updates,
+        totals.cursor_updates as f64 / secs,
+        totals.cursor_stale,
+        totals.cursor_images
+    );
+    println!(
         "{:<20} {:>8} {:>8} {:>8} {:>8}",
         "stage (ms)", "mean", "p50", "p95", "max"
     );
@@ -595,6 +659,17 @@ fn print_summary((totals, stats, secs): &(Totals, StageStats, f64)) {
 #[cfg(test)]
 mod tests {
     use super::{viewer_ui, ViewerUi};
+
+    #[test]
+    fn backlog_flush_empties_the_bounded_queue() {
+        let (tx, rx) = crossbeam_channel::bounded::<u32>(super::DECODE_QUEUE);
+        for i in 0..super::DECODE_QUEUE as u32 {
+            tx.try_send(i).unwrap();
+        }
+        assert!(tx.try_send(99).is_err(), "queue is bounded");
+        assert_eq!(super::flush_backlog(&rx), super::DECODE_QUEUE);
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn stays_connecting_until_session_is_up() {

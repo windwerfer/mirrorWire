@@ -40,7 +40,13 @@ Rules:
 Presenter                                                         Viewer
 ---------                                                         ------
 xdg-desktop-portal ScreenCast  (one-time dialog, restore token)
-  -> PipeWire stream (BGRx/BGRA/RGBx/RGBA), maxFramerate = --fps (60)
+  -> PipeWire stream (BGRx/BGRA/RGBx/RGBA), maxFramerate = --fps (30|60|max, default 60);
+       the negotiated max is read back and caps the encoder's nominal fps
+       cursor: portal cursor_mode METADATA (if AvailableCursorModes has it) + SPA_META_Cursor
+         -> CursorSink -> transport cursor_loop -> pointer datagrams / image uni streams
+            (bypasses the encoder; see protocol.md §3a); else EMBEDDED
+       a changed cursor mode / fps cap reopens the source (Controls::request_source_restart,
+         CaptureExit::RestartSource keeps the encoder; portal restore token = no dialog)
        DMA-BUF with modifiers offered first (VAAPI encoders), shared memory second
   -> FrameSource::poll_frame -> RawFrame (pixels in `data`, or a DMA-BUF fd in `dmabuf`)
   -> Encoder (FFmpeg): h264_vaapi | h264_videotoolbox | libx264

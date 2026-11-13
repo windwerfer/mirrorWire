@@ -49,6 +49,8 @@ struct ViewerApp {
     picture_size: (u32, u32),
     show_overlay: bool,
     last_uri_check: Instant,
+    /// Texture of the separately sent cursor, by image id.
+    cursor_tex: Option<(u32, egui::TextureHandle)>,
 }
 
 impl ViewerApp {
@@ -89,6 +91,7 @@ impl ViewerApp {
             picture_size: (0, 0),
             show_overlay: true,
             last_uri_check: Instant::now() - Duration::from_secs(1),
+            cursor_tex: None,
         }
     }
 
@@ -99,6 +102,7 @@ impl ViewerApp {
         }
         self.error = None;
         self.texture = None;
+        self.cursor_tex = None;
         self.target_name = target.name.clone().unwrap_or_else(|| target.addr.to_string());
         let repaint = ctx.clone();
         self.session = Some(session::spawn(
@@ -230,12 +234,18 @@ impl ViewerApp {
     fn video_ui(&mut self, ui: &mut egui::Ui, status: &session::Status) {
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
-        if let Some(tex) = &self.texture {
+        if let Some(tex_id) = self.texture.as_ref().map(|t| t.id()) {
             let (w, h) = (self.picture_size.0.max(1) as f32, self.picture_size.1.max(1) as f32);
             let scale = (rect.width() / w).min(rect.height() / h);
             let size = egui::vec2(w * scale, h * scale);
             let img_rect = egui::Rect::from_center_size(rect.center(), size);
-            ui.painter().image(tex.id(), img_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+            ui.painter().image(tex_id, img_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+            if status.cursor_mode == "separate" {
+                let current = status.cursor.as_ref().and_then(|c| c.lock().unwrap_or_else(|e| e.into_inner()).current());
+                if let Some((p, img)) = current {
+                    self.draw_cursor(ui, &p, &img, img_rect);
+                }
+            }
         } else {
             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Waiting for the first picture…", egui::FontId::proportional(18.0), egui::Color32::GRAY);
         }
@@ -246,7 +256,7 @@ impl ViewerApp {
         if self.show_overlay {
             let stream = status.stream.as_ref();
             let text = format!(
-                "{}x{}  {:.1} fps  {:.2} Mbit/s  ({})\n{}  decode {:.1} ms  lost {}\ntap: hide",
+                "{}x{}  {:.1} fps  {:.2} Mbit/s  ({})\n{}  decode {:.1} ms  lost {}\ncursor {}\ntap: hide",
                 stream.map(|s| s.width).unwrap_or(0),
                 stream.map(|s| s.height).unwrap_or(0),
                 status.fps,
@@ -255,12 +265,42 @@ impl ViewerApp {
                 status.decoder,
                 status.decode_ms,
                 status.lost,
+                if status.cursor_mode.is_empty() { "?" } else { status.cursor_mode.as_str() },
             );
             ui.painter().text(rect.left_top() + egui::vec2(8.0, 40.0), egui::Align2::LEFT_TOP, text, egui::FontId::monospace(12.0), egui::Color32::from_rgb(0, 255, 120));
             let button = egui::Rect::from_min_size(rect.right_top() + egui::vec2(-150.0, 40.0), egui::vec2(140.0, 44.0));
             if ui.put(button, egui::Button::new("Disconnect")).clicked() {
                 self.disconnect();
             }
+        }
+    }
+}
+
+impl ViewerApp {
+    /// The presenter's cursor as a textured quad over the video (same
+    /// mapping as the desktop viewer). Drawn inside this app's own surface,
+    /// so no overlay permission is involved.
+    fn draw_cursor(
+        &mut self,
+        ui: &egui::Ui,
+        p: &mirrorwire_proto::cursor::PointerUpdate,
+        img: &mirrorwire_proto::cursor::CursorImage,
+        video: egui::Rect,
+    ) {
+        let rect = mirrorwire_proto::cursor::RectF { x: video.min.x, y: video.min.y, w: video.width(), h: video.height() };
+        let Some(r) = mirrorwire_proto::cursor::cursor_rect(p, img, rect) else { return };
+        if self.cursor_tex.as_ref().is_none_or(|(id, _)| *id != img.id) {
+            let image = egui::ColorImage::from_rgba_premultiplied([img.width as usize, img.height as usize], &img.rgba);
+            let tex = ui.ctx().load_texture("cursor", image, egui::TextureOptions::LINEAR);
+            self.cursor_tex = Some((img.id, tex));
+        }
+        if let Some((_, tex)) = &self.cursor_tex {
+            ui.painter().with_clip_rect(video).image(
+                tex.id(),
+                egui::Rect::from_min_size(egui::pos2(r.x, r.y), egui::vec2(r.w, r.h)),
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
         }
     }
 }

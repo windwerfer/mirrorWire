@@ -1238,7 +1238,10 @@ fn apply_rate_control(
         RateControl::Vbr => bitrate + bitrate / 4,
         _ => bitrate,
     };
-    let buffer = (bitrate * 2).min(i32::MAX as i64) as i32;
+    // VBV of 100 ms of bitrate: a scene change or IDR can't produce a frame
+    // that takes several hundred ms to send (the old 2 s buffer let one
+    // frame grow to megabytes, which stalled Wi-Fi and the viewer).
+    let buffer = (bitrate / 10).clamp(1, i32::MAX as i64) as i32;
     match rc {
         RateControl::Cqp | RateControl::Icq => {
             enc.set_bit_rate(0);
@@ -1256,7 +1259,7 @@ fn apply_rate_control(
             unsafe {
                 let raw = enc.as_mut_ptr();
                 (*raw).rc_buffer_size = buffer;
-                (*raw).rc_initial_buffer_occupancy = buffer * 3 / 4;
+                (*raw).rc_initial_buffer_occupancy = buffer / 10 * 9;
             }
         }
     }

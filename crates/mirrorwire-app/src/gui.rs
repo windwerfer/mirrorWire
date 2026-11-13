@@ -1,4 +1,5 @@
 use crate::applog::LogStore;
+use crate::capture_prefs::{CapturePrefs, CursorPref, FpsPref};
 use crate::presenter::{self, PresentPhase, PresenterHandle};
 use crate::viewer::{self, viewer_ui, Picture, ViewerHandle, ViewerOptions, ViewerUi};
 use crate::yuv_glow::{YuvPaint, YuvRenderer};
@@ -101,6 +102,7 @@ pub fn run(
             let initial = initial.clone();
             let log = log.clone();
             Box::new(move |cc: &eframe::CreationContext<'_>| {
+                let capture = crate::capture_prefs::resolve(None, None, &config_dir);
                 let mut app = MirrorApp {
                     identity,
                     runtime: handle,
@@ -141,6 +143,9 @@ pub fn run(
                     keyint_sec: 10,
                     encoder: EncoderBackend::Auto,
                     firewall_fix: None,
+                    capture,
+                    cursor_tex: None,
+                    cursor_rate: (Instant::now(), 0, 0.0),
                 };
                 if let Some(target) = initial {
                     app.screen = Screen::View;
@@ -211,6 +216,12 @@ struct MirrorApp {
     keyint_sec: u32,
     encoder: EncoderBackend,
     firewall_fix: Option<Arc<Mutex<FirewallFix>>>,
+    /// Presenter cursor mode and frame-rate cap (Quality panel).
+    capture: CapturePrefs,
+    /// Viewer: texture of the separately sent cursor, by image id.
+    cursor_tex: Option<(u32, egui::TextureHandle)>,
+    /// Viewer: (window start, updates at start, updates/s) for the HUD.
+    cursor_rate: (Instant, u64, f64),
 }
 
 impl MirrorApp {
@@ -219,6 +230,7 @@ impl MirrorApp {
         self.error = None;
         self.texture = None;
         self.yuv = None;
+        self.cursor_tex = None;
         self.last_target = Some(target.clone());
         self.watching = Some(viewer::spawn(
             &self.runtime,
@@ -441,6 +453,30 @@ impl MirrorApp {
                 if let Some(note) = &hud.fallback_note {
                     ui.colored_label(egui::Color32::from_rgb(230, 160, 40), note);
                 }
+                let cap = &status.capture;
+                ui.horizontal(|ui| {
+                    ui.weak("Cursor:");
+                    let text = match cap.cursor_mode.as_str() {
+                        "separate" => "separate (sent as coordinates, drawn by the viewer)",
+                        "embedded" => "embedded (drawn into the video)",
+                        other => other,
+                    };
+                    let color = if cap.cursor_mode == "separate" || cap.prefs.cursor != CursorPref::Separate {
+                        egui::Color32::from_rgb(0, 180, 80)
+                    } else {
+                        egui::Color32::from_rgb(230, 160, 40)
+                    };
+                    ui.colored_label(color, text);
+                });
+                if let Some(note) = &cap.cursor_note {
+                    ui.colored_label(egui::Color32::from_rgb(230, 160, 40), note);
+                }
+                ui.weak(format!(
+                    "Frame rate: asked up to {} fps  ·  compositor allows {}  ·  encoder runs at {} fps",
+                    cap.fps_requested,
+                    cap.fps_negotiated.map(|f| format!("{f} fps")).unwrap_or_else(|| "? (not reported)".into()),
+                    status.settings.fps
+                ));
                 if hud.capture_w > 0 {
                     ui.weak(format!(
                         "Capture {}x{}  →  encode {}x{}  ·  source {:.1} fps (+{:.1} repeats/s)  ·  map/pack {:.1} ms  convert {:.1} ms  upload {:.1} ms  encode {:.1} ms (avg {:.1} ms)",
@@ -636,6 +672,14 @@ impl MirrorApp {
                     egui::Color32::WHITE,
                 );
             }
+            if status.cursor_mode == "separate" {
+                if let Some(cursor) = &status.cursor {
+                    let current = cursor.lock().expect("cursor lock").current();
+                    if let Some((p, img)) = current {
+                        self.draw_cursor(ui, &p, &img, draw);
+                    }
+                }
+            }
             let drawn_px = draw_size * ppp;
             let sx = drawn_px.x / tex_w;
             let sy = drawn_px.y / tex_h;
@@ -651,16 +695,27 @@ impl MirrorApp {
                 if self.pixel_exact { "1:1 nearest" } else { "fit linear" },
             );
         }
+        let updates = status.cursor.as_ref().map(|c| c.lock().expect("cursor lock").updates).unwrap_or(0);
+        let elapsed = self.cursor_rate.0.elapsed().as_secs_f64();
+        if elapsed >= 1.0 {
+            self.cursor_rate = (Instant::now(), updates, updates.saturating_sub(self.cursor_rate.1) as f64 / elapsed);
+        }
+        let cursor_line = match status.cursor_mode.as_str() {
+            "separate" => format!("cursor separate ({:.0} updates/s)", self.cursor_rate.2),
+            "" => "cursor ?".to_owned(),
+            other => format!("cursor {other} (in video)"),
+        };
         if self.show_stats {
             let stream = status.stream.as_ref();
             let text = format!(
-                "{}x{}  source {:.1} fps  {:.2} Mbit/s  {} ({})\n{}  decode {:.2} ms  {}  capture->texture {:.1} ms\nwindow: {}\n{}\n{}\nS: stats  1: 1:1 pixels  F / double-click: fullscreen  Esc: disconnect",
+                "{}x{}  source {:.1} fps  {:.2} Mbit/s  {} ({})  {}\n{}  decode {:.2} ms  {}  capture->texture {:.1} ms\nwindow: {}\n{}\n{}\nS: stats  1: 1:1 pixels  F / double-click: fullscreen  Esc: disconnect",
                 status.native_width.max(stream.map(|s| s.width).unwrap_or(0)),
                 status.native_height.max(stream.map(|s| s.height).unwrap_or(0)),
                 status.source_fps,
                 status.bitrate_mbps,
                 stream.map(|s| s.codec.as_str()).unwrap_or("h264"),
                 stream.map(|s| s.encoder.as_str()).unwrap_or("?"),
+                cursor_line,
                 status.decoder,
                 status.decode_ms,
                 self.renderer.label(),
@@ -679,9 +734,14 @@ impl MirrorApp {
         }
 
         let response = ui.interact(rect, ui.scope_id().with("video"), egui::Sense::click());
+        // Never call Response methods inside `ctx.input(..)`: on a click,
+        // `double_clicked()` takes the context lock again, and a nested read
+        // lock deadlocks as soon as the decode thread is waiting to write
+        // (`request_repaint`). That froze the iMac viewer on a click.
+        let double_clicked = response.double_clicked();
         let (toggle_fs, toggle_stats, toggle_1to1, leave) = ctx.input(|i| {
             (
-                i.key_pressed(egui::Key::F) || response.double_clicked(),
+                i.key_pressed(egui::Key::F) || double_clicked,
                 i.key_pressed(egui::Key::S),
                 i.key_pressed(egui::Key::Num1),
                 i.key_pressed(egui::Key::Escape),
@@ -703,6 +763,40 @@ impl MirrorApp {
             self.disconnect(&ctx);
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    }
+
+    /// The presenter's cursor as a textured quad over the video, mapped
+    /// through the same rectangle the video is drawn in.
+    fn draw_cursor(
+        &mut self,
+        ui: &egui::Ui,
+        p: &mirrorwire_proto::cursor::PointerUpdate,
+        img: &mirrorwire_proto::cursor::CursorImage,
+        video: egui::Rect,
+    ) {
+        let rect = mirrorwire_proto::cursor::RectF {
+            x: video.min.x,
+            y: video.min.y,
+            w: video.width(),
+            h: video.height(),
+        };
+        let Some(r) = mirrorwire_proto::cursor::cursor_rect(p, img, rect) else { return };
+        if self.cursor_tex.as_ref().is_none_or(|(id, _)| *id != img.id) {
+            let image = egui::ColorImage::from_rgba_premultiplied(
+                [img.width as usize, img.height as usize],
+                &img.rgba,
+            );
+            let tex = ui.ctx().load_texture("cursor", image, egui::TextureOptions::LINEAR);
+            self.cursor_tex = Some((img.id, tex));
+        }
+        if let Some((_, tex)) = &self.cursor_tex {
+            ui.painter().with_clip_rect(video).image(
+                tex.id(),
+                egui::Rect::from_min_size(egui::pos2(r.x, r.y), egui::vec2(r.w, r.h)),
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
     }
 
     fn has_picture(&self) -> bool {
@@ -1086,5 +1180,30 @@ fn quality_controls(ui: &mut egui::Ui, app: &mut MirrorApp, live: &EncoderConfig
             }
         }
     });
+    ui.horizontal(|ui| {
+        let before = app.capture;
+        ui.label("Cursor");
+        egui::ComboBox::from_id_salt("cursor")
+            .selected_text(app.capture.cursor.as_str())
+            .show_ui(ui, |ui| {
+                for c in CursorPref::all() {
+                    ui.selectable_value(&mut app.capture.cursor, c, c.as_str());
+                }
+            });
+        ui.label("Max fps");
+        egui::ComboBox::from_id_salt("max-fps")
+            .selected_text(app.capture.fps.label())
+            .show_ui(ui, |ui| {
+                for f in [FpsPref::Fixed(30), FpsPref::Fixed(60), FpsPref::Max] {
+                    ui.selectable_value(&mut app.capture.fps, f, f.label());
+                }
+            });
+        if app.capture != before {
+            if let Some(h) = &app.presenting {
+                h.apply_capture(app.capture);
+            }
+        }
+    });
+    ui.weak("Cursor and Max fps apply at once (the capture restarts without a dialog) and are saved. separate: the viewer draws the cursor from coordinates, so it moves without waiting for video; embedded: the old way, for viewers or desktops where separate misbehaves.");
     ui.weak("Apply restarts the encoder with an IDR. filmcraft is the optional pure-Rust encoder (CPU, for comparison; auto never picks it). Switching away from vaapi uses shared-memory capture until the next start. 4:4:4 chroma is not available with VAAPI on UHD 620 or with VideoToolbox decode.");
 }

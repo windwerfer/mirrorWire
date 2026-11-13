@@ -11,6 +11,7 @@ use mirrorwire_net::pairing::ConnectInfo;
 use mirrorwire_net::transport::ViewerSession;
 use mirrorwire_proto::clock::now_us;
 use mirrorwire_proto::control::{Control, StreamInfo};
+use mirrorwire_proto::cursor::ViewerCursor;
 use mirrorwire_proto::fragment::{AssembledFrame, Reassembler};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,6 +29,10 @@ pub struct Status {
     pub decode_ms: f64,
     pub lost: u64,
     pub first_frame: bool,
+    /// How the presenter sends the cursor: `separate`, `embedded`, `hidden`.
+    pub cursor_mode: String,
+    /// Cursor sent as coordinates, once connected.
+    pub cursor: Option<Arc<Mutex<ViewerCursor>>>,
 }
 
 pub struct Handle {
@@ -100,11 +105,17 @@ async fn run(
         s.connected = true;
         s.error = None;
         s.stream = Some(info.clone());
+        s.cursor_mode = session.cursor_mode();
+        s.cursor = Some(session.cursor.clone());
     }
     repaint();
+    let mut stream_updates = session.stream_updates.clone();
 
     let need_keyframe = Arc::new(AtomicBool::new(true));
-    let (decode_tx, decode_rx) = bounded::<AssembledFrame>(4);
+    // Bounded, flushed on overflow: decode only fresh frames (see the
+    // desktop viewer).
+    let (decode_tx, decode_rx) = bounded::<AssembledFrame>(2);
+    let decode_flush = decode_rx.clone();
     let control = session.control_sender();
     let dec_status = status.clone();
     let dec_need_key = need_keyframe.clone();
@@ -139,6 +150,16 @@ async fn run(
             got_datagram = true;
             trace.ok(ConnectStepId::FirstDatagram, format!("{} byte datagram", datagram.len()));
         }
+        if stream_updates.has_changed().unwrap_or(false) {
+            let info = stream_updates.borrow_and_update().clone();
+            let mut s = status.lock().unwrap_or_else(|e| e.into_inner());
+            s.cursor_mode = info.cursor.clone().unwrap_or_else(|| "embedded".into());
+            s.stream = Some(info);
+        }
+        if session.handle_pointer_datagram(&datagram) {
+            repaint();
+            continue;
+        }
         let Some((frame, event)) = reassembler.push(datagram, now_us()) else { continue };
         window.1 += 1;
         window.2 += frame.data.len() as u64;
@@ -168,7 +189,14 @@ async fn run(
         }
         match decode_tx.try_send(frame) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => need_keyframe.store(true, Ordering::Release),
+            Err(TrySendError::Full(_)) => {
+                while decode_flush.try_recv().is_ok() {}
+                need_keyframe.store(true, Ordering::Release);
+                if last_request.elapsed() > Duration::from_millis(100) {
+                    session.request_keyframe("decoder backlog");
+                    last_request = Instant::now();
+                }
+            }
             Err(TrySendError::Disconnected(_)) => break Some("decoder stopped".into()),
         }
     };

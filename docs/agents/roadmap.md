@@ -18,6 +18,10 @@ target), **planned**, **idea**. Update this file when an item moves.
 | Android viewer APK (arm64-v8a, MediaCodec) | built (2026-11-13), untested on a device |
 | Browser (WebAssembly) viewer | design sketch in Planned and Future, not started |
 | Camera QR scan in the desktop viewer | not started (Android: the phone's camera app opens the `mirrorwire://` link) |
+| Cursor sent as coordinates (portal METADATA cursor, pointer datagrams, viewer-drawn) | built (2026-11-13), loopback-tested with a synthetic cursor; untested with KWin on the T480s |
+| 60 fps / max frame-rate setting, negotiated rate shown | built (2026-11-13); KWin's reported max untested |
+| Click-freeze in the viewer (egui nested input lock) | fixed (2026-11-13), untested on the iMac |
+| Latency spikes on scene changes (2 s VBV, unbounded QUIC queue, 4-frame decode backlog, no pacing) | fixed (2026-11-13): 100 ms VBV, 2 MiB datagram queue with delta-frame drop, 2-frame decode queue flushed on overflow, 500 Mbit/s pacing; untested on Wi-Fi hardware |
 
 ## Next (owner-agreed order)
 
@@ -79,6 +83,11 @@ Build the reverse input channel first, over the existing paired, encrypted QUIC
 connection (do not switch to TCP).
 
 - Unreliable datagrams for pointer and pen samples (high rate; loss is acceptable).
+  **Reuse the cursor path:** the presenter→viewer pointer datagram
+  (`mirrorwire-proto/src/cursor.rs`, protocol.md §3a) already has a `tool` byte and accepts
+  trailing fields, so pen pressure/tilt/buttons are appended there (and the same message goes
+  viewer→presenter for input), with `cursor_rect()` inverted to map tablet touches back to
+  presenter pixels.
 - Reliable stream for pen-down / pen-up, key events, and other edges, so a
   stroke or a key press never gets stuck.
 - Virtual input on the Linux presenter via `/dev/uinput`. That needs a udev or
