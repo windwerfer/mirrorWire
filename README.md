@@ -262,7 +262,8 @@ when the portal only sent 6.8 fps, because PTS advanced by 1/60 s per frame.
 | camera QR scanning | not started |
 | Android viewer (APK) | built, untested on devices: arm64-v8a, Android 8+, MediaCodec decode |
 | Android presenter | later (MediaProjection) |
-| Browser viewer (WebAssembly) | planned (WebTransport + WebCodecs) |
+| Browser viewer (WebAssembly) | planned (WebTransport + WebCodecs); details in [docs/agents/roadmap.md](docs/agents/roadmap.md) |
+| Phone/tablet as input device (remote, pointer, drawing, touchpad, pen tablet) | idea, parked until mirroring is solid and a UI sketch arrives; see [docs/agents/roadmap.md](docs/agents/roadmap.md#future-phonetablet-as-input-device) |
 
 
 ## Security

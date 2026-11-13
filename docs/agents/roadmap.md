@@ -16,7 +16,7 @@ target), **planned**, **idea**. Update this file when an item moves.
 | Pairing, pinned TLS, mDNS | works between the target machines (after opening 47800/udp) |
 | Flatpak, AppImage, DMGs in CI | built; Flatpak and x86_64 DMG run on target |
 | Android viewer APK (arm64-v8a, MediaCodec) | built (2026-11-13), untested on a device |
-| Browser (WebAssembly) viewer | design sketch below, not started |
+| Browser (WebAssembly) viewer | design sketch in Planned and Future, not started |
 | Camera QR scan in the desktop viewer | not started (Android: the phone's camera app opens the `mirrorwire://` link) |
 
 ## Next (owner-agreed order)
@@ -55,20 +55,79 @@ target), **planned**, **idea**. Update this file when an item moves.
   the camera app, or the keypad + mDNS list); a stable release keystore so updates install
   over each other (CI debug keys change per run).
 - **Android presenter** later (MediaProjection + MediaCodec encode; needs Java/JNI glue).
-- **Browser viewer (WebAssembly), sketch:**
-  - Presenter: add an HTTP/3 WebTransport endpoint on the same UDP port family (e.g. `wtransport`
-    or `h3` + `quinn`), serving a static page + wasm. Video goes as WebTransport datagrams with
-    the existing fragment header; control messages on a bidirectional stream.
-  - Trust: browsers reject self-signed certs unless pinned via
-    `serverCertificateHashes` (cert valid ≤ 14 days, ECDSA P-256). The presenter would mint a
-    short-lived WebTransport cert signed by nothing and put its hash in the QR/URL
-    (`https://<ip>:<port>/#cert=<sha256>&code=<pairing>`); pairing code as today.
-  - Page: egui compiled to wasm (or plain JS) + **WebCodecs** `VideoDecoder` (`avc1.42E0xx`,
-    `optimizeForLatency: true`), drawing `VideoFrame`s onto a canvas. Needs a secure context:
-    serving the page itself over HTTPS with the same pinned cert is the open problem
-    (browsers do not pin for page loads), so a small hosted loader page (GitHub Pages) that
-    only opens WebTransport to the LAN address may be required.
+- **Browser viewer (WebAssembly), sketch:** see also [Future: phone/tablet as input device](#future-phonetablet-as-input-device) for the agreed trust model and input-mode scope.
+  - Presenter: add an HTTP/3 WebTransport endpoint on the presenter's own UDP port (any port, including 47800; not 443), e.g. `wtransport` or `h3` + `quinn`. Video goes as WebTransport datagrams with the existing fragment header; control messages on a bidirectional stream. Decode with **WebCodecs**.
+  - Trust: browsers reject self-signed certs unless pinned via `serverCertificateHashes` (cert valid ≤ 14 days, ECDSA P-256). The presenter mints a short-lived cert and puts its hash in the QR/URL. The web page itself must come from a normal HTTPS origin (e.g. GitHub Pages); only the WebTransport session goes to the laptop on the LAN. Pairing is bound to the pairing identity, not to one certificate, so pairings survive automatic cert rotation.
+  - Page: egui compiled to wasm (or plain JS) + WebCodecs `VideoDecoder` (`avc1.42E0xx`, `optimizeForLatency: true`), drawing `VideoFrame`s onto a canvas.
   - Wire: reuse `mirrorwire-proto` compiled to wasm (it has no I/O by design, see architecture.md §1).
+  - The viewer and the input modes in the Future section can all run in the browser. The presenter stays a native app.
+
+
+## Future: phone/tablet as input device
+
+**Status: idea.** Parked until screen mirroring is solid and the owner sends a UI
+sketch. Do not start this work until then.
+
+The phone or tablet already shows the laptop screen as a MirrorWire viewer.
+These modes add a reverse input channel so the same device can control the
+presenter: a PowerPoint remote, a laser pointer, a drawing overlay, a
+touchpad, and (later) a Wacom-style pen tablet. They all share one foundation.
+
+### Foundation
+
+Build the reverse input channel first, over the existing paired, encrypted QUIC
+connection (do not switch to TCP).
+
+- Unreliable datagrams for pointer and pen samples (high rate; loss is acceptable).
+- Reliable stream for pen-down / pen-up, key events, and other edges, so a
+  stroke or a key press never gets stuck.
+- Virtual input on the Linux presenter via `/dev/uinput`. That needs a udev or
+  permission rule, and the Flatpak sandbox cannot open uinput as-is. Plan
+  around that: a small privileged helper, or the xdg-desktop-portal
+  `RemoteDesktop` portal, which may cover mouse and keyboard without uinput.
+  Pen-tablet injection may still need uinput.
+
+### Modes (rough sizes)
+
+| Mode | Notes | Rough size |
+|---|---|---|
+| Presenter remote | Next, previous, and click as arrow / space keys. PowerPoint, LibreOffice Impress, and PDF viewers already understand these. | ~300–500 LOC |
+| Laser pointer | Finger position drawn as a coloured dot in a transparent overlay on the presenter; colours selectable. The KDE Wayland overlay is the hard part. | ~300–600 LOC |
+| Drawing overlay | The same overlay, plus strokes and colours, with an optional fade-out like old Linux screen-annotation / "flame" effects. | ~800–1500 LOC |
+| Touchpad | One finger moves the cursor, a tap clicks, two fingers scroll or right-click. | ~500–800 LOC |
+| Pen tablet (Wacom emulation) | Pressure, tilt, hover, and buttons. Two display modes on the tablet: screen-visible (the existing viewer picture) and grey (no picture). Linux apps such as Krita and GIMP see a virtual tablet. Photoshop would need a macOS presenter, which is a separate and harder job (macOS makes faking a tablet difficult). Total includes tablet-side capture, laptop-side uinput, protocol, UI, tests, and docs. | ~1500–2500 LOC total |
+
+The "screen shines through" mode is essentially free, because the tablet is
+already a viewer. The grey mode is just "don't show the picture".
+
+### Web viewer (WASM)
+
+The viewer and all of the input modes above can run in the browser. The
+presenter stays a native app (screen capture, virtual input, and the overlay
+need access a browser cannot give).
+
+- Transport: WebTransport over HTTP/3 on the presenter's own port (any port,
+  including the existing 47800; not 443).
+- Trust: `serverCertificateHashes` with the certificate fingerprint already
+  carried in the QR link, so the page can say "trust exactly this certificate".
+  No public hostname or internet address is required for the video/input
+  connection.
+- The web page itself must be served from a normal HTTPS origin (for example
+  a free GitHub Pages site). Only the WebTransport session then goes to the
+  laptop on the LAN.
+- Browsers accept these certificates for at most 14 days, and they must be
+  ECDSA. The presenter rotates the short-lived cert automatically. Pairing
+  must be bound to the pairing identity, not to one certificate, so existing
+  pairings survive rotation.
+- Video decode via WebCodecs.
+
+### Build order
+
+1. Reverse input channel and virtual mouse/keyboard on the Linux presenter.
+2. Presenter remote and touchpad (they rest on that channel).
+3. Overlay (laser pointer, then drawing).
+4. Pen tablet.
+5. Web viewer in parallel when ready.
 
 
 ## Open questions
