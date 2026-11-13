@@ -5,7 +5,9 @@
 //! is a polkit-authenticated D-Bus call: the app itself never runs as root.
 //! If firewalld is not available, a short general guide is shown instead.
 
+#[cfg(target_os = "linux")]
 use mirrorwire_proto::DEFAULT_PORT;
+#[cfg(target_os = "linux")]
 use std::fmt;
 
 /// firewalld service name that matches `packaging/linux/mirrorwire.xml`.
@@ -65,8 +67,7 @@ impl FirewallHint {
 
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = &guide;
-            return Self {
+            Self {
                 show: false,
                 prominent: false,
                 message: String::new(),
@@ -74,7 +75,7 @@ impl FirewallHint {
                 command,
                 can_autofix: false,
                 port,
-            };
+            }
         }
 
         #[cfg(target_os = "linux")]
@@ -584,8 +585,8 @@ where
         .expect("firewalld-dbus thread")
 }
 
+#[cfg(any(test, target_os = "linux"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum UfwState {
     Inactive,
     Open,
@@ -593,12 +594,14 @@ enum UfwState {
     Unknown,
 }
 
+#[cfg(any(test, target_os = "linux"))]
 #[derive(Debug, Clone, Copy)]
 struct UfwPaths<'a> {
     conf: &'a str,
     user_rules: &'a str,
 }
 
+#[cfg(any(test, target_os = "linux"))]
 impl UfwPaths<'static> {
     fn system() -> Self {
         Self {
@@ -608,6 +611,7 @@ impl UfwPaths<'static> {
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn probe_ufw(port: u16, paths: UfwPaths<'_>) -> Option<UfwState> {
     let conf = std::fs::read_to_string(paths.conf).ok()?;
     if !ufw_enabled(&conf) {
@@ -623,6 +627,7 @@ fn probe_ufw(port: u16, paths: UfwPaths<'_>) -> Option<UfwState> {
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn ufw_enabled(conf: &str) -> bool {
     conf.lines().any(|line| {
         let line = line.trim();
@@ -631,6 +636,7 @@ fn ufw_enabled(conf: &str) -> bool {
     })
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn ufw_rules_allow_udp(port: u16, rules: &str) -> bool {
     let port_s = port.to_string();
     rules.lines().any(|line| {
