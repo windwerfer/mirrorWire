@@ -70,6 +70,13 @@ line `fps, Mbit/s, rtt, ms mean/p95/max: …stages…`.
   orange note says why it fell back (portal without metadata cursor, older viewer). Viewer
   overlay: `cursor separate (N updates/s)`; N should follow mouse movement (KWin caps it at the
   frame rate). If the cursor misbehaves, switch Quality › Cursor to `embedded`.
+- FEC: the viewer overlay line `fec +N%  rebuilt N/s  loss N%  unrecoverable frames N` (and the
+  headless summary `fec overhead … packet loss … rebuilt packets … unrecoverable frames …`).
+  `fec off` with a new presenter means the setting is off; the presenter window says
+  `off for this viewer (older version)` for an old viewer. Loss well above ~5 % or growing
+  unrecoverable frames: the link is worse than the parity covers; raise Quality › FEC to 30–50 %
+  or lower the bitrate. Parity costs bandwidth: at 40 Mbit/s, auto adds 4–20 Mbit/s.
+  Try the loss handling without Wi-Fi: `--simulate-loss 5 --simulate-burst 4` on a viewer.
 - Frame rate: presenter line `Frame rate: asked up to N fps · compositor allows M`. M below N
   means the compositor capped it; "not reported" means KWin did not send a maxFramerate.
 - Freeze on click (fixed 2026-11-13): egui `Response` methods must not be called inside

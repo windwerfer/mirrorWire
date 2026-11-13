@@ -256,7 +256,7 @@ impl ViewerApp {
         if self.show_overlay {
             let stream = status.stream.as_ref();
             let text = format!(
-                "{}x{}  {:.1} fps  {:.2} Mbit/s  ({})\n{}  decode {:.1} ms  lost {}\ncursor {}\ntap: hide",
+                "{}x{}  {:.1} fps  {:.2} Mbit/s  ({})\n{}  decode {:.1} ms  lost {}\ncursor {}\n{}\ntap: hide",
                 stream.map(|s| s.width).unwrap_or(0),
                 stream.map(|s| s.height).unwrap_or(0),
                 status.fps,
@@ -266,6 +266,7 @@ impl ViewerApp {
                 status.decode_ms,
                 status.lost,
                 if status.cursor_mode.is_empty() { "?" } else { status.cursor_mode.as_str() },
+                status.link.line(),
             );
             ui.painter().text(rect.left_top() + egui::vec2(8.0, 40.0), egui::Align2::LEFT_TOP, text, egui::FontId::monospace(12.0), egui::Color32::from_rgb(0, 255, 120));
             let button = egui::Rect::from_min_size(rect.right_top() + egui::vec2(-150.0, 40.0), egui::vec2(140.0, 44.0));

@@ -17,6 +17,7 @@ use mirrorwire_proto::cursor::{
     is_pointer_datagram, CursorEvent, CursorImage, PointerUpdate, ViewerCursor, CAP_CURSOR_METADATA,
     MAX_IMAGE_STREAM,
 };
+use mirrorwire_proto::fec::{fec_fragment, FecHeader, FecMode, LinkStats, CAP_FEC};
 use mirrorwire_proto::fragment::{fragment, FrameTiming};
 use mirrorwire_proto::stats::StageStats;
 use mirrorwire_proto::PROTOCOL_VERSION;
@@ -35,6 +36,103 @@ pub const DATAGRAM_SEND_BUFFER: usize = 2 << 20;
 /// datagram queue is too full to take it (a keyframe is always queued).
 pub fn should_drop_for_backlog(keyframe: bool, frame_len: usize, free_space: usize) -> bool {
     !keyframe && free_space < frame_len + frame_len / 16 + 4096
+}
+
+/// Ceiling for [`FecState::boost_pct`].
+const MAX_FEC_BOOST: f32 = 30.0;
+
+/// Presenter-side FEC state, shared with the app: the setting, and what the
+/// current viewer last reported about the link.
+#[derive(Debug)]
+pub struct FecControl {
+    state: Mutex<FecState>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FecState {
+    pub mode: FecMode,
+    /// The connected viewer can rebuild FEC packets.
+    pub viewer_fec: bool,
+    /// Smoothed packet loss the viewer reports (percent); drives auto mode.
+    pub loss_pct: f32,
+    /// Data packets the viewer rebuilt from parity, per second.
+    pub recovered_per_s: f32,
+    /// Frames the viewer could not rebuild since it connected.
+    pub unrecoverable: u64,
+    /// Extra parity (percentage points, auto mode) added while frames are
+    /// still lost: +5 per report with unrecoverable frames, -1 per clean one.
+    pub boost_pct: f32,
+    pub reports: u64,
+    last_report: Option<Instant>,
+}
+
+impl FecState {
+    /// Overhead currently applied to (delta, key) frames, or `None` when no
+    /// FEC is sent (setting off, or an older viewer).
+    pub fn overheads(&self) -> Option<(f32, f32)> {
+        if !self.viewer_fec {
+            return None;
+        }
+        Some((
+            self.mode.overhead(self.loss_pct, self.boost_pct, false)?,
+            self.mode.overhead(self.loss_pct, self.boost_pct, true)?,
+        ))
+    }
+}
+
+impl FecControl {
+    pub fn new(mode: FecMode) -> Arc<Self> {
+        Arc::new(Self { state: Mutex::new(FecState { mode, ..Default::default() }) })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, FecState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn snapshot(&self) -> FecState {
+        *self.lock()
+    }
+
+    pub fn set_mode(&self, mode: FecMode) {
+        self.lock().mode = mode;
+    }
+
+    fn viewer_connected(&self, fec: bool) {
+        let mut s = self.lock();
+        let mode = s.mode;
+        *s = FecState { mode, viewer_fec: fec, ..Default::default() };
+    }
+
+    fn overhead(&self, keyframe: bool) -> Option<f32> {
+        let s = self.lock();
+        if !s.viewer_fec {
+            return None;
+        }
+        s.mode.overhead(s.loss_pct, s.boost_pct, keyframe)
+    }
+
+    fn on_report(&self, loss_permille: u32, recovered: u32, unrecoverable: u32) {
+        let mut s = self.lock();
+        let loss = (loss_permille.min(1000) as f32) / 10.0;
+        // Rise fast, decay slowly: a loss burst should get more parity at once.
+        let w = if loss > s.loss_pct { 0.5 } else { 0.15 };
+        s.loss_pct = if s.reports == 0 { loss } else { s.loss_pct + w * (loss - s.loss_pct) };
+        let now = Instant::now();
+        let secs = s
+            .last_report
+            .map(|t| now.duration_since(t).as_secs_f32())
+            .filter(|d| *d > 0.05)
+            .unwrap_or(0.5);
+        s.recovered_per_s = recovered as f32 / secs;
+        s.unrecoverable += unrecoverable as u64;
+        s.boost_pct = if unrecoverable > 0 {
+            (s.boost_pct + 5.0 * unrecoverable.min(3) as f32).min(MAX_FEC_BOOST)
+        } else {
+            (s.boost_pct - 1.0).max(0.0)
+        };
+        s.reports += 1;
+        s.last_report = Some(now);
+    }
 }
 
 fn transport_config() -> Arc<TransportConfig> {
@@ -94,6 +192,8 @@ pub struct PresenterConfig {
     /// sending half lives with the capture thread). Sent only to viewers that
     /// can draw them.
     pub cursor_events: Option<mpsc::Receiver<CursorEvent>>,
+    /// FEC setting and link feedback (see [`FecControl`]).
+    pub fec: Arc<FecControl>,
 }
 
 type Callback = Arc<dyn Fn() + Send + Sync>;
@@ -104,6 +204,8 @@ struct ActiveViewer {
     conn: Connection,
     /// Listed [`CAP_CURSOR_METADATA`] in its hello.
     cursor: bool,
+    /// Listed [`CAP_FEC`] in its hello.
+    fec: bool,
 }
 
 pub struct Presenter {
@@ -111,6 +213,7 @@ pub struct Presenter {
     pub local_addr: SocketAddr,
     pub viewer_connected: watch::Receiver<bool>,
     stream_info: Arc<watch::Sender<StreamInfo>>,
+    fec: Arc<FecControl>,
     endpoint: Endpoint,
 }
 
@@ -126,9 +229,11 @@ impl Presenter {
         let (current_tx, current_rx) = watch::channel::<Option<ActiveViewer>>(None);
         let (connected_tx, viewer_connected) = watch::channel(false);
         let current_tx = Arc::new(current_tx);
-        let stream_info = Arc::new(watch::channel(cfg.stream_info).0);
+        let mut info = cfg.stream_info;
+        info.fec = Some(cfg.fec.snapshot().mode.as_string());
+        let stream_info = Arc::new(watch::channel(info).0);
 
-        tokio::spawn(send_loop(frames_rx, current_rx.clone(), on_keyframe_request.clone()));
+        tokio::spawn(send_loop(frames_rx, current_rx.clone(), on_keyframe_request.clone(), cfg.fec.clone()));
         if let Some(cursor_rx) = cfg.cursor_events {
             tokio::spawn(cursor_loop(cursor_rx, current_rx));
         }
@@ -142,6 +247,7 @@ impl Presenter {
             on_keyframe_request,
             on_viewer: cfg.on_viewer,
             attempts: cfg.attempts,
+            fec: cfg.fec.clone(),
         });
         let ep = endpoint.clone();
         tokio::spawn(async move {
@@ -155,7 +261,7 @@ impl Presenter {
             }
         });
 
-        Ok(Self { frames, local_addr, viewer_connected, stream_info, endpoint })
+        Ok(Self { frames, local_addr, viewer_connected, stream_info, fec: cfg.fec, endpoint })
     }
 
     /// Change the stream description; connected viewers get a fresh
@@ -166,6 +272,12 @@ impl Presenter {
             f(info);
             *info != before
         });
+    }
+
+    /// Change the FEC setting live; viewers see it in `stream_info.fec`.
+    pub fn set_fec_mode(&self, mode: FecMode) {
+        self.fec.set_mode(mode);
+        self.update_stream_info(|i| i.fec = Some(mode.as_string()));
     }
 
     pub fn close(&self) {
@@ -182,6 +294,7 @@ struct SessionShared {
     on_keyframe_request: Callback,
     on_viewer: Option<Arc<dyn Fn(bool) + Send + Sync>>,
     attempts: Arc<Mutex<Vec<IncomingAttempt>>>,
+    fec: Arc<FecControl>,
 }
 
 async fn handle_viewer(incoming: quinn::Incoming, shared: Arc<SessionShared>) -> Result<()> {
@@ -253,6 +366,7 @@ async fn handle_viewer(incoming: quinn::Incoming, shared: Arc<SessionShared>) ->
     }
 
     let viewer_cursor = caps.iter().any(|c| c == CAP_CURSOR_METADATA);
+    let viewer_fec = caps.iter().any(|c| c == CAP_FEC);
     let mut info_rx = shared.stream_info.subscribe();
     let stream_info = info_rx.borrow_and_update().clone();
     write_msg(&mut send, &Control::StreamInfo(stream_info)).await?;
@@ -261,10 +375,13 @@ async fn handle_viewer(incoming: quinn::Incoming, shared: Arc<SessionShared>) ->
         IncomingAttempt::new(remote, Some(name.clone()), true, "connected"),
     );
     tracing::info!(
-        "viewer {name} connected from {remote} (cursor as coordinates: {})",
-        if viewer_cursor { "supported" } else { "not supported, older viewer" }
+        "viewer {name} connected from {remote} (cursor as coordinates: {}, FEC: {})",
+        if viewer_cursor { "supported" } else { "not supported, older viewer" },
+        if viewer_fec { "supported" } else { "not supported, older viewer" }
     );
-    if let Some(old) = shared.current.send_replace(Some(ActiveViewer { conn: conn.clone(), cursor: viewer_cursor })) {
+    shared.fec.viewer_connected(viewer_fec);
+    let active = ActiveViewer { conn: conn.clone(), cursor: viewer_cursor, fec: viewer_fec };
+    if let Some(old) = shared.current.send_replace(Some(active)) {
         old.conn.close(1u32.into(), b"replaced by another viewer");
     }
     shared.connected.send_replace(true);
@@ -310,6 +427,13 @@ async fn handle_viewer(incoming: quinn::Incoming, shared: Arc<SessionShared>) ->
                 Control::RequestKeyframe { reason } => {
                     tracing::debug!("keyframe requested: {reason}");
                     (shared.on_keyframe_request)();
+                }
+                Control::LinkReport { loss_permille, packets, recovered, unrecoverable } => {
+                    tracing::debug!(
+                        "viewer link: loss {:.1}% of {packets} packets, {recovered} rebuilt, {unrecoverable} frames lost",
+                        loss_permille as f32 / 10.0
+                    );
+                    shared.fec.on_report(loss_permille, recovered, unrecoverable);
                 }
                 Control::Bye => return Ok::<_, anyhow::Error>(()),
                 other => tracing::debug!("ignoring {other:?}"),
@@ -408,16 +532,30 @@ async fn send_loop(
     mut frames: mpsc::Receiver<OutgoingFrame>,
     current: watch::Receiver<Option<ActiveViewer>>,
     on_keyframe_request: Callback,
+    fec: Arc<FecControl>,
 ) {
     let mut stats = StageStats::new(&["capture_to_encoded", "encoded_to_sent", "send"]);
     let mut window_start = Instant::now();
     let (mut window_frames, mut window_bytes, mut window_keyframes) = (0u32, 0usize, 0u32);
     let mut backlog_drops = 0u32;
+    let (mut window_parity, mut window_packets) = (0usize, 0usize);
 
     while let Some(frame) = frames.recv().await {
-        let Some(conn) = current.borrow().as_ref().map(|v| v.conn.clone()) else { continue };
+        let Some((conn, viewer_fec)) = current.borrow().as_ref().map(|v| (v.conn.clone(), v.fec)) else { continue };
         let Some(max) = conn.max_datagram_size() else { continue };
-        if should_drop_for_backlog(frame.keyframe, frame.data.len(), conn.datagram_send_buffer_space()) {
+        let sent_us = now_us();
+        let timing = FrameTiming {
+            capture_us: frame.capture_us,
+            encoded_us: frame.encoded_us,
+            sent_us,
+        };
+        let overhead = if viewer_fec { fec.overhead(frame.keyframe) } else { None };
+        let packets = match overhead {
+            Some(o) => fec_fragment(frame.frame_id, frame.keyframe, timing, &frame.data, max, o),
+            None => fragment(frame.frame_id, frame.keyframe, timing, &frame.data, max),
+        };
+        let wire_len: usize = packets.iter().map(|p| p.len()).sum();
+        if should_drop_for_backlog(frame.keyframe, wire_len, conn.datagram_send_buffer_space()) {
             // The network is behind (big scene change on Wi-Fi). Sending this
             // frame would only add latency; the viewer recovers with the
             // keyframe we ask for instead.
@@ -426,17 +564,19 @@ async fn send_loop(
             on_keyframe_request();
             continue;
         }
-        let sent_us = now_us();
-        let timing = FrameTiming {
-            capture_us: frame.capture_us,
-            encoded_us: frame.encoded_us,
-            sent_us,
-        };
-        // Burst every fragment. send_datagram queues immediately; only wait
+        // Burst every fragment (parity last); the congestion controller's
+        // pacer spreads them out. send_datagram queues immediately; only wait
         // when the datagram send buffer is full so a frame is not paced out
         // one packet at a time.
         let mut send_err = false;
-        for datagram in fragment(frame.frame_id, frame.keyframe, timing, &frame.data, max) {
+        window_packets += packets.len();
+        if overhead.is_some() {
+            window_parity += packets
+                .first()
+                .and_then(|p| FecHeader::parse(p))
+                .map_or(0, |(h, _)| h.parity_count as usize);
+        }
+        for datagram in packets {
             if conn.send_datagram(datagram.clone()).is_ok() {
                 continue;
             }
@@ -466,19 +606,37 @@ async fn send_loop(
         if elapsed >= Duration::from_secs(1) {
             let secs = elapsed.as_secs_f64();
             tracing::info!(
-                "presenter: {:.1} fps, {:.2} Mbit/s, {} keyframes, {} dropped for backlog, mtu {}, ms mean/p95/max:{}",
+                "presenter: {:.1} fps, {:.2} Mbit/s, {} keyframes, {} dropped for backlog, mtu {}, {}, ms mean/p95/max:{}",
                 window_frames as f64 / secs,
                 window_bytes as f64 * 8.0 / secs / 1e6,
                 window_keyframes,
                 backlog_drops,
                 max,
+                fec_summary(&fec.snapshot(), window_parity, window_packets),
                 stats.report()
             );
             backlog_drops = 0;
+            (window_parity, window_packets) = (0, 0);
             stats.clear();
             window_start = Instant::now();
             (window_frames, window_bytes, window_keyframes) = (0, 0, 0);
         }
+    }
+}
+
+fn fec_summary(s: &FecState, parity: usize, packets: usize) -> String {
+    match s.overheads() {
+        None if !s.viewer_fec => "fec off (viewer without FEC)".into(),
+        None => "fec off".into(),
+        Some(_) => format!(
+            "fec {} ~{:.0}% parity packets (boost +{:.0}), viewer loss {:.1}%, rebuilt {:.0}/s, unrecoverable {}",
+            s.mode.as_string(),
+            100.0 * parity as f64 / packets.saturating_sub(parity).max(1) as f64,
+            s.boost_pct,
+            s.loss_pct,
+            s.recovered_per_s,
+            s.unrecoverable
+        ),
     }
 }
 
@@ -583,6 +741,27 @@ impl ViewerSession {
             .unwrap_or_else(|| mirrorwire_proto::control::CURSOR_EMBEDDED.to_owned())
     }
 
+    /// The presenter's FEC setting, or `None` for an older presenter (which
+    /// must not get `link_report` messages).
+    pub fn presenter_fec(&self) -> Option<String> {
+        self.stream_updates.borrow().fec.clone()
+    }
+
+    /// Tell the presenter how the link did over `window` (a difference of
+    /// [`LinkStats`] snapshots). No-op for older presenters.
+    pub fn report_link(&self, window: &LinkStats) {
+        if self.presenter_fec().is_none() || window.expected == 0 {
+            return;
+        }
+        let loss = window.expected.saturating_sub(window.received);
+        let _ = self.control.send(Control::LinkReport {
+            loss_permille: (loss * 1000 / window.expected).min(1000) as u32,
+            packets: window.expected.min(u32::MAX as u64) as u32,
+            recovered: window.recovered.min(u32::MAX as u64) as u32,
+            unrecoverable: window.unrecoverable_frames.min(u32::MAX as u64) as u32,
+        });
+    }
+
     pub fn control_sender(&self) -> mpsc::UnboundedSender<Control> {
         self.control.clone()
     }
@@ -678,7 +857,7 @@ async fn connect_one(
             protocol: PROTOCOL_VERSION,
             name: viewer_name.to_owned(),
             pairing_code: target.pairing_code.clone(),
-            caps: vec![CAP_CURSOR_METADATA.to_owned()],
+            caps: vec![CAP_CURSOR_METADATA.to_owned(), CAP_FEC.to_owned()],
         },
     )
     .await?;
@@ -856,12 +1035,14 @@ mod tests {
                     bitrate_kbps: 1,
                     intra_refresh: false,
                     cursor: Some("separate".into()),
+                    fec: None,
                 },
                 pairing_code: None,
                 config_dir: dir.clone(),
                 attempts: Default::default(),
                 on_viewer: Some(Arc::new(move |ok| *caps_slot.lock().unwrap() = Some(ok))),
                 cursor_events: Some(cursor_rx),
+                fec: FecControl::new(FecMode::Auto),
             },
             Arc::new(|| {}),
         )
@@ -903,11 +1084,65 @@ mod tests {
         assert_eq!(*img, image);
         assert_eq!(*seen_caps.lock().unwrap(), Some(true));
 
+        // Video goes out as FEC packets to a viewer that lists the cap, and
+        // its link report reaches the presenter's FEC state.
+        assert_eq!(viewer.presenter_fec().as_deref(), Some("auto"));
+        let payload = Bytes::from(vec![7u8; 20_000]);
+        presenter
+            .frames
+            .send(OutgoingFrame { frame_id: 1, keyframe: true, data: payload.clone(), capture_us: 1, encoded_us: 2 })
+            .await
+            .unwrap();
+        let mut reassembler = mirrorwire_proto::fragment::Reassembler::new(u64::MAX);
+        let mut first_dropped = false;
+        let frame = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let d = viewer.conn.read_datagram().await.unwrap();
+                if viewer.handle_pointer_datagram(&d) {
+                    continue;
+                }
+                assert_eq!(d[0], mirrorwire_proto::fec::FEC_WIRE_VERSION);
+                if !first_dropped {
+                    first_dropped = true; // lose one packet: parity must cover it
+                    continue;
+                }
+                if let Some((f, ev)) = reassembler.push(d, 0) {
+                    return (f, ev);
+                }
+            }
+        })
+        .await
+        .expect("FEC frame");
+        assert_eq!(frame.0.data, payload);
+        assert_eq!(frame.1.recovered, 1);
+        assert!(presenter.fec.snapshot().viewer_fec);
+        viewer.report_link(&LinkStats { expected: 1000, received: 950, recovered: 40, ..Default::default() });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while presenter.fec.snapshot().reports == 0 {
+            assert!(Instant::now() < deadline, "link report never arrived");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let fec = presenter.fec.snapshot();
+        assert!((fec.loss_pct - 5.0).abs() < 0.01, "{}", fec.loss_pct);
+        assert_eq!(fec.overheads(), Some((0.25, 0.5)));
+        viewer.report_link(&LinkStats { expected: 1000, received: 950, unrecoverable_frames: 1, ..Default::default() });
+        while presenter.fec.snapshot().reports < 2 {
+            assert!(Instant::now() < deadline, "second link report never arrived");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let fec = presenter.fec.snapshot();
+        assert_eq!((fec.boost_pct, fec.unrecoverable), (5.0, 1));
+        assert_eq!(fec.overheads(), Some((0.30, 0.575)));
+        presenter.set_fec_mode(FecMode::Off);
+        assert_eq!(presenter.fec.snapshot().overheads(), None);
+
         // A changed cursor mode reaches the connected viewer.
         presenter.update_stream_info(|i| i.cursor = Some("embedded".into()));
         let mut updates = viewer.stream_updates.clone();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while updates.borrow_and_update().cursor.as_deref() != Some("embedded") {
+            while updates.borrow_and_update().cursor.as_deref() != Some("embedded")
+                || updates.borrow().fec.as_deref() != Some("off")
+            {
                 updates.changed().await.unwrap();
             }
         })

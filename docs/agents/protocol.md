@@ -27,10 +27,11 @@ followed by a JSON body (`serde`, `tag = "type"`, `snake_case`). Bodies over
 
 | `type` | Direction | Fields |
 |---|---|---|
-| `hello` | viewer → presenter | `protocol` (u32, must equal `PROTOCOL_VERSION`), `name`, `pairing_code` (optional), `caps` (optional list; `cursor-metadata` = can draw a separately sent cursor) |
+| `hello` | viewer → presenter | `protocol` (u32, must equal `PROTOCOL_VERSION`), `name`, `pairing_code` (optional), `caps` (optional list; `cursor-metadata` = can draw a separately sent cursor; `fec-rs1` = can rebuild FEC video packets, §3b) |
 | `rejected` | presenter → viewer | `reason` (shown to the user) |
-| `stream_info` | presenter → viewer | `width`, `height`, `fps`, `codec`, `encoder`, `bitrate_kbps`, `intra_refresh`, `cursor` (optional: `separate`, `embedded`, `hidden`; absent = embedded). Sent after `hello`, and **again** whenever it changes (older viewers ignore the repeat) |
+| `stream_info` | presenter → viewer | `width`, `height`, `fps`, `codec`, `encoder`, `bitrate_kbps`, `intra_refresh`, `cursor` (optional: `separate`, `embedded`, `hidden`; absent = embedded), `fec` (optional: the presenter's FEC setting `off`/`auto`/`20%`, informational; present = the presenter understands `link_report`). Sent after `hello`, and **again** whenever it changes (older viewers ignore the repeat) |
 | `request_keyframe` | viewer → presenter | `reason` |
+| `link_report` | viewer → presenter | `loss_permille`, `packets`, `recovered`, `unrecoverable` over the last ~0.5 s. Sent **only** if `stream_info.fec` is present: an older presenter fails on unknown message types |
 | `ping` / `pong` | viewer ↔ presenter | `t_viewer_us`, `t_presenter_us` (clock offset + RTT) |
 | `bye` | either | — |
 
@@ -93,11 +94,57 @@ viewer gets every cached image and the last position on connect.
 rectangle the video is drawn in (`video.w / frame_w`), so fit, letterbox and 1:1 modes all
 line up. The same message is meant to carry the future pen/Wacom mode.
 
+## 3b. Forward error correction (capability `fec-rs1`)
+
+Only viewers that list `fec-rs1` in `hello.caps` get these packets, and only while the
+presenter's FEC setting isn't `off`; everyone else gets the version-1 fragments of §3. Code in
+`mirrorwire-proto/src/fec.rs` (erasure code: `reed-solomon-simd`, MIT AND BSD-3-Clause). No
+`PROTOCOL_VERSION` bump: a new wire version is only sent to viewers that asked for it.
+
+The frame is cut into `data_count` equal shards of `shard_len` bytes (even; the last data shard
+goes out unpadded and is zero-padded for coding). Data shard `i` belongs to block
+`i % blocks`, parity shard `j` to block `j % blocks` (`blocks = ceil(data_count / 64)`, at most
+255), so consecutive packets hit different blocks and a burst costs each block one or two
+packets. Each block is a Reed-Solomon code over its data and parity shards: **any** `k_b` of
+its `k_b + m_b` shards rebuild it, immediately, without a round trip. Data packets go out first,
+then parity (paced by the congestion controller like everything else). 44-byte header, big
+endian:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | wire version 2 |
+| 1 | 1 | flags: bit 0 = keyframe |
+| 2 | 4 | `frame_id` |
+| 6 | 2 | `index`: `0..data_count` data, then `data_count..data_count+parity_count` parity |
+| 8 | 2 | `data_count` |
+| 10 | 2 | `parity_count` |
+| 12 | 4 | `frame_len` (bytes of the encoded frame, ≤ 64 MiB) |
+| 16 | 2 | `shard_len` |
+| 18 | 1 | `blocks` |
+| 19 | 1 | reserved, 0 |
+| 20 | 24 | `capture_us`, `encoded_us`, `sent_us` (as in §3) |
+
+Receivers drop packets whose header is inconsistent (zero blocks, `frame_len` not matching the
+counts, payload length not what the index implies) or whose layout differs from the first packet
+seen for that frame, and keep at most 64 partial frames.
+
+**Overhead** (`FecMode::overhead`): `auto` gives delta frames 10 % + 3 × loss + boost (10–60 %)
+parity and keyframes 25 % + 5 × loss + 1.5 × boost (25–100 %), from the loss the viewer reports in
+`link_report` (smoothed: rises at once, decays slowly). The boost (0–30 points) grows by 5 for
+every report with unrecoverable frames and shrinks by 1 per clean report, because bursty loss
+needs more parity than its average suggests. A fixed setting `N%` gives delta frames N % and
+keyframes 1.5 × N %. At least one parity packet per block (two for keyframes). Parity is extra
+bandwidth on top of the encoder bitrate.
+
+**Loss accounting**: the viewer counts, per frame, packets sent (`data_count + parity_count`)
+against packets received, once the frame is 30 frames old (so late packets still count). Frames
+that never arrive at all are not in the packet count; they show up as unrecoverable frames.
+
 ## 4. Versioning rules
 
 | Change | Bump |
 |---|---|
-| Datagram header layout or flag meaning | `WIRE_VERSION` (`fragment.rs`) |
+| Datagram header layout or flag meaning | `WIRE_VERSION` (`fragment.rs`; FEC packets are version 2, `fec.rs`) |
 | Control message incompatible change, handshake/auth semantics | `PROTOCOL_VERSION` (`lib.rs`) **and** the ALPN suffix (`mirrorwire/2`) |
 | mDNS TXT keys or meaning | TXT `v` |
 | URI parameters (removal or meaning) | document it; keep parsing the old form |

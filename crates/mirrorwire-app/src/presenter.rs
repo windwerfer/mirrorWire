@@ -20,7 +20,8 @@ use mirrorwire_net::identity::{short_fingerprint, Identity};
 use mirrorwire_net::pairing::{
     lan_ipv4s, primary_ipv4, qr_terminal, random_pairing_code, ConnectInfo,
 };
-use mirrorwire_net::transport::{OutgoingFrame, Presenter, PresenterConfig};
+use mirrorwire_net::transport::{FecControl, FecState, OutgoingFrame, Presenter, PresenterConfig};
+use mirrorwire_proto::fec::FecMode;
 use mirrorwire_proto::control::StreamInfo;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -61,7 +62,13 @@ pub struct PresentArgs {
     /// when the portal or the viewer can't do it.
     #[arg(long, value_enum)]
     pub cursor: Option<CursorPref>,
-    /// Resolved from --fps / --cursor / env / settings.json in `main`.
+    /// Forward error correction for video packets: auto (default; parity
+    /// adapts to the loss the viewer reports), off, or a fixed percentage of
+    /// parity packets such as 20. Also MIRRORWIRE_FEC or the saved setting.
+    /// Older viewers always get plain packets.
+    #[arg(long, value_parser = crate::capture_prefs::parse_fec_arg, value_name = "auto|off|PERCENT")]
+    pub fec: Option<FecMode>,
+    /// Resolved from --fps / --cursor / --fec / env / settings.json in `main`.
     #[arg(skip)]
     pub capture: CapturePrefs,
     /// Target bitrate in kbit/s (default: 40000 = 40 Mbit/s).
@@ -155,6 +162,7 @@ impl PresentArgs {
             size: None,
             fps: None,
             cursor: None,
+            fec: None,
             capture: CapturePrefs::default(),
             bitrate_kbps: DEFAULT_BITRATE_KBPS,
             bitrate_mbps: None,
@@ -307,11 +315,21 @@ impl PresenterHandle {
     /// and the capture is reopened (silently, with the portal restore token)
     /// when it changes what is asked of the compositor.
     pub fn apply_capture(&self, prefs: CapturePrefs) {
-        if let Err(e) = mirrorwire_net::settings::save_capture(&self.config_dir, prefs.cursor.as_str(), &prefs.fps.label()) {
+        if let Err(e) = mirrorwire_net::settings::save_capture(
+            &self.config_dir,
+            prefs.cursor.as_str(),
+            &prefs.fps.label(),
+            &prefs.fec.as_string(),
+        ) {
             tracing::warn!("could not save capture settings: {e:#}");
         }
         let restart = {
             let mut c = self.capture.lock().expect("capture ctl");
+            if c.prefs.fec != prefs.fec {
+                tracing::info!("FEC set to {}", prefs.fec.as_string());
+            }
+            // FEC applies to the next frame; no restart needed.
+            c.fec.set_mode(prefs.fec);
             c.prefs = prefs;
             c.needs_restart()
         };
@@ -402,11 +420,14 @@ pub struct CaptureCtl {
     cursor_note: Option<String>,
     negotiated_fps: Option<u32>,
     source_desc: String,
+    /// FEC setting and link feedback, shared with the transport.
+    fec: Arc<FecControl>,
 }
 
 impl CaptureCtl {
     fn new(prefs: CapturePrefs) -> Self {
         Self {
+            fec: FecControl::new(prefs.fec),
             prefs,
             legacy_viewer: false,
             asked_cursor: CursorCapture::Embedded,
@@ -444,6 +465,7 @@ impl CaptureCtl {
             cursor_note: note,
             fps_requested: self.asked_fps,
             fps_negotiated: self.negotiated_fps,
+            fec: self.fec.snapshot(),
         }
     }
 }
@@ -458,6 +480,8 @@ pub struct CaptureStatus {
     pub cursor_note: Option<String>,
     pub fps_requested: u32,
     pub fps_negotiated: Option<u32>,
+    /// FEC setting, applied overhead and what the viewer reports.
+    pub fec: FecState,
 }
 
 impl Default for CaptureStatus {
@@ -597,6 +621,8 @@ fn stream_info_from(encoder: &Encoder, fps: u32, cursor: CursorCapture) -> Strea
         bitrate_kbps: encoder.config().bitrate_kbps,
         intra_refresh: encoder.config().intra_refresh,
         cursor: Some(cursor.as_str().to_owned()),
+        // Filled in by `Presenter::start` from the FEC setting.
+        fec: None,
     }
 }
 
@@ -628,7 +654,10 @@ fn present_session(
     let fps = apply_negotiated_fps(source.as_ref(), &ctl, &settings);
     let cfg = settings.lock().expect("encoder settings").clone();
     let encoder = open_encoder_for(&first, &cfg)?;
-    let active_cursor = ctl.lock().expect("capture ctl").active_cursor;
+    let (active_cursor, fec) = {
+        let c = ctl.lock().expect("capture ctl");
+        (c.active_cursor, c.fec.clone())
+    };
 
     let _guard = runtime.enter();
     let pairing_code = if args.no_pairing {
@@ -665,6 +694,7 @@ fn present_session(
                 }
             })),
             cursor_events: Some(cursor_rx),
+            fec,
         },
         Arc::new(move || keyframe_controls.request_keyframe()),
     )?;
@@ -961,6 +991,7 @@ pub fn run(args: PresentArgs, config_dir: &Path) -> Result<()> {
                     c.asked_fps,
                     c.negotiated_fps.map(|f| format!("{f} fps")).unwrap_or_else(|| "?".into())
                 );
+                println!("forward error correction {}", c.prefs.fec.as_string());
             }
             println!("{}", ready.rc_summary);
             println!("colour conversion {}", ready.conversion);
@@ -996,7 +1027,7 @@ pub fn spawn_for_gui(
     let mut args = PresentArgs::gui_defaults();
     args.name = Some(name);
     args.port = port;
-    args.capture = crate::capture_prefs::resolve(None, None, &config_dir);
+    args.capture = crate::capture_prefs::resolve(None, None, None, &config_dir);
     spawn(runtime, args, config_dir, identity, on_update)
 }
 

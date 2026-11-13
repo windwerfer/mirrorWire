@@ -12,6 +12,7 @@ use mirrorwire_net::transport::ViewerSession;
 use mirrorwire_proto::clock::now_us;
 use mirrorwire_proto::control::{Control, StreamInfo};
 use mirrorwire_proto::cursor::ViewerCursor;
+use mirrorwire_proto::fec::{LinkHud, LinkWindow};
 use mirrorwire_proto::fragment::{AssembledFrame, Reassembler};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,6 +34,8 @@ pub struct Status {
     pub cursor_mode: String,
     /// Cursor sent as coordinates, once connected.
     pub cursor: Option<Arc<Mutex<ViewerCursor>>>,
+    /// FEC overhead, packet loss and rebuilt packets (last ~0.5 s).
+    pub link: LinkHud,
 }
 
 pub struct Handle {
@@ -134,6 +137,7 @@ async fn run(
     let mut last_request = Instant::now() - Duration::from_secs(1);
     let mut lost = 0u64;
     let mut window = (Instant::now(), 0u64, 0u64);
+    let mut link_window = LinkWindow::default();
     let close_reason = loop {
         if stop.load(Ordering::Acquire) {
             break None;
@@ -155,6 +159,10 @@ async fn run(
             let mut s = status.lock().unwrap_or_else(|e| e.into_inner());
             s.cursor_mode = info.cursor.clone().unwrap_or_else(|| "embedded".into());
             s.stream = Some(info);
+        }
+        if let Some(w) = link_window.tick(reassembler.link_stats(), now_us()) {
+            session.report_link(&w);
+            status.lock().unwrap_or_else(|e| e.into_inner()).link = link_window.hud;
         }
         if session.handle_pointer_datagram(&datagram) {
             repaint();

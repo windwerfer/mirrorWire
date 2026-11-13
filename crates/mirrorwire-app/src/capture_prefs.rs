@@ -1,8 +1,9 @@
-//! Presenter capture preferences: how the cursor is sent and the frame-rate
-//! cap. Resolved like the port: CLI flag, then environment
-//! (`MIRRORWIRE_CURSOR`, `MIRRORWIRE_FPS`), then `settings.json`, then the
-//! default (separate cursor, 60 fps).
+//! Presenter capture preferences: how the cursor is sent, the frame-rate
+//! cap and forward error correction. Resolved like the port: CLI flag, then
+//! environment (`MIRRORWIRE_CURSOR`, `MIRRORWIRE_FPS`, `MIRRORWIRE_FEC`), then
+//! `settings.json`, then the default (separate cursor, 60 fps, FEC auto).
 
+use mirrorwire_proto::fec::FecMode;
 use std::path::Path;
 
 /// How the presenter delivers the mouse cursor.
@@ -92,10 +93,28 @@ pub fn parse_fps_arg(s: &str) -> Result<FpsPref, String> {
         .ok_or_else(|| format!("expected 30, 60, another number 1–{MAX_FPS}, or max; got {s:?}"))
 }
 
+/// clap value parser for `--fec`.
+pub fn parse_fec_arg(s: &str) -> Result<FecMode, String> {
+    FecMode::parse(s).ok_or_else(|| format!("expected off, auto or a percentage 1–100; got {s:?}"))
+}
+
+/// FEC choices offered in the Quality panel.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub const FEC_CHOICES: [FecMode; 6] = [
+    FecMode::Off,
+    FecMode::Auto,
+    FecMode::Fixed(10),
+    FecMode::Fixed(20),
+    FecMode::Fixed(30),
+    FecMode::Fixed(50),
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CapturePrefs {
     pub cursor: CursorPref,
     pub fps: FpsPref,
+    /// Forward error correction for video datagrams (applies live).
+    pub fec: FecMode,
 }
 
 impl Default for CapturePrefs {
@@ -103,6 +122,7 @@ impl Default for CapturePrefs {
         Self {
             cursor: CursorPref::Separate,
             fps: FpsPref::Fixed(60),
+            fec: FecMode::Auto,
         }
     }
 }
@@ -160,25 +180,34 @@ pub fn resolve_with(
             "MIRRORWIRE_FPS",
             d.fps,
         ),
+        fec: d.fec,
     }
+}
+
+fn resolve_fec_with(cli: Option<FecMode>, env: Option<&str>, saved: Option<&str>) -> FecMode {
+    pick(cli, env, saved, FecMode::parse, "MIRRORWIRE_FEC", FecMode::Auto)
 }
 
 pub fn resolve(
     cli_cursor: Option<CursorPref>,
     cli_fps: Option<FpsPref>,
+    cli_fec: Option<FecMode>,
     config_dir: &Path,
 ) -> CapturePrefs {
     let saved = mirrorwire_net::settings::Settings::load(config_dir);
     let env_cursor = std::env::var("MIRRORWIRE_CURSOR").ok();
     let env_fps = std::env::var("MIRRORWIRE_FPS").ok();
-    resolve_with(
+    let env_fec = std::env::var("MIRRORWIRE_FEC").ok();
+    let mut prefs = resolve_with(
         cli_cursor,
         cli_fps,
         env_cursor.as_deref(),
         env_fps.as_deref(),
         saved.cursor.as_deref(),
         saved.fps.as_deref(),
-    )
+    );
+    prefs.fec = resolve_fec_with(cli_fec, env_fec.as_deref(), saved.fec.as_deref());
+    prefs
 }
 
 #[cfg(test)]
@@ -201,6 +230,17 @@ mod tests {
     }
 
     #[test]
+    fn fec_precedence() {
+        assert_eq!(resolve_fec_with(None, None, None), FecMode::Auto);
+        assert_eq!(resolve_fec_with(None, None, Some("off")), FecMode::Off);
+        assert_eq!(resolve_fec_with(None, Some("30%"), Some("off")), FecMode::Fixed(30));
+        assert_eq!(resolve_fec_with(None, Some("lots"), Some("off")), FecMode::Off);
+        assert_eq!(resolve_fec_with(Some(FecMode::Fixed(5)), Some("30"), None), FecMode::Fixed(5));
+        assert_eq!(parse_fec_arg("auto"), Ok(FecMode::Auto));
+        assert!(parse_fec_arg("200").is_err());
+    }
+
+    #[test]
     fn precedence_cli_env_saved_default() {
         assert_eq!(
             resolve_with(None, None, None, None, None, None),
@@ -211,7 +251,8 @@ mod tests {
             saved,
             CapturePrefs {
                 cursor: CursorPref::Embedded,
-                fps: FpsPref::Fixed(30)
+                fps: FpsPref::Fixed(30),
+                fec: FecMode::Auto,
             }
         );
         let env = resolve_with(
@@ -226,7 +267,8 @@ mod tests {
             env,
             CapturePrefs {
                 cursor: CursorPref::Hidden,
-                fps: FpsPref::Max
+                fps: FpsPref::Max,
+                fec: FecMode::Auto,
             }
         );
         let cli = resolve_with(
@@ -251,7 +293,8 @@ mod tests {
             junk,
             CapturePrefs {
                 cursor: CursorPref::Embedded,
-                fps: FpsPref::Fixed(60)
+                fps: FpsPref::Fixed(60),
+                fec: FecMode::Auto,
             }
         );
     }

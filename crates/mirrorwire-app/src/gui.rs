@@ -1,5 +1,5 @@
 use crate::applog::LogStore;
-use crate::capture_prefs::{CapturePrefs, CursorPref, FpsPref};
+use crate::capture_prefs::{CapturePrefs, CursorPref, FpsPref, FEC_CHOICES};
 use crate::presenter::{self, PresentPhase, PresenterHandle};
 use crate::viewer::{self, viewer_ui, Picture, ViewerHandle, ViewerOptions, ViewerUi};
 use crate::yuv_glow::{YuvPaint, YuvRenderer};
@@ -102,7 +102,7 @@ pub fn run(
             let initial = initial.clone();
             let log = log.clone();
             Box::new(move |cc: &eframe::CreationContext<'_>| {
-                let capture = crate::capture_prefs::resolve(None, None, &config_dir);
+                let capture = crate::capture_prefs::resolve(None, None, None, &config_dir);
                 let mut app = MirrorApp {
                     identity,
                     runtime: handle,
@@ -239,6 +239,7 @@ impl MirrorApp {
             ViewerOptions {
                 hwdec: self.hwdec,
                 simulate_loss: 0.0,
+                simulate_burst: 1.0,
                 rgba: self.renderer != ResolvedRenderer::Glow,
                 name: self.name.clone(),
             },
@@ -477,6 +478,7 @@ impl MirrorApp {
                     cap.fps_negotiated.map(|f| format!("{f} fps")).unwrap_or_else(|| "? (not reported)".into()),
                     status.settings.fps
                 ));
+                ui.weak(fec_status_line(&cap.fec, status.viewer_connected));
                 if hud.capture_w > 0 {
                     ui.weak(format!(
                         "Capture {}x{}  →  encode {}x{}  ·  source {:.1} fps (+{:.1} repeats/s)  ·  map/pack {:.1} ms  convert {:.1} ms  upload {:.1} ms  encode {:.1} ms (avg {:.1} ms)",
@@ -708,7 +710,7 @@ impl MirrorApp {
         if self.show_stats {
             let stream = status.stream.as_ref();
             let text = format!(
-                "{}x{}  source {:.1} fps  {:.2} Mbit/s  {} ({})  {}\n{}  decode {:.2} ms  {}  capture->texture {:.1} ms\nwindow: {}\n{}\n{}\nS: stats  1: 1:1 pixels  F / double-click: fullscreen  Esc: disconnect",
+                "{}x{}  source {:.1} fps  {:.2} Mbit/s  {} ({})  {}\n{}  decode {:.2} ms  {}  capture->texture {:.1} ms\nwindow: {}\n{}\n{}\n{}\nS: stats  1: 1:1 pixels  F / double-click: fullscreen  Esc: disconnect",
                 status.native_width.max(stream.map(|s| s.width).unwrap_or(0)),
                 status.native_height.max(stream.map(|s| s.height).unwrap_or(0)),
                 status.source_fps,
@@ -722,6 +724,7 @@ impl MirrorApp {
                 self.display_latency_ms,
                 self.display_server.as_deref().unwrap_or("?"),
                 status.last_second,
+                status.link.line(),
                 scale_info,
             );
             ui.painter().text(
@@ -1136,6 +1139,27 @@ fn attempts_panel(ui: &mut egui::Ui, attempts: &[IncomingAttempt]) {
     }
 }
 
+/// Presenter status line for forward error correction.
+fn fec_status_line(fec: &mirrorwire_net::transport::FecState, viewer_connected: bool) -> String {
+    let mode = fec.mode.as_string();
+    if !viewer_connected {
+        return format!("FEC: {mode}");
+    }
+    match fec.overheads() {
+        None if !fec.viewer_fec => format!("FEC: {mode}  ·  off for this viewer (older version)"),
+        None => "FEC: off".into(),
+        Some((delta, key)) => format!(
+            "FEC: {mode}  ·  parity +{:.0}% delta / +{:.0}% keyframes{}  ·  viewer loss {:.1}%  ·  rebuilt {:.0} packets/s  ·  unrecoverable frames {}",
+            delta * 100.0,
+            key * 100.0,
+            if fec.boost_pct > 0.0 { format!(" (raised {:.0} points after lost frames)", fec.boost_pct) } else { String::new() },
+            fec.loss_pct,
+            fec.recovered_per_s,
+            fec.unrecoverable
+        ),
+    }
+}
+
 fn quality_controls(ui: &mut egui::Ui, app: &mut MirrorApp, live: &EncoderConfig) {
     ui.add_space(8.0);
     ui.strong("Quality");
@@ -1198,12 +1222,21 @@ fn quality_controls(ui: &mut egui::Ui, app: &mut MirrorApp, live: &EncoderConfig
                     ui.selectable_value(&mut app.capture.fps, f, f.label());
                 }
             });
+        ui.label("FEC");
+        egui::ComboBox::from_id_salt("fec")
+            .selected_text(app.capture.fec.as_string())
+            .show_ui(ui, |ui| {
+                for m in FEC_CHOICES {
+                    ui.selectable_value(&mut app.capture.fec, m, m.as_string());
+                }
+            });
         if app.capture != before {
             if let Some(h) = &app.presenting {
                 h.apply_capture(app.capture);
             }
         }
     });
+    ui.weak("FEC adds parity packets so frames survive Wi-Fi loss without a keyframe round trip (auto adapts to the loss the viewer reports; the percentage is extra bandwidth on top of the bitrate). Applies to the next frame.");
     ui.weak("Cursor and Max fps apply at once (the capture restarts without a dialog) and are saved. separate: the viewer draws the cursor from coordinates, so it moves without waiting for video; embedded: the old way, for viewers or desktops where separate misbehaves.");
     ui.weak("Apply restarts the encoder with an IDR. filmcraft is the optional pure-Rust encoder (CPU, for comparison; auto never picks it). Switching away from vaapi uses shared-memory capture until the next start. 4:4:4 chroma is not available with VAAPI on UHD 620 or with VideoToolbox decode.");
 }

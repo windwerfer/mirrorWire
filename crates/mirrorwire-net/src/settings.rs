@@ -21,6 +21,9 @@ pub struct Settings {
     /// Presenter frame-rate cap: `30`, `60` (or another number) or `max`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fps: Option<String>,
+    /// Forward error correction for video: `off`, `auto` or a percentage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fec: Option<String>,
 }
 
 impl Settings {
@@ -52,14 +55,19 @@ impl Settings {
     }
 }
 
-/// Persist the presenter's cursor mode and frame-rate cap for the next start.
-pub fn save_capture(config_dir: &Path, cursor: &str, fps: &str) -> Result<()> {
+/// Persist the presenter's cursor mode, frame-rate cap and FEC setting for
+/// the next start.
+pub fn save_capture(config_dir: &Path, cursor: &str, fps: &str, fec: &str) -> Result<()> {
     let mut settings = Settings::load(config_dir);
-    if settings.cursor.as_deref() == Some(cursor) && settings.fps.as_deref() == Some(fps) {
+    if settings.cursor.as_deref() == Some(cursor)
+        && settings.fps.as_deref() == Some(fps)
+        && settings.fec.as_deref() == Some(fec)
+    {
         return Ok(());
     }
     settings.cursor = Some(cursor.to_owned());
     settings.fps = Some(fps.to_owned());
+    settings.fec = Some(fec.to_owned());
     settings.save(config_dir)
 }
 
@@ -159,7 +167,7 @@ mod tests {
     #[test]
     fn save_and_load_roundtrip() {
         let dir = temp_dir();
-        let settings = Settings { port: Some(47901), cursor: Some("embedded".into()), fps: Some("max".into()) };
+        let settings = Settings { port: Some(47901), cursor: Some("embedded".into()), fps: Some("max".into()), fec: Some("20%".into()) };
         settings.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), settings);
         std::fs::remove_dir_all(&dir).ok();
@@ -177,9 +185,10 @@ mod tests {
     fn capture_settings_keep_the_port() {
         let dir = temp_dir();
         save_port(&dir, 47555).unwrap();
-        save_capture(&dir, "separate", "60").unwrap();
+        save_capture(&dir, "separate", "60", "auto").unwrap();
         let s = Settings::load(&dir);
         assert_eq!((s.port, s.cursor.as_deref(), s.fps.as_deref()), (Some(47555), Some("separate"), Some("60")));
+        assert_eq!(s.fec.as_deref(), Some("auto"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

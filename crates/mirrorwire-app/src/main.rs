@@ -88,6 +88,10 @@ pub struct ViewArgs {
     /// Drop this percentage of received datagrams, to test loss recovery.
     #[arg(long, default_value_t = 0.0)]
     pub simulate_loss: f64,
+    /// Mean length of a loss burst in packets for --simulate-loss (1 =
+    /// independent losses; e.g. 4 to mimic Wi-Fi bursts at the same average).
+    #[arg(long, default_value_t = 1.0)]
+    pub simulate_burst: f64,
     /// Name shown to the presenter.
     #[arg(long)]
     pub name: Option<String>,
@@ -103,6 +107,7 @@ impl Default for ViewArgs {
             software_decode: false,
             rgba: false,
             simulate_loss: 0.0,
+            simulate_burst: 1.0,
             name: None,
         }
     }
@@ -139,7 +144,7 @@ fn main() -> Result<()> {
         Some(Command::Present(mut args)) => {
             args.port = port;
             let cli_cursor = if args.hide_cursor { Some(capture_prefs::CursorPref::Hidden) } else { args.cursor };
-            args.capture = capture_prefs::resolve(cli_cursor, args.fps, &config_dir);
+            args.capture = capture_prefs::resolve(cli_cursor, args.fps, args.fec, &config_dir);
             presenter::run(args, &config_dir)
         }
         Some(Command::View(args)) if args.headless => viewer::run_headless(args, &config_dir),

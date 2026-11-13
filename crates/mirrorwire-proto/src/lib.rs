@@ -1,6 +1,7 @@
 pub mod clock;
 pub mod control;
 pub mod cursor;
+pub mod fec;
 pub mod fragment;
 pub mod stats;
 

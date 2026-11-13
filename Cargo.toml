@@ -16,6 +16,8 @@ publish = false
 anyhow = "1"
 bytes = "1"
 crossbeam-channel = "0.5"
+# Erasure code for video FEC (MIT AND BSD-3-Clause, pure Rust, SIMD with scalar fallback).
+reed-solomon-simd = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"

@@ -64,11 +64,38 @@ Rules (adapted from FilmCraft's "report progress honestly"):
   no GPU") and that it was loopback.
 - **Name what was measured vs estimated.** A VM result says nothing about VAAPI on UHD 620 or
   decode on the iMac. Write "untested on target" when that's the truth.
-- Use `--simulate-loss <percent>` on the viewer to test loss recovery; quote lost frames and
-  keyframe requests.
+- Use `--simulate-loss <percent>` on the viewer to test loss recovery (add
+  `--simulate-burst <mean packets>` for Wi-Fi-like bursts); quote decoded frames, lost frames,
+  keyframe requests and the `fec overhead … packet loss …` line. Compare `--fec auto` against
+  `--fec off` (= the old behaviour) on the presenter.
 - Quality: compare at the same bitrate and resolution. Native resolution with no scaling is the
   baseline; a sharpness claim needs a photo/screenshot of text at 100 % or a PSNR/SSIM number
   from a decoded dump.
+
+### 3.0 Forward error correction under simulated loss (box, 2026-11-13)
+
+Agent box (8 vCPU Xeon VM, no GPU), loopback, release build, x264 1920×1080@60 test pattern,
+40 Mbit/s, 10 s per run, loss simulated on the viewer
+(`scripts/loopback-test.sh 10 --encoder x264 --fec MODE -- --simulate-loss L [--simulate-burst B]`).
+"main" is commit 1ea1523 (no FEC). "fec off" is this build with `--fec off` (same wire format as
+main, used for the bursty runs, which main's simulator can't do). Latency is
+`capture_to_decoded` mean / p95 in ms over decoded frames; the max is dominated by x264 stalls
+on the VM (`capture_to_encoded`), not the network.
+
+| Loss | main: frames (lost, kf req) | fec off: frames | fec auto: frames (lost, kf req) | fec auto overhead | fec auto latency mean / p95 |
+|---|---|---|---|---|---|
+| 0 % | 599 (0, 0), 8.45 / 10.45 ms | 594–600, 9.2–9.5 / 11.5–11.8 ms | 602–603 (0, 0) | 12 % | 8.80–8.90 / 11.3–11.5 |
+| 2 % random | 1 (366, 74) | 9 (357, 75) | 600–601 (0, 0) | 16–17 % | 8.8–9.0 / 10.4–10.9 |
+| 5 % random | 0 (517, 26) | 0 (503, 27) | 592–597 (0–1, 1–2) | 25 % | 9.5–9.6 / 11.0–12.6 |
+| 2 % bursts of 4 | — | 172 (159, 77) | 570 (10, 9) | 31 % | 9.2 / 11.1 |
+| 5 % bursts of 4 | — | 40 (279, 78) | 562 (16, 12) | 40 % | 9.4 / 11.7 |
+| 5 % bursts of 8 | — | — | 554 (17, 15) | 49 % | 9.1 / 11.8 |
+
+Without FEC, almost no frame of a 40 Mbit/s 1080p stream survives 2 % loss: every frame has
+~60 packets and a keyframe ~400, so one loss per frame is likely and the keyframe asked for to
+recover is lost too. With auto FEC random loss is fully covered; bursty loss still costs a
+frame now and then (each lost delta frame waits for a keyframe, since there is no intra
+refresh), and the auto boost raises the parity until that mostly stops. Untested on real Wi-Fi.
 
 ### 3.1 FilmCraft vs x264 (box, 2026-11-13)
 

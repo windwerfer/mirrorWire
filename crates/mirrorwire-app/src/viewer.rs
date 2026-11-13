@@ -10,6 +10,7 @@ use mirrorwire_net::transport::{ms, ViewerSession};
 use mirrorwire_proto::clock::{now_us, ClockSync};
 use mirrorwire_proto::control::StreamInfo;
 use mirrorwire_proto::cursor::ViewerCursor;
+use mirrorwire_proto::fec::{LinkHud, LinkStats, LinkWindow, LossSim};
 use mirrorwire_proto::fragment::{AssembledFrame, Reassembler};
 use mirrorwire_proto::stats::StageStats;
 use std::path::Path;
@@ -80,6 +81,8 @@ pub struct ViewerStatus {
     pub cursor_mode: String,
     /// Cursor sent as coordinates (position + cached images), once connected.
     pub cursor: Option<Arc<Mutex<ViewerCursor>>>,
+    /// FEC overhead, packet loss, rebuilt packets (last ~0.5 s window).
+    pub link: LinkHud,
 }
 
 #[derive(Default)]
@@ -97,11 +100,13 @@ pub struct Totals {
     pub cursor_updates: u64,
     pub cursor_stale: u64,
     pub cursor_images: u64,
+    pub link: LinkStats,
 }
 
 pub struct ViewerOptions {
     pub hwdec: bool,
     pub simulate_loss: f64,
+    pub simulate_burst: f64,
     pub rgba: bool,
     pub name: String,
 }
@@ -223,7 +228,7 @@ async fn session(
     let mut stream_updates = session.stream_updates.clone();
     let repaint = on_frame.clone();
 
-    let opts_loss = opts.simulate_loss;
+    let mut loss_sim = LossSim::new(opts.simulate_loss, opts.simulate_burst, now_us());
     let self_healing = session.stream_info.intra_refresh;
     let need_keyframe = Arc::new(AtomicBool::new(true));
     // At most one frame waits while another decodes. When the decoder falls
@@ -259,8 +264,7 @@ async fn session(
     let mut lost = 0u64;
     let mut skipped = 0u64;
     let started = Instant::now();
-    let mut rng = now_us() | 1;
-    let drop_threshold = (opts_loss.clamp(0.0, 1.0) * u64::MAX as f64) as u64;
+    let mut link_window = LinkWindow::default();
     let close_reason = loop {
         if stop.load(Ordering::Acquire) {
             break None;
@@ -280,13 +284,12 @@ async fn session(
                 format!("{} byte QUIC datagram from {}", datagram.len(), target.addr),
             );
         }
-        if drop_threshold > 0 {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            if rng < drop_threshold {
-                continue;
-            }
+        if loss_sim.drop_next() {
+            continue;
+        }
+        if let Some(window) = link_window.tick(reassembler.link_stats(), now_us()) {
+            session.report_link(&window);
+            status.lock().expect("status lock").link = link_window.hud;
         }
         if stream_updates.has_changed().unwrap_or(false) {
             let info = stream_updates.borrow_and_update().clone();
@@ -348,6 +351,7 @@ async fn session(
         .join()
         .map_err(|_| anyhow!("decode thread panicked"))??;
     totals.lost = lost;
+    totals.link = reassembler.link_stats();
     totals.skipped_waiting_keyframe = skipped;
     totals.keyframe_requests += requests;
     (totals.cursor_updates, totals.cursor_stale, totals.cursor_images) = cursor_summary;
@@ -584,6 +588,7 @@ pub fn run_headless(args: ViewArgs, config_dir: &Path) -> Result<()> {
         ViewerOptions {
             hwdec: args.want_hwdec(),
             simulate_loss: args.simulate_loss / 100.0,
+            simulate_burst: args.simulate_burst,
             rgba: args.rgba,
             name: args
                 .name
@@ -641,6 +646,16 @@ fn print_summary((totals, stats, secs): &(Totals, StageStats, f64)) {
         totals.cursor_updates as f64 / secs,
         totals.cursor_stale,
         totals.cursor_images
+    );
+    let link = &totals.link;
+    println!(
+        "fec overhead {:.0}%  packet loss {:.2}% ({} of {})  rebuilt packets {}  unrecoverable frames {}",
+        link.overhead_pct(),
+        link.loss_pct(),
+        link.expected.saturating_sub(link.received),
+        link.expected,
+        link.recovered,
+        link.unrecoverable_frames
     );
     println!(
         "{:<20} {:>8} {:>8} {:>8} {:>8}",

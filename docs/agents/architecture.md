@@ -6,7 +6,7 @@ A Cargo workspace with five crates. Lower layers never depend on higher ones.
 
 | Layer | Crate | Job | May depend on |
 |---|---|---|---|
-| L0 | `mirrorwire-proto` | Wire format: datagram fragment header, fragmentation and reassembly, control messages (JSON over a length-prefixed stream), clock-offset estimation, latency statistics, protocol constants (`PROTOCOL_VERSION`, `ALPN`, `MDNS_SERVICE`, `DEFAULT_PORT`). **No I/O, no async, no FFmpeg.** | `bytes`, `serde`, `serde_json`, `anyhow` only |
+| L0 | `mirrorwire-proto` | Wire format: datagram fragment header, fragmentation and reassembly, control messages (JSON over a length-prefixed stream), clock-offset estimation, latency statistics, protocol constants (`PROTOCOL_VERSION`, `ALPN`, `MDNS_SERVICE`, `DEFAULT_PORT`). **No I/O, no async, no FFmpeg.** | `bytes`, `serde`, `serde_json`, `anyhow`, `reed-solomon-simd` (FEC) only |
 | L1 | `mirrorwire-media` | Frame sources (test pattern, portal + PipeWire), H.264 encoder and decoder via FFmpeg (VAAPI / VideoToolbox / x264), YUV→RGBA conversion, the capture→encode loop and the `VideoSink` trait. | `mirrorwire-proto` |
 | L1 | `mirrorwire-net` | Identity (self-signed cert), pinned TLS verifiers, QUIC presenter/viewer sessions, pairing (`paired_viewers.json`, pairing code, `mirrorwire://` URI, QR), mDNS announce/browse, persisted presenter settings (`settings.json`), Linux firewall detection and a best-effort firewalld D-Bus open-port request. | `mirrorwire-proto` |
 | L2 | `mirrorwire-app` | The `mirrorwire` binary: CLI (`present`, `view`, `view --headless`, `discover`), presenter and viewer glue, the egui GUI (start screen, presenter status, viewer list, video, stats overlay). | all of the above |
@@ -62,8 +62,10 @@ xdg-desktop-portal ScreenCast  (one-time dialog, restore token)
   -> VideoSink (QUIC)                                          QUIC endpoint (pinned cert)
        fragment frame into <= max_datagram_size pieces           reassemble fragments by frame_id,
        34-byte header each, unreliable datagrams  ---------->    detect loss, request keyframe
+       (FEC viewers: 44-byte v2 header, Reed-Solomon             (FEC: rebuild a block from any
+        parity per block, overhead from LinkReport)               k of n packets, report loss)
        control stream: Hello/StreamInfo/Ping/Pong/   <------>    over control stream
-       RequestKeyframe/Rejected/Bye                             -> Decoder (FFmpeg; VideoToolbox/VAAPI
+       RequestKeyframe/LinkReport/Rejected/Bye                             -> Decoder (FFmpeg; VideoToolbox/VAAPI
                                                                     with --hwdec, else software)
                                                                 -> RgbaConverter (swscale, CPU)
                                                                 -> egui texture, drawn by

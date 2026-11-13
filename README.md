@@ -172,7 +172,8 @@ cargo build --release
 
 Useful presenter options: `--fps 30|60|max` (frame-rate cap asked of the compositor; default
 60, `max` = the display refresh rate; also `MIRRORWIRE_FPS`), `--cursor separate|embedded|hidden`
-(default `separate`, also `MIRRORWIRE_CURSOR`), `--bitrate-kbps 40000` (or `--bitrate-mbps 40`),
+(default `separate`, also `MIRRORWIRE_CURSOR`), `--fec auto|off|20` (forward error
+correction, default `auto`; also `MIRRORWIRE_FEC`), `--bitrate-kbps 40000` (or `--bitrate-mbps 40`),
 `--rc auto|cbr|vbr|cqp|icq`, `--qp 18`, `--keyint` (frames; 0 = 10 s),
 `--encoder auto|vaapi|x264|filmcraft`, `--intra-refresh`, `--source test`, `--no-pairing`,
 `--port` (or `MIRRORWIRE_PORT`; the GUI also saves the port in `settings.json`),
@@ -194,6 +195,16 @@ The presenter window shows the active mode under *Cursor*; the viewer overlay sh
 `cursor separate (N updates/s)` or `cursor embedded (in video)`. Cursor and *Max fps* can be
 changed in the presenter's Quality panel (saved in `settings.json`; the capture restarts
 without a dialog). Typing still goes through the video, so only 60 fps helps there.
+
+**Forward error correction.** Video packets carry Reed-Solomon parity, so a frame survives a
+few lost Wi-Fi packets without waiting for a keyframe. The viewer rebuilds a frame as soon as
+enough packets of it have arrived, with no round trip. With `--fec auto` (the default) parity is
+10 % of a delta frame's packets and 25 % of a keyframe's at no loss, and rises with the loss the
+viewer reports, and further while frames still can't be rebuilt (bursts; up to 60 % and 100 %). `--fec 20` fixes it at 20 % (30 % for keyframes); `--fec off`
+sends no parity. Parity is extra bandwidth on top of the bitrate. Older viewers get plain packets.
+FEC can be changed live in the presenter's Quality panel (saved in `settings.json`). The presenter
+window shows `FEC: auto · parity +N% delta / +M% keyframes · viewer loss … · rebuilt … packets/s ·
+unrecoverable frames …`; the viewer overlay shows `fec +N%  rebuilt N/s  loss N%  unrecoverable frames N`.
 
 ## Build and run: viewer on macOS
 
@@ -230,6 +241,7 @@ point `PKG_CONFIG_PATH` at it.
 ```sh
 scripts/loopback-test.sh 10 --encoder x264            # 10 s, native test pattern 1920x1080@60, 40 Mbit/s
 scripts/loopback-test.sh 10 --intra-refresh -- --simulate-loss 0.5
+scripts/loopback-test.sh 10 --encoder x264 --fec auto -- --simulate-loss 5 --simulate-burst 4
 MIRRORWIRE_FEATURES=filmcraft scripts/loopback-test.sh 10 --encoder filmcraft
 mirrorwire view --headless --duration 10 '<uri>'          # against a real presenter
 mirrorwire discover                                       # list presenters via mDNS
@@ -265,6 +277,7 @@ when the portal only sent 6.8 fps, because PTS advanced by 1/60 s per frame.
 | proto (fragmentation, reassembly, loss detection, clock sync) | unit-tested, loopback-tested |
 | x264 encode, software H.264 decode, RGBA conversion | loopback-tested |
 | QUIC datagram transport, control stream, keyframe recovery | loopback-tested, including simulated loss |
+| Forward error correction (Reed-Solomon, adaptive) | unit-tested, loopback-tested with simulated random and bursty loss; not tried on real Wi-Fi |
 | pinned TLS, pairing code, paired-viewer memory | tested: wrong fingerprint and missing code are rejected |
 | mDNS announce/browse | tested on one host |
 | egui viewer | runs on the VM (llvmpipe, X11) and on a 2011 iMac (OpenGL / glow, macOS 15 via OCLP) |

@@ -21,6 +21,7 @@ target), **planned**, **idea**. Update this file when an item moves.
 | Cursor sent as coordinates (portal METADATA cursor, pointer datagrams, viewer-drawn) | built (2026-11-13), loopback-tested with a synthetic cursor; untested with KWin on the T480s |
 | 60 fps / max frame-rate setting, negotiated rate shown | built (2026-11-13); KWin's reported max untested |
 | Click-freeze in the viewer (egui nested input lock) | fixed (2026-11-13), untested on the iMac |
+| Forward error correction for video (Reed-Solomon per block, interleaved, adaptive from viewer loss reports; `--fec auto|off|N`, Quality panel) | built (2026-11-13), loopback-tested with simulated random and bursty loss (protocol.md §3b); untested on real Wi-Fi and on Android hardware |
 | Latency spikes on scene changes (2 s VBV, unbounded QUIC queue, 4-frame decode backlog, no pacing) | fixed (2026-11-13): 100 ms VBV, 2 MiB datagram queue with delta-frame drop, 2-frame decode queue flushed on overflow, 500 Mbit/s pacing; untested on Wi-Fi hardware |
 
 ## Next (owner-agreed order)
@@ -41,9 +42,11 @@ target), **planned**, **idea**. Update this file when an item moves.
 
 ## Planned
 
-- **FEC for Wi-Fi:** Reed-Solomon parity fragments per frame so single losses don't cost a
-  keyframe. Needs a `WIRE_VERSION` bump ([protocol.md](protocol.md) §4).
-- **Adaptive bitrate** from QUIC RTT/loss and reassembly loss.
+- **Adaptive bitrate** from QUIC RTT/loss and reassembly loss. The viewer's `link_report`
+  (built for FEC) already carries the loss; FEC parity is currently extra bandwidth on top of the
+  encoder bitrate, so a later step could take it out of the bitrate budget.
+- **FEC follow-ups:** spread a keyframe's parity over the next frame interval (covers longer
+  bursts at the cost of latency); measure on real Wi-Fi and tune the auto curve.
 - **Zero-copy (viewer):** VideoToolbox → texture and a YUV→RGB shader on the wgpu path too
   (glow already has the shader). The presenter side (DMA-BUF → VAAPI) is built.
 - **DMA-BUF modifiers from VAAPI:** today a fixed list (Intel Y/X-tiled, linear, implicit) is

@@ -20,6 +20,19 @@ pub enum Control {
     RequestKeyframe { reason: String },
     Ping { t_viewer_us: u64 },
     Pong { t_viewer_us: u64, t_presenter_us: u64 },
+    /// Viewer -> presenter, about twice a second, only when the presenter's
+    /// `stream_info` has a `fec` field (older presenters would reject an
+    /// unknown message). Feeds the adaptive FEC overhead.
+    LinkReport {
+        /// Packet loss over the window, in 1/1000.
+        loss_permille: u32,
+        /// Packets the presenter sent for frames in the window.
+        packets: u32,
+        /// Data packets rebuilt from parity.
+        recovered: u32,
+        /// Frames that could not be rebuilt.
+        unrecoverable: u32,
+    },
     Bye,
 }
 
@@ -40,6 +53,12 @@ pub struct StreamInfo {
     /// The presenter may send `stream_info` again when this changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    /// Forward error correction setting (`off`, `auto`, `20%`) of a presenter
+    /// that can send FEC packets and reads `link_report`. Absent from older
+    /// presenters. Whether this viewer gets FEC packets depends on its hello
+    /// listing [`crate::fec::CAP_FEC`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fec: Option<String>,
 }
 
 pub const CURSOR_SEPARATE: &str = "separate";
@@ -101,5 +120,8 @@ mod tests {
         let info = br#"{"type":"stream_info","width":1,"height":1,"fps":60,"codec":"h264","encoder":"x","bitrate_kbps":1,"intra_refresh":false}"#;
         let Control::StreamInfo(info) = Control::decode_body(info).unwrap() else { panic!() };
         assert_eq!(info.cursor, None);
+        assert_eq!(info.fec, None);
+        let report = Control::LinkReport { loss_permille: 20, packets: 1000, recovered: 18, unrecoverable: 0 };
+        assert_eq!(Control::decode_body(&report.encode()[4..]).unwrap(), report);
     }
 }
