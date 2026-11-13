@@ -5,7 +5,9 @@ use crate::yuv_glow::{YuvPaint, YuvRenderer};
 use crate::{GuiLaunch, RendererChoice, ViewArgs};
 use anyhow::{anyhow, Result};
 use eframe::egui;
-use mirrorwire_media::encode::{EncoderBackend, EncoderConfig, RateControl, DEFAULT_BITRATE_KBPS, DEFAULT_QP};
+use mirrorwire_media::encode::{
+    EncoderBackend, EncoderConfig, RateControl, DEFAULT_BITRATE_KBPS, DEFAULT_QP,
+};
 use mirrorwire_net::diag::{ConnectStep, FirewallHint, IncomingAttempt, StepState};
 use mirrorwire_net::discovery::{Browser, Presenter};
 use mirrorwire_net::identity::{short_fingerprint, Identity};
@@ -15,6 +17,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const PRESENT_AVAILABLE: bool = cfg!(all(target_os = "linux", feature = "portal"));
+
+/// Background result of the "Open port in firewall" button.
+enum FirewallFix {
+    Running,
+    Ok(String),
+    Applied(String),
+    Err(String),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResolvedRenderer {
@@ -130,6 +140,7 @@ pub fn run(
                     qp: DEFAULT_QP,
                     keyint_sec: 10,
                     encoder: EncoderBackend::Auto,
+                    firewall_fix: None,
                 };
                 if let Some(target) = initial {
                     app.screen = Screen::View;
@@ -199,6 +210,7 @@ struct MirrorApp {
     qp: u32,
     keyint_sec: u32,
     encoder: EncoderBackend,
+    firewall_fix: Option<Arc<Mutex<FirewallFix>>>,
 }
 
 impl MirrorApp {
@@ -290,8 +302,20 @@ impl MirrorApp {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.weak("UDP port:");
-                ui.add(egui::DragValue::new(&mut self.present_port).range(1..=65535));
+                if ui
+                    .add(egui::DragValue::new(&mut self.present_port).range(1..=65535))
+                    .changed()
+                {
+                    if let Err(e) =
+                        mirrorwire_net::settings::save_port(&self.config_dir, self.present_port)
+                    {
+                        tracing::warn!("could not save port: {e:#}");
+                    }
+                }
             });
+            ui.weak(
+                "The viewer finds this port automatically (mDNS, QR and the link all include it).",
+            );
             if !PRESENT_AVAILABLE {
                 ui.add_space(4.0);
                 ui.weak("Screen capture is not available on this platform yet.");
@@ -334,6 +358,7 @@ impl MirrorApp {
             PresentPhase::Starting | PresentPhase::WaitingForCapture => {
                 ui.label("Waiting for the screen share dialog…");
                 ui.weak("Choose the display or window to share, then come back to this window for the pairing code.");
+                firewall_panel(ui, self, status.firewall.as_ref(), false);
             }
             PresentPhase::Streaming => {
                 if let Some(code) = &status.pairing_code {
@@ -381,7 +406,11 @@ impl MirrorApp {
                 }
                 if let (Some(enc), Some(src)) = (&status.encoder, &status.source) {
                     // The HUD name follows live encoder switches; `status.encoder` is the first one.
-                    let enc = if status.hud.encoder.is_empty() { enc } else { &status.hud.encoder };
+                    let enc = if status.hud.encoder.is_empty() {
+                        enc
+                    } else {
+                        &status.hud.encoder
+                    };
                     ui.weak(format!("Encoder: {enc}  ·  Source: {src}"));
                 }
                 if let Some(fp) = &status.fingerprint {
@@ -429,7 +458,12 @@ impl MirrorApp {
                     ));
                 }
                 quality_controls(ui, self, &status.settings);
-                firewall_panel(ui, status.firewall.as_ref(), &mut self.copy_note);
+                firewall_panel(
+                    ui,
+                    self,
+                    status.firewall.as_ref(),
+                    status.attempts.is_empty() && !status.viewer_connected,
+                );
                 attempts_panel(ui, &status.attempts);
                 log_panel(ui, &self.log, &mut self.copy_note);
             }
@@ -489,7 +523,11 @@ impl MirrorApp {
                     });
                 }
                 let addrs = if p.addrs.len() > 1 {
-                    p.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+                    p.addrs
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 } else {
                     p.addr.to_string()
                 };
@@ -586,11 +624,10 @@ impl MirrorApp {
             };
             let draw = egui::Rect::from_center_size(rect.center(), draw_size);
             if let Some(yuv) = &self.yuv {
-                ui.painter().add(YuvPaint::new(
-                    yuv.clone(),
-                    self.yuv_gpu.clone(),
-                    self.pixel_exact,
-                ).callback(draw));
+                ui.painter().add(
+                    YuvPaint::new(yuv.clone(), self.yuv_gpu.clone(), self.pixel_exact)
+                        .callback(draw),
+                );
             } else if let Some(tex) = &self.texture {
                 ui.painter().image(
                     tex.id(),
@@ -602,7 +639,11 @@ impl MirrorApp {
             let drawn_px = draw_size * ppp;
             let sx = drawn_px.x / tex_w;
             let sy = drawn_px.y / tex_h;
-            let convert = if self.yuv.is_some() { "GL YUV shader" } else { "CPU RGBA" };
+            let convert = if self.yuv.is_some() {
+                "GL YUV shader"
+            } else {
+                "CPU RGBA"
+            };
             scale_info = format!(
                 "texture {tex_w:.0}x{tex_h:.0}  window {:.0}x{:.0} px  ppp {ppp:.2}  scale {sx:.2}x/{sy:.2}x  {}  {convert}",
                 rect.width() * ppp,
@@ -803,7 +844,6 @@ fn qr_color_image(uri: &str) -> Result<egui::ColorImage> {
     ))
 }
 
-
 fn step_row(ui: &mut egui::Ui, step: &ConnectStep) {
     let (mark, color) = match step.state {
         StepState::Pending => ("·", egui::Color32::GRAY),
@@ -824,7 +864,11 @@ fn step_row(ui: &mut egui::Ui, step: &ConnectStep) {
 /// Copy through egui's own clipboard (winit: smithay-clipboard on Wayland,
 /// the system pasteboard on macOS). It reports no errors back, so the note
 /// keeps the manual fallback in view.
-fn copy_with_feedback(ctx: &egui::Context, text: String, note: &mut Option<(Instant, bool, String)>) {
+fn copy_with_feedback(
+    ctx: &egui::Context,
+    text: String,
+    note: &mut Option<(Instant, bool, String)>,
+) {
     ctx.copy_text(text);
     *note = Some((
         Instant::now(),
@@ -873,24 +917,108 @@ fn log_panel(ui: &mut egui::Ui, log: &LogStore, note: &mut Option<(Instant, bool
 
 fn firewall_panel(
     ui: &mut egui::Ui,
+    app: &mut MirrorApp,
     hint: Option<&FirewallHint>,
-    note: &mut Option<(Instant, bool, String)>,
+    waiting_for_viewer: bool,
 ) {
-    let Some(hint) = hint.filter(|h| h.show) else { return };
+    let Some(hint) = hint else { return };
+    let show = hint.show
+        || matches!(
+            app.firewall_fix
+                .as_ref()
+                .and_then(|s| s.lock().ok().map(|g| !matches!(*g, FirewallFix::Running))),
+            Some(true)
+        );
+    if !show {
+        return;
+    }
     ui.add_space(8.0);
-    let color = if hint.prominent {
+    let color = if hint.prominent || waiting_for_viewer && hint.show {
         egui::Color32::from_rgb(230, 160, 40)
     } else {
         egui::Color32::GRAY
     };
-    ui.colored_label(color, &hint.message);
-    ui.horizontal(|ui| {
-        ui.monospace(&hint.command);
-        if ui.button("Copy command").clicked() {
-            copy_with_feedback(ui.ctx(), hint.command.clone(), note);
+    if hint.show {
+        ui.colored_label(color, &hint.message);
+        if waiting_for_viewer && hint.prominent {
+            ui.colored_label(
+                color,
+                "If a viewer is stuck on connecting, the packets are probably being dropped here.",
+            );
         }
-        show_copy_note(ui, note);
+    }
+
+    if let Some(slot) = &app.firewall_fix {
+        if let Ok(mut g) = slot.lock() {
+            if let FirewallFix::Ok(msg) = &*g {
+                let msg = msg.clone();
+                if let Some(h) = &app.presenting {
+                    h.refresh_firewall();
+                }
+                *g = FirewallFix::Applied(msg);
+            }
+        }
+    }
+
+    let fix_snapshot = app.firewall_fix.as_ref().and_then(|s| {
+        s.lock().ok().map(|g| match &*g {
+            FirewallFix::Running => "running".to_owned(),
+            FirewallFix::Ok(m) | FirewallFix::Applied(m) => format!("ok:{m}"),
+            FirewallFix::Err(m) => format!("err:{m}"),
+        })
     });
+
+    if hint.can_autofix && hint.show {
+        ui.horizontal(|ui| {
+            let busy = matches!(fix_snapshot.as_deref(), Some("running"));
+            let label = if busy {
+                "Opening port… (a password prompt may appear)"
+            } else {
+                "Open port in firewall"
+            };
+            if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+                let port = hint.port;
+                let slot = Arc::new(Mutex::new(FirewallFix::Running));
+                app.firewall_fix = Some(slot.clone());
+                let ctx = ui.ctx().clone();
+                std::thread::Builder::new()
+                    .name("firewall-open".into())
+                    .spawn(move || {
+                        let result = FirewallHint::open_port(port);
+                        if let Ok(mut g) = slot.lock() {
+                            *g = match result {
+                                Ok(msg) => FirewallFix::Ok(msg),
+                                Err(msg) => FirewallFix::Err(msg),
+                            };
+                        }
+                        ctx.request_repaint();
+                    })
+                    .ok();
+            }
+        });
+        ui.weak("Your system may ask for your password. The app does not run as root.");
+    }
+
+    if let Some(text) = fix_snapshot.as_deref() {
+        if let Some(msg) = text.strip_prefix("ok:") {
+            ui.colored_label(egui::Color32::from_rgb(0, 180, 80), msg);
+        } else if let Some(msg) = text.strip_prefix("err:") {
+            ui.colored_label(egui::Color32::LIGHT_RED, msg);
+            ui.weak("If the password prompt was cancelled, or this system does not use firewalld, use the commands below.");
+        }
+    }
+
+    if hint.show {
+        ui.add_space(4.0);
+        ui.weak(&hint.guide);
+        ui.horizontal(|ui| {
+            ui.monospace(&hint.command);
+            if ui.button("Copy command").clicked() {
+                copy_with_feedback(ui.ctx(), hint.command.clone(), &mut app.copy_note);
+            }
+            show_copy_note(ui, &app.copy_note);
+        });
+    }
 }
 
 fn attempts_panel(ui: &mut egui::Ui, attempts: &[IncomingAttempt]) {
@@ -907,7 +1035,10 @@ fn attempts_panel(ui: &mut egui::Ui, attempts: &[IncomingAttempt]) {
             egui::Color32::LIGHT_RED
         };
         let name = a.viewer_name.as_deref().unwrap_or("unknown viewer");
-        ui.colored_label(color, format!("{}  {}  {}  {}", a.at, a.peer, name, a.outcome));
+        ui.colored_label(
+            color,
+            format!("{}  {}  {}  {}", a.at, a.peer, name, a.outcome),
+        );
     }
 }
 
@@ -924,7 +1055,11 @@ fn quality_controls(ui: &mut egui::Ui, app: &mut MirrorApp, live: &EncoderConfig
                 }
             });
         ui.label("Bitrate (Mbit/s)");
-        ui.add(egui::DragValue::new(&mut app.bitrate_mbps).range(1.0..=80.0).speed(0.5));
+        ui.add(
+            egui::DragValue::new(&mut app.bitrate_mbps)
+                .range(1.0..=80.0)
+                .speed(0.5),
+        );
         ui.label("RC");
         egui::ComboBox::from_id_salt("rc")
             .selected_text(app.rc.as_str())
@@ -953,4 +1088,3 @@ fn quality_controls(ui: &mut egui::Ui, app: &mut MirrorApp, live: &EncoderConfig
     });
     ui.weak("Apply restarts the encoder with an IDR. filmcraft is the optional pure-Rust encoder (CPU, for comparison; auto never picks it). Switching away from vaapi uses shared-memory capture until the next start. 4:4:4 chroma is not available with VAAPI on UHD 620 or with VideoToolbox decode.");
 }
-

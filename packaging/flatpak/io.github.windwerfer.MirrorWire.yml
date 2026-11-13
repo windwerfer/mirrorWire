@@ -12,6 +12,9 @@ finish-args:
   - --share=ipc
   - --share=network
   - --device=dri
+  # Query / open the presenter UDP port via firewalld (polkit prompt). No host
+  # filesystem and no generic --talk-name; this is the only extra D-Bus name.
+  - --system-talk-name=org.fedoraproject.FirewallD1
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin
   prepend-ld-library-path: /usr/lib/sdk/llvm20/lib
@@ -85,6 +88,8 @@ modules:
       - install -Dm644 packaging/linux/io.github.windwerfer.MirrorWire.desktop /app/share/applications/io.github.windwerfer.MirrorWire.desktop
       - install -Dm644 packaging/linux/io.github.windwerfer.MirrorWire.metainfo.xml /app/share/metainfo/io.github.windwerfer.MirrorWire.metainfo.xml
       - install -Dm644 packaging/icons/io.github.windwerfer.MirrorWire.png /app/share/icons/hicolor/512x512/apps/io.github.windwerfer.MirrorWire.png
+      - install -Dm644 packaging/linux/mirrorwire.xml /app/share/firewalld/services/mirrorwire.xml
+      - install -Dm644 packaging/linux/README-firewalld.md /app/share/doc/mirrorwire/README-firewalld.md
     sources:
       - type: dir
         path: ../..

@@ -101,10 +101,16 @@ Launching the app without arguments opens a start screen with **Present this scr
 and **View**. Present starts capture and the pairing window (Linux only; the button is
 disabled on macOS until capture exists there). The presenter window shows the pairing
 code, a live quality panel (bitrate, CBR/VBR/CQP/ICQ, keyint), connection attempts,
-and, on Fedora, a hint if firewalld may be blocking UDP 47800. **View** lists
+and a firewall panel if the presenter port looks blocked. The default port is
+UDP 47800; it can be changed in the start screen (saved for next time), with
+`--port`, or with `MIRRORWIRE_PORT`. The mDNS announcement and the QR/link already
+include the port, so the viewer finds it automatically. If firewalld is running,
+**Open port in firewall** asks the system (a password prompt may appear) to allow
+the port now and after a reboot; the app never runs as root. Otherwise the panel
+shows a short general guide. **View** lists
 presenters and, while connecting, a staged status (handshake, certificate, pairing,
-first frame) plus a copyable log. After a timeout it suggests
-`sudo firewall-cmd --add-port=47800/udp`. The CLI subcommands (`present`, `view`,
+first frame) plus a copyable log. After a timeout it shows the same short firewall
+guide. The CLI subcommands (`present`, `view`,
 `discover`) still work, including headless tests.
 
 The presenter shows its **Capture path**: `dmabuf-zero-copy` (compositor GPU buffer
@@ -137,8 +143,10 @@ flatpak run io.github.windwerfer.MirrorWire present     # Flatpak
 ```
 
 **Flatpak permissions:** `--socket=wayland`, `--socket=fallback-x11`, `--share=ipc`
-(for X11 only), `--share=network` (QUIC and mDNS), and `--device=dri` (VAAPI and GPU
-rendering). There is no host filesystem access. Screen capture goes through the
+(for X11 only), `--share=network` (QUIC and mDNS), `--device=dri` (VAAPI and GPU
+rendering), and `--system-talk-name=org.fedoraproject.FirewallD1` (so the presenter
+can ask firewalld to query or open its UDP port; a password prompt may appear).
+There is no host filesystem access. Screen capture goes through the
 ScreenCast portal, which needs no extra permission. Settings live in
 `~/.var/app/io.github.windwerfer.MirrorWire/config/mirrorwire`.
 
@@ -164,14 +172,14 @@ cargo build --release
 
 Useful presenter options: `--fps 60 --bitrate-kbps 40000` (or `--bitrate-mbps 40`),
 `--rc auto|cbr|vbr|cqp|icq`, `--qp 18`, `--keyint` (frames; 0 = 10 s),
-`--encoder auto|vaapi|x264|filmcraft`, `--intra-refresh`, `--source test`, `--no-pairing`, `--port`,
+`--encoder auto|vaapi|x264|filmcraft`, `--intra-refresh`, `--source test`, `--no-pairing`,
+`--port` (or `MIRRORWIRE_PORT`; the GUI also saves the port in `settings.json`),
 `--no-dmabuf` (capture through shared memory instead of zero-copy GPU buffers).
 `filmcraft` is an optional pure-Rust H.264 encoder for comparison (built into the Flatpak
 and AppImage; from source add `--features filmcraft`). It can also be switched live in the
 presenter window under Quality › Encoder. FFmpeg (VAAPI, then x264) stays the default.
 The default size is the native capture. `--size 1920x1080` (or `--width` / `--height`)
-overrides it and scales. If a viewer finds the presenter but cannot connect, open
-the port on Fedora: `sudo firewall-cmd --add-port=47800/udp`.
+overrides it and scales.
 
 ## Build and run: viewer on macOS
 
@@ -288,22 +296,41 @@ The source is MIT OR Apache-2.0. The Linux release builds statically link x264
 (GPL-2.0-or-later), so those binaries are distributed under the GPL. The macOS
 builds use only FFmpeg's LGPL parts plus VideoToolbox.
 
+## Troubleshooting
+
+**A viewer lists the presenter but cannot connect** (it sits on "connecting…", then times out).
+The presenter is visible via mDNS, but the QUIC packets on the presenter UDP port
+(default 47800, or the port shown in the presenter window and in the link) are
+probably being dropped by a firewall. On the presenter, use **Open port in firewall**
+if the button is offered (a password prompt may appear). Otherwise:
+
+```
+On Fedora: sudo firewall-cmd --add-port=47800/udp
+To keep it after a reboot: sudo firewall-cmd --permanent --add-port=47800/udp && sudo firewall-cmd --reload
+Ubuntu with ufw: sudo ufw allow 47800/udp
+```
+
+If you use another Linux distribution, look up how to allow a UDP port in its firewall.
+Replace `47800` with the port shown in the presenter if you changed it. A firewalld
+service file (`mirrorwire.xml`, UDP 47800 only) is shipped in the AppImage and Flatpak
+under `share/firewalld/services/`; it only takes effect if it is installed on the host
+(`sudo firewall-cmd --permanent --add-service=mirrorwire && sudo firewall-cmd --reload`).
+See [packaging/linux/README-firewalld.md](packaging/linux/README-firewalld.md).
+
 ## Known limitations and next steps
 
 1. Re-test on the T480s + iMac after this quality/diagnostics build (40 Mbit/s,
    native 1920×1080, firewall hint, GPU convert when VPP is in the runtime).
-2. If firewalld is running: `sudo firewall-cmd --add-port=47800/udp` (add
-   `--permanent` and reload to keep it).
-3. Forward error correction (Reed-Solomon parity per frame) so single packet
+2. Forward error correction (Reed-Solomon parity per frame) so single packet
    losses on Wi-Fi do not cost a keyframe or artifacts.
-4. Zero-copy on the viewer: VideoToolbox -> texture, YUV->RGB in a wgpu shader
+3. Zero-copy on the viewer: VideoToolbox -> texture, YUV->RGB in a wgpu shader
    (the presenter's PipeWire DMA-BUF -> VAAPI path is built; the presenter shows
    "Capture path: dmabuf-zero-copy" when it is active).
-5. Adaptive bitrate from QUIC RTT/loss stats.
-6. Vendor cargo sources (flatpak-cargo-generator) for a Flathub submission; notarized Mac builds.
-7. QR scanning with the viewer's camera, virtual-monitor (extend) mode via portal.
-8. Optional Miracast sink as a second `VideoSink`.
-9. The Android APK is a viewer only, debug-signed (each CI build has a new key: uninstall the old
+4. Adaptive bitrate from QUIC RTT/loss stats.
+5. Vendor cargo sources (flatpak-cargo-generator) for a Flathub submission; notarized Mac builds.
+6. QR scanning with the viewer's camera, virtual-monitor (extend) mode via portal.
+7. Optional Miracast sink as a second `VideoSink`.
+8. The Android APK is a viewer only, debug-signed (each CI build has a new key: uninstall the old
    one before installing a newer build). No browser viewer yet.
 
 ## Contributing

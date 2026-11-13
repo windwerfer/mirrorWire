@@ -31,7 +31,8 @@ impl ConnectInfo {
     }
 
     pub fn to_uri(&self) -> String {
-        let mut url = url::Url::parse(&format!("mirrorwire://{}", self.addr)).expect("valid socket addr");
+        let mut url =
+            url::Url::parse(&format!("mirrorwire://{}", self.addr)).expect("valid socket addr");
         {
             let mut q = url.query_pairs_mut();
             q.append_pair("fp", &self.fingerprint);
@@ -180,6 +181,20 @@ mod tests {
         assert!(uri.starts_with("mirrorwire://192.168.1.20:47800?"));
         assert_eq!(ConnectInfo::parse(&uri).unwrap(), info);
         assert!(qr_terminal(&uri).unwrap().lines().count() > 10);
+    }
+
+    #[test]
+    fn uri_roundtrip_custom_port() {
+        let info = ConnectInfo {
+            addr: "10.0.0.8:47901".parse().unwrap(),
+            addrs: Vec::new(),
+            fingerprint: "cd".repeat(32),
+            pairing_code: Some("654321".into()),
+            name: Some("custom-port".into()),
+        };
+        let uri = info.to_uri();
+        assert!(uri.starts_with("mirrorwire://10.0.0.8:47901?"), "{uri}");
+        assert_eq!(ConnectInfo::parse(&uri).unwrap(), info);
     }
 
     #[test]

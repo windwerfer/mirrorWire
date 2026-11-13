@@ -5,6 +5,8 @@
 
 use crate::pairing::ConnectInfo;
 use mirrorwire_proto::DEFAULT_PORT;
+
+pub use crate::firewall::FirewallHint;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -171,7 +173,12 @@ pub struct IncomingAttempt {
 }
 
 impl IncomingAttempt {
-    pub fn new(peer: impl fmt::Display, viewer_name: Option<String>, ok: bool, outcome: impl Into<String>) -> Self {
+    pub fn new(
+        peer: impl fmt::Display,
+        viewer_name: Option<String>,
+        ok: bool,
+        outcome: impl Into<String>,
+    ) -> Self {
         Self {
             at: local_stamp(),
             peer: peer.to_string(),
@@ -218,7 +225,8 @@ pub fn no_answer_message(addrs: &[SocketAddr], cause: Option<&str>) -> String {
         None => String::new(),
     };
     format!(
-        "No answer from {targets}. {cause}The presenter is visible via mDNS but QUIC packets aren't getting through. Probably a firewall on the presenter. On Fedora: sudo firewall-cmd --add-port={port}/udp"
+        "No answer from {targets}. {cause}The presenter is visible via mDNS but QUIC packets aren't getting through. Probably a firewall on the presenter.\n{}",
+        crate::firewall::guide_text(port)
     )
 }
 
@@ -298,153 +306,6 @@ fn local_hms(_secs: i64) -> Option<(i32, i32, i32)> {
     None
 }
 
-/// Result of a best-effort firewalld probe on Linux. Always safe to show.
-#[derive(Debug, Clone)]
-pub struct FirewallHint {
-    /// `true` when we should draw the hint in the presenter window.
-    pub show: bool,
-    /// `true` when we know firewalld is running and the port is not open.
-    pub prominent: bool,
-    pub message: String,
-    pub command: String,
-}
-
-impl FirewallHint {
-    pub fn for_port(port: u16) -> Self {
-        let command = format!("sudo firewall-cmd --add-port={port}/udp");
-        let static_msg = format!(
-            "If a viewer finds this computer but cannot connect, the firewall may be blocking UDP {port}. On Fedora: {command}"
-        );
-
-        #[cfg(not(target_os = "linux"))]
-        #[allow(clippy::needless_return)] // only "needless" when the linux block is compiled out
-        {
-            let _ = static_msg;
-            return Self {
-                show: false,
-                prominent: false,
-                message: String::new(),
-                command,
-            };
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            match firewalld_state() {
-                Some(state) if state.eq_ignore_ascii_case("running") => {
-                    match firewalld_port_open(port) {
-                        Some(true) => Self {
-                            show: false,
-                            prominent: false,
-                            message: format!("firewalld is running; UDP {port} is already open."),
-                            command,
-                        },
-                        Some(false) => Self {
-                            show: true,
-                            prominent: true,
-                            message: format!(
-                                "firewalld is running and UDP {port} is not open. Viewers can discover this computer but QUIC will time out until you run:\n{command}"
-                            ),
-                            command,
-                        },
-                        None => Self {
-                            show: true,
-                            prominent: true,
-                            message: format!(
-                                "firewalld is running. If a viewer cannot connect, open UDP {port} with:\n{command}"
-                            ),
-                            command,
-                        },
-                    }
-                }
-                Some(_) => Self {
-                    show: false,
-                    prominent: false,
-                    message: "firewalld is not running.".to_owned(),
-                    command,
-                },
-                None => Self {
-                    show: true,
-                    prominent: false,
-                    message: static_msg,
-                    command,
-                },
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn firewalld_state() -> Option<String> {
-    let out = run_maybe_host("firewall-cmd", &["--state"])?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let text = text.trim();
-    if !text.is_empty() {
-        return Some(text.to_owned());
-    }
-    if dbus_firewalld_running() {
-        Some("running".into())
-    } else {
-        None
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn firewalld_port_open(port: u16) -> Option<bool> {
-    let arg = format!("--query-port={port}/udp");
-    let out = run_maybe_host("firewall-cmd", &[&arg])?;
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_ascii_lowercase();
-    if text == "yes" || out.status.success() && text.is_empty() {
-        Some(true)
-    } else if text == "no" || !out.status.success() {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-/// Run a command, falling back to `flatpak-spawn --host` when we are in a sandbox
-/// that has that portal. No extra Flatpak permission is requested; the spawn
-/// simply fails and we treat detection as unavailable.
-#[cfg(target_os = "linux")]
-fn run_maybe_host(program: &str, args: &[&str]) -> Option<std::process::Output> {
-    if let Ok(out) = std::process::Command::new(program).args(args).output() {
-        return Some(out);
-    }
-    let mut cmd = std::process::Command::new("flatpak-spawn");
-    cmd.arg("--host").arg(program).args(args);
-    cmd.output().ok()
-}
-
-#[cfg(target_os = "linux")]
-fn dbus_firewalld_running() -> bool {
-    let attempts = [
-        std::process::Command::new("busctl")
-            .args([
-                "--system",
-                "call",
-                "org.fedoraproject.FirewallD1",
-                "/org/fedoraproject/FirewallD1",
-                "org.fedoraproject.FirewallD1",
-                "getDefaultZone",
-            ])
-            .output(),
-        std::process::Command::new("flatpak-spawn")
-            .args([
-                "--host",
-                "busctl",
-                "--system",
-                "call",
-                "org.fedoraproject.FirewallD1",
-                "/org/fedoraproject/FirewallD1",
-                "org.fedoraproject.FirewallD1",
-                "getDefaultZone",
-            ])
-            .output(),
-    ];
-    attempts.into_iter().any(|r| r.map(|o| o.status.success()).unwrap_or(false))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,7 +316,14 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 201, 132)), 47_800);
         let msg = no_answer_message(&[addr], None);
         assert!(msg.contains("192.168.201.132:47800 (UDP)"), "{msg}");
-        assert!(msg.contains("sudo firewall-cmd --add-port=47800/udp"), "{msg}");
+        assert!(
+            msg.contains("sudo firewall-cmd --add-port=47800/udp"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Ubuntu with ufw: sudo ufw allow 47800/udp"),
+            "{msg}"
+        );
         assert!(msg.contains("mDNS"), "{msg}");
         assert!(msg.contains("QUIC"), "{msg}");
     }
@@ -472,7 +340,8 @@ mod tests {
 
     #[test]
     fn logical_reject_is_not_a_firewall_error() {
-        let err = anyhow::anyhow!("presenter rejected connection: not paired: pairing code required");
+        let err =
+            anyhow::anyhow!("presenter rejected connection: not paired: pairing code required");
         assert!(is_logical_reject(&err));
         assert!(!is_unreachable(&err));
         let err = anyhow::anyhow!("connecting to 192.168.1.2:47800: timed out");
@@ -485,6 +354,9 @@ mod tests {
         let s = local_stamp();
         let parts: Vec<_> = s.split([':', '.']).collect();
         assert_eq!(parts.len(), 4, "{s}");
-        assert!(parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())), "{s}");
+        assert!(
+            parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())),
+            "{s}"
+        );
     }
 }

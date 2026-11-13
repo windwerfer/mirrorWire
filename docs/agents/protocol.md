@@ -6,6 +6,9 @@ Everything here lives in `mirrorwire-proto` (constants, framing) and `mirrorwire
 ## 1. Connection
 
 - QUIC over UDP, default port **47800** (`DEFAULT_PORT`), ALPN **`mirrorwire/1`** (`ALPN`).
+  The presenter port is configurable (`--port`, `MIRRORWIRE_PORT`, saved `settings.json`).
+  A changed port is advertised in mDNS (`ServiceInfo` port) and in the URI (`mirrorwire://ip:port?…`);
+  the viewer always uses the advertised port, never a hard-coded 47800.
 - TLS 1.3 with self-signed certificates on both sides (`rcgen`, ring provider).
   - The viewer's verifier accepts the presenter's cert **only** if its SHA-256 fingerprint
     (64 lowercase hex chars) equals the pinned one from the URI/mDNS.

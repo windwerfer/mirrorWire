@@ -32,8 +32,12 @@ sharp text, and no special privileges.
    `/dev/uinput`, KMS/DRM grabbing or X11-only capture paths. Screen capture goes through the
    xdg-desktop-portal ScreenCast API and PipeWire only.
 2. **No new Flatpak permissions.** The `finish-args` in
-   `packaging/flatpak/io.github.windwerfer.MirrorWire.yml` are the ceiling. No `--filesystem`,
-   no `--device=all`, no `--talk-name` beyond what portals need. Adding one needs the owner.
+   `packaging/flatpak/io.github.windwerfer.MirrorWire.yml` are the ceiling:
+   `--socket=wayland`, `--socket=fallback-x11`, `--share=ipc`, `--share=network`,
+   `--device=dri`, and `--system-talk-name=org.fedoraproject.FirewallD1` (owner-approved,
+   so the presenter can query or open its UDP port through firewalld; a password prompt
+   may appear). No `--filesystem`, no `--device=all`, no other `--talk-name`. Adding
+   another permission needs the owner.
 3. **The security model stays:** QUIC with TLS 1.3, a self-signed per-install certificate, the
    viewer pins the presenter's SHA-256 fingerprint, and the presenter only streams to a viewer
    that showed the pairing code once (then remembered by certificate fingerprint). Never add a

@@ -38,6 +38,10 @@ chmod +x "$WORK/linuxdeploy" "$WORK/linuxdeploy-plugin-appimage"
 export PATH="$WORK:$PATH"
 export APPIMAGE_EXTRACT_AND_RUN=1
 export OUTPUT="$OUT/MirrorWire-x86_64.AppImage"
+# For packagers: host firewalld will not see this path inside the AppImage.
+mkdir -p "$WORK/AppDir/usr/share/firewalld/services" "$WORK/AppDir/usr/share/doc/mirrorwire"
+cp "$ROOT/packaging/linux/mirrorwire.xml" "$WORK/AppDir/usr/share/firewalld/services/mirrorwire.xml"
+cp "$ROOT/packaging/linux/README-firewalld.md" "$WORK/AppDir/usr/share/doc/mirrorwire/README-firewalld.md"
 "$WORK/linuxdeploy" \
   --appdir "$WORK/AppDir" \
   --executable "$ROOT/target/release/mirrorwire" \

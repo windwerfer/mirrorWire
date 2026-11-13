@@ -5,9 +5,20 @@
 mDNS working proves multicast gets through, not that UDP 47800 does.
 
 1. **Firewall on the presenter (most common on Fedora).** firewalld allows mDNS but blocks
-   47800/udp silently.
-   `sudo firewall-cmd --add-port=47800/udp` (until reboot), then
-   `sudo firewall-cmd --permanent --add-port=47800/udp`. This fixed the first real test.
+   the presenter UDP port (default 47800) silently. In the presenter window, use
+   **Open port in firewall** if it is offered (a password prompt may appear; the app
+   does not run as root). Otherwise:
+
+   ```
+   On Fedora: sudo firewall-cmd --add-port=47800/udp
+   To keep it after a reboot: sudo firewall-cmd --permanent --add-port=47800/udp && sudo firewall-cmd --reload
+   Ubuntu with ufw: sudo ufw allow 47800/udp
+   ```
+
+   If you use another Linux distribution, look up how to allow a UDP port in its firewall.
+   Replace `47800` with the port shown in the presenter if it was changed. The same
+   short guide is in the README troubleshooting section. This (`firewall-cmd --add-port`)
+   fixed the first real test.
 2. **Wrong address.** Check the presenter panel's "Listening on" and the IP in the viewer's
    list/URI. VPNs, Docker bridges and a second NIC can make mDNS advertise an unreachable
    address. Try the pasted URI with the right IP, or `--advertise-ip`.

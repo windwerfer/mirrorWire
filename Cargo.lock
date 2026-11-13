@@ -2165,6 +2165,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "zbus",
 ]
 
 [[package]]
@@ -3967,6 +3968,7 @@ dependencies = [
  "signal-hook-registry",
  "socket2",
  "tokio-macros",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -5127,6 +5129,7 @@ dependencies = [
  "serde_repr",
  "socket2",
  "tokio",
+ "tracing",
  "uds_windows",
  "uuid",
  "windows-sys 0.61.2",
@@ -5271,6 +5274,7 @@ checksum = "23ef5ed7d628cdf0af82f93dfe03330a8e37383bf7422a1d3d6eb72326680be5"
 dependencies = [
  "futures-core",
  "futures-io",
+ "tracing",
 ]
 
 [[package]]

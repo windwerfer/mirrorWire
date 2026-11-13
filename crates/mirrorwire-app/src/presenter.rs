@@ -10,12 +10,13 @@ use mirrorwire_media::pipeline::{
 };
 use mirrorwire_media::source::testpattern::TestPattern;
 use mirrorwire_media::source::FrameSource;
-#[cfg(feature = "gui")]
 use mirrorwire_net::diag::FirewallHint;
 use mirrorwire_net::diag::IncomingAttempt;
 use mirrorwire_net::discovery::Advertisement;
 use mirrorwire_net::identity::{short_fingerprint, Identity};
-use mirrorwire_net::pairing::{lan_ipv4s, primary_ipv4, qr_terminal, random_pairing_code, ConnectInfo};
+use mirrorwire_net::pairing::{
+    lan_ipv4s, primary_ipv4, qr_terminal, random_pairing_code, ConnectInfo,
+};
 use mirrorwire_net::transport::{OutgoingFrame, Presenter, PresenterConfig};
 use mirrorwire_proto::control::StreamInfo;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -72,8 +73,9 @@ pub struct PresentArgs {
     /// Spread intra coding over frames instead of sending large keyframes.
     #[arg(long)]
     intra_refresh: bool,
-    #[arg(long, default_value_t = mirrorwire_proto::DEFAULT_PORT)]
-    port: u16,
+    /// Set from the global `--port` / `MIRRORWIRE_PORT` / saved settings in `main`.
+    #[arg(skip)]
+    pub port: u16,
     /// Address to bind (default: all interfaces).
     #[arg(long)]
     bind: Option<IpAddr>,
@@ -277,6 +279,12 @@ impl PresenterHandle {
     pub fn apply_settings(&self, cfg: EncoderConfig) {
         *self.settings.lock().expect("encoder settings") = cfg;
         self.controls.request_keyframe();
+    }
+
+    pub fn refresh_firewall(&self) {
+        let port = self.status.lock().expect("present status").port;
+        let hint = FirewallHint::for_port(port);
+        self.status.lock().expect("present status").firewall = Some(hint);
     }
 
     pub fn poll(&self) -> PresentStatus {
@@ -560,7 +568,12 @@ struct EncodeHudShim {
 }
 
 impl EncodeHudShim {
-    fn note_frame(&mut self, enc: &mirrorwire_media::encode::Encoder, capture_w: u32, capture_h: u32) {
+    fn note_frame(
+        &mut self,
+        enc: &mirrorwire_media::encode::Encoder,
+        capture_w: u32,
+        capture_h: u32,
+    ) {
         let (p, c, u, e) = enc.last_breakdown_ms();
         self.pack_ms = p;
         self.convert_ms = c;
@@ -669,7 +682,9 @@ pub fn run(args: PresentArgs, config_dir: &Path) -> Result<()> {
             println!("{}", qr_terminal(&ready.uri)?);
             println!(
                 "presenter \"{}\" listening on {} (UDP {})",
-                ready.name, ready.listen_addr, ready.listen_addr.port()
+                ready.name,
+                ready.listen_addr,
+                ready.listen_addr.port()
             );
             if !ready.advertised.is_empty() {
                 println!(
@@ -690,6 +705,13 @@ pub fn run(args: PresentArgs, config_dir: &Path) -> Result<()> {
                 println!("pairing code {code}");
             }
             println!("{}", ready.uri);
+            let hint = FirewallHint::for_port(ready.listen_addr.port());
+            if hint.show {
+                println!("{}", hint.message);
+                if !hint.guide.is_empty() {
+                    println!("{}", hint.guide);
+                }
+            }
             Ok(())
         },
     );
@@ -725,7 +747,8 @@ pub fn spawn(
     let name = args.name.clone().unwrap_or_else(crate::default_name);
     let port = args.port;
     let settings = Arc::new(Mutex::new(
-        args.encoder_config().unwrap_or_else(|_| EncoderConfig::default()),
+        args.encoder_config()
+            .unwrap_or_else(|_| EncoderConfig::default()),
     ));
     let attempts = Arc::new(Mutex::new(Vec::new()));
     let hud = Arc::new(Mutex::new(EncodeHudShim::default()));

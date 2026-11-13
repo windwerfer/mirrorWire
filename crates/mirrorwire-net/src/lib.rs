@@ -1,8 +1,10 @@
 pub mod diag;
-mod lan_cc;
 pub mod discovery;
+pub mod firewall;
 pub mod identity;
+mod lan_cc;
 pub mod pairing;
+pub mod settings;
 pub mod tls;
 pub mod transport;
 

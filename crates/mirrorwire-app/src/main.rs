@@ -29,6 +29,11 @@ struct Cli {
     #[arg(long, global = true, value_enum, value_name = "gl|wgpu|auto")]
     renderer: Option<RendererChoice>,
 
+    /// UDP port the presenter binds and advertises (default: 47800, or
+    /// MIRRORWIRE_PORT, or the port saved in the GUI). 0 picks an ephemeral port.
+    #[arg(long, global = true)]
+    port: Option<u16>,
+
     /// Without a subcommand the start screen opens (Present / View).
     #[command(subcommand)]
     command: Option<Command>,
@@ -119,11 +124,30 @@ fn main() -> Result<()> {
     let config_dir = mirrorwire_net::config_dir(cli.config_dir.as_deref());
     let renderer = resolve_renderer(cli.renderer);
 
+    let port = mirrorwire_net::settings::resolve_port(cli.port, &config_dir);
+
     match cli.command {
-        None => run_gui(GuiLaunch::Home, ViewArgs::default(), &config_dir, renderer, log, None),
-        Some(Command::Present(args)) => presenter::run(args, &config_dir),
+        None => run_gui(
+            GuiLaunch::Home,
+            ViewArgs::default(),
+            &config_dir,
+            renderer,
+            log,
+            Some(port),
+        ),
+        Some(Command::Present(mut args)) => {
+            args.port = port;
+            presenter::run(args, &config_dir)
+        }
         Some(Command::View(args)) if args.headless => viewer::run_headless(args, &config_dir),
-        Some(Command::View(args)) => run_gui(GuiLaunch::View, args, &config_dir, renderer, log, None),
+        Some(Command::View(args)) => run_gui(
+            GuiLaunch::View,
+            args,
+            &config_dir,
+            renderer,
+            log,
+            Some(port),
+        ),
         Some(Command::Discover { seconds }) => {
             let found = mirrorwire_net::discovery::Browser::start()?
                 .browse_for(Duration::from_secs_f64(seconds));
@@ -134,7 +158,11 @@ fn main() -> Result<()> {
                 let addrs = if p.addrs.is_empty() {
                     p.addr.to_string()
                 } else {
-                    p.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",")
+                    p.addrs
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
                 };
                 println!(
                     "{}  {}  {}  {}",
@@ -191,7 +219,14 @@ fn run_gui(
     log: applog::LogStore,
     port: Option<u16>,
 ) -> Result<()> {
-    gui::run(launch, args, config_dir, renderer, log, port.unwrap_or(mirrorwire_proto::DEFAULT_PORT))
+    gui::run(
+        launch,
+        args,
+        config_dir,
+        renderer,
+        log,
+        port.unwrap_or(mirrorwire_proto::DEFAULT_PORT),
+    )
 }
 
 #[cfg(not(feature = "gui"))]

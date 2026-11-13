@@ -8,7 +8,7 @@ A Cargo workspace with five crates. Lower layers never depend on higher ones.
 |---|---|---|---|
 | L0 | `mirrorwire-proto` | Wire format: datagram fragment header, fragmentation and reassembly, control messages (JSON over a length-prefixed stream), clock-offset estimation, latency statistics, protocol constants (`PROTOCOL_VERSION`, `ALPN`, `MDNS_SERVICE`, `DEFAULT_PORT`). **No I/O, no async, no FFmpeg.** | `bytes`, `serde`, `serde_json`, `anyhow` only |
 | L1 | `mirrorwire-media` | Frame sources (test pattern, portal + PipeWire), H.264 encoder and decoder via FFmpeg (VAAPI / VideoToolbox / x264), YUV→RGBA conversion, the capture→encode loop and the `VideoSink` trait. | `mirrorwire-proto` |
-| L1 | `mirrorwire-net` | Identity (self-signed cert), pinned TLS verifiers, QUIC presenter/viewer sessions, pairing (`paired_viewers.json`, pairing code, `mirrorwire://` URI, QR), mDNS announce/browse. | `mirrorwire-proto` |
+| L1 | `mirrorwire-net` | Identity (self-signed cert), pinned TLS verifiers, QUIC presenter/viewer sessions, pairing (`paired_viewers.json`, pairing code, `mirrorwire://` URI, QR), mDNS announce/browse, persisted presenter settings (`settings.json`), Linux firewall detection and a best-effort firewalld D-Bus open-port request. | `mirrorwire-proto` |
 | L2 | `mirrorwire-app` | The `mirrorwire` binary: CLI (`present`, `view`, `view --headless`, `discover`), presenter and viewer glue, the egui GUI (start screen, presenter status, viewer list, video, stats overlay). | all of the above |
 | L2 | `mirrorwire-android` | The Android viewer: `libmirrorwire_android.so` loaded by the APK. egui (glow) via `android-activity` NativeActivity, MediaCodec decode (`ndk` crate, `AImageReader` → CPU BT.709 → texture), the viewer receive loop. No FFmpeg. On non-Android targets only its pure helpers (`h264`, `yuv`) compile, so host `cargo test` covers them. | `mirrorwire-proto`, `mirrorwire-net` |
 
@@ -106,8 +106,16 @@ macOS: `~/Library/Application Support/mirrorwire`), overridable with `--config-d
 | `identity.cert.der`, `identity.key.der` | both | per-install self-signed cert and key (key file mode 0600) |
 | `paired_viewers.json` | presenter | fingerprints and names of viewers that showed the pairing code |
 | `portal_restore_token` | presenter (Linux) | ScreenCast restore token, so the share dialog appears once |
+| `settings.json` | presenter | Saved UDP port from the start-screen field. Overridden by `--port` or `MIRRORWIRE_PORT` for one run. |
 
 Deleting the directory resets identity and pairings; viewers then see a new fingerprint.
+
+The presenter UDP port defaults to 47800. A changed port is what mDNS advertises and
+what the QR/`mirrorwire://` URI contains, so the viewer does not need a matching
+setting. On Linux the presenter probes firewalld over the system bus when it can
+(and ufw's readable config otherwise). If the port looks blocked, the GUI offers
+**Open port in firewall** (D-Bus add-port, polkit prompt, runtime + permanent) or
+the short general guide. The app never runs as root.
 
 ## 5. Packaging
 

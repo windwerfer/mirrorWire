@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>MirrorWire</short>
+  <description>Low-latency LAN screen mirroring (QUIC over UDP).</description>
+  <port protocol="udp" port="47800"/>
+</service>

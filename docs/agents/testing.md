@@ -28,7 +28,7 @@ the diff readable. See [roadmap.md](roadmap.md) "Known debt".
 | Kind | Where | What it proves |
 |---|---|---|
 | Unit | `#[cfg(test)]` in `mirrorwire-proto` | header encode/parse, fragmentation and reassembly (loss, reordering, late fragments), control framing, clock offset, stats |
-| Unit | `#[cfg(test)]` in `mirrorwire-net` | identity load/create, URI round trip and rejection of bad fingerprints, QR generation |
+| Unit | `#[cfg(test)]` in `mirrorwire-net` | identity load/create, URI round trip (including a non-default port) and rejection of bad fingerprints, QR generation, port settings precedence, firewall guide text, ufw rule parsing |
 | Unit (FilmCraft) | `mirrorwire-media/src/filmcraft.rs`, feature `filmcraft` | FilmCraft output via the real `Encoder` decodes with FFmpeg, markers read back, keyframe on request; an `#[ignore]` x264-vs-FilmCraft benchmark |
 | Loopback (end to end) | `scripts/loopback-test.sh` | test pattern → encoder → QUIC (pinned TLS, pairing) → reassembly → decoder, on localhost, with latency stats |
 | Real hardware | the owner's T480s + iMac | portal capture, VAAPI, Wi-Fi, OpenGL on a non-Metal Mac (only he can run this) |
@@ -117,8 +117,8 @@ screen**, not logs. So:
 - Every state and error must be readable in the window: presenter status panel (phase,
   listen address, encoder, source, fingerprint, pairing code, connected viewer) and viewer
   connection status and stats overlay (`S`).
-- Error messages say what to do ("no answer from 192.168.1.20:47800 — check the presenter's
-  firewall for UDP 47800"), not just what failed.
+- Error messages say what to do ("No answer from 192.168.1.20:47800 (UDP). … On Fedora:
+  sudo firewall-cmd --add-port=47800/udp"), not just what failed.
 - Ask for exactly what you need ("press S and photograph the top-left corner").
 - Don't ask him to install a toolchain on the iMac for routine debugging; build artifacts in CI.
 

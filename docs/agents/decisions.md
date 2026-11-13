@@ -7,7 +7,7 @@ agrees, update the entry (status, date, reason) in the same commit as the change
 | # | Decision | Why |
 |---|---|---|
 | D1 | **No special privileges.** Capture only via xdg-desktop-portal ScreenCast + PipeWire. No root, `setcap`, KMS/DRM capture, kernel modules, uinput. | The owner refuses tools that need elevated rights (the reason Sunshine was ruled out). Portals are the sanctioned Wayland path and work in a Flatpak. |
-| D2 | **Flatpak-friendly, minimal permissions.** `finish-args`: `--socket=wayland`, `--socket=fallback-x11`, `--share=ipc`, `--share=network`, `--device=dri`. Nothing else. | Sandboxed install without extra rights. Screen capture needs no permission because the portal asks the user. |
+| D2 | **Flatpak-friendly, minimal permissions.** `finish-args`: `--socket=wayland`, `--socket=fallback-x11`, `--share=ipc`, `--share=network`, `--device=dri`, `--system-talk-name=org.fedoraproject.FirewallD1`. Nothing else. | Sandboxed install without extra rights. Screen capture needs no permission because the portal asks the user. The firewalld name was added with the owner's approval (2026-11) so the presenter can detect a blocked port and offer a polkit-authenticated Open-port button; the app never runs as root. |
 | D3 | **Transport: QUIC (`quinn`).** Video as unreliable datagrams with per-frame fragmentation; one reliable bidirectional control stream. | Low latency without TCP head-of-line blocking; TLS 1.3 built in; one UDP port. |
 | D4 | **Security: pinned self-signed certs + pairing code.** Each install generates a cert once. The viewer pins the presenter's SHA-256 fingerprint (from QR/URI or mDNS). The presenter streams only to a viewer that sent the 6-digit pairing code once, then remembers it by client-cert fingerprint. No plaintext or skip-verify mode. | "Secure and easy": no CA, no accounts, keys generated once. |
 | D5 | **Identifiers:** app id `io.github.windwerfer.MirrorWire`; mDNS service `_mirrorwire._udp`; default UDP port `47800`; ALPN `mirrorwire/1`; URI scheme `mirrorwire://`; config dir name `mirrorwire`. | Users' firewall rules (firewalld `47800/udp`), pairings and launchers depend on them. |
@@ -32,6 +32,16 @@ agrees, update the entry (status, date, reason) in the same commit as the change
 
 Newest first. Add an entry when the owner decides something non-obvious.
 
+- **2026-11 (Presenter port and firewall):** the owner does not want a "magic always-open
+  port" (none exists across distros). Keep default UDP 47800 (D5). The port is configurable
+  (`--port`, `MIRRORWIRE_PORT`, a saved field on the presenter start screen). mDNS and the
+  QR/URI already carry the port, so the viewer finds a changed port automatically. If a
+  firewall is detected, the presenter shows a prompt: an **Open port in firewall** button
+  when firewalld is reachable over D-Bus (polkit password prompt, runtime + permanent),
+  otherwise a short general guide (Fedora `firewall-cmd`, one Ubuntu `ufw` line, and "look
+  up your own distro if different") — not a list of every OS. The same guide is in the
+  README troubleshooting section. A `mirrorwire.xml` firewalld service (UDP 47800) is
+  shipped in the Flatpak/AppImage for packagers; it only works once installed on the host.
 - **2026-11 (FilmCraft encoder built):** `filmcraft-h264enc` is an optional presenter encoder
   behind cargo feature `filmcraft` (`--encoder filmcraft`, or the Encoder selector in the
   presenter's Quality panel). FFmpeg stays the default; `auto` never picks FilmCraft. The git
