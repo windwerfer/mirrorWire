@@ -17,7 +17,7 @@ mirrorwire-proto = { path = "../mirrorwire-proto" }
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.14"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 mdns-sd = "0.21"
 qrcode = { version = "0.14", default-features = false }
