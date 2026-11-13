@@ -5,11 +5,6 @@
 //! is a polkit-authenticated D-Bus call: the app itself never runs as root.
 //! If firewalld is not available, a short general guide is shown instead.
 
-#[cfg(target_os = "linux")]
-use mirrorwire_proto::DEFAULT_PORT;
-#[cfg(target_os = "linux")]
-use std::fmt;
-
 /// firewalld service name that matches `packaging/linux/mirrorwire.xml`.
 pub const FIREWALLD_SERVICE: &str = "mirrorwire";
 
@@ -94,12 +89,15 @@ impl FirewallHint {
         }
         #[cfg(target_os = "linux")]
         {
-            open_port_linux(port)
+            system::open_port(port)
         }
     }
 }
 
 #[cfg(target_os = "linux")]
+mod system;
+
+#[cfg(any(test, target_os = "linux"))]
 fn intro(port: u16) -> String {
     format!(
         "If a viewer finds this computer but cannot connect, the firewall may be blocking UDP {port}."
@@ -108,68 +106,59 @@ fn intro(port: u16) -> String {
 
 #[cfg(target_os = "linux")]
 fn probe_linux(port: u16, command: String, guide: String) -> FirewallHint {
-    match probe_firewalld(port) {
-        Some(Probe {
-            running: true,
-            port_open: Some(true),
+    hint_from_probe(port, command, guide, system::probe_firewalld(port), || {
+        probe_ufw(port, UfwPaths::system())
+    })
+}
+
+/// The hint for what the firewalld probe found; `ufw` is only consulted when
+/// firewalld is not running.
+#[cfg(any(test, target_os = "linux"))]
+fn hint_from_probe(
+    port: u16,
+    command: String,
+    guide: String,
+    probe: Option<Probe>,
+    ufw: impl FnOnce() -> Option<UfwState>,
+) -> FirewallHint {
+    let hint = |show, prominent, message: String, can_autofix| FirewallHint {
+        show,
+        prominent,
+        message,
+        guide: guide.clone(),
+        command: command.clone(),
+        can_autofix,
+        port,
+    };
+    match probe {
+        Some(Probe { running: true, port_open: Some(true), can_autofix }) => hint(
+            false,
+            false,
+            format!("firewalld is running; UDP {port} is already open."),
             can_autofix,
-        }) => FirewallHint {
-            show: false,
-            prominent: false,
-            message: format!("firewalld is running; UDP {port} is already open."),
-            guide,
-            command,
-            can_autofix,
-            port,
-        },
-        Some(Probe {
-            running: true,
-            port_open: Some(false),
-            can_autofix,
-        }) => FirewallHint {
-            show: true,
-            prominent: true,
-            message: format!(
+        ),
+        Some(Probe { running: true, port_open: Some(false), can_autofix }) => hint(
+            true,
+            true,
+            format!(
                 "firewalld is running and UDP {port} is not open. Viewers can discover this computer but the connection will time out until the port is opened."
             ),
-            guide,
-            command,
             can_autofix,
-            port,
+        ),
+        Some(Probe { running: true, port_open: None, can_autofix }) => hint(
+            true,
+            true,
+            format!("firewalld is running. If a viewer cannot connect, UDP {port} may be blocked."),
+            can_autofix,
+        ),
+        Some(Probe { running: false, .. }) | None => match ufw() {
+            Some(state) => ufw_hint(port, state, guide.clone()),
+            None => hint(true, false, intro(port), false),
         },
-        Some(Probe {
-            running: true,
-            port_open: None,
-            can_autofix,
-        }) => FirewallHint {
-            show: true,
-            prominent: true,
-            message: format!(
-                "firewalld is running. If a viewer cannot connect, UDP {port} may be blocked."
-            ),
-            guide,
-            command,
-            can_autofix,
-            port,
-        },
-        Some(Probe { running: false, .. }) | None => {
-            if let Some(ufw) = probe_ufw(port, UfwPaths::system()) {
-                return ufw_hint(port, ufw, guide);
-            }
-            FirewallHint {
-                show: true,
-                prominent: false,
-                message: intro(port),
-                guide,
-                command,
-                can_autofix: false,
-                port,
-            }
-        }
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 fn ufw_hint(port: u16, state: UfwState, guide: String) -> FirewallHint {
     let command = ufw_command(port);
     match state {
@@ -216,373 +205,106 @@ fn ufw_hint(port: u16, state: UfwState, guide: String) -> FirewallHint {
     }
 }
 
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy)]
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Probe {
     running: bool,
     port_open: Option<bool>,
     can_autofix: bool,
 }
 
-#[cfg(target_os = "linux")]
-fn probe_firewalld(port: u16) -> Option<Probe> {
-    if let Some(probe) = dbus_probe(port) {
-        return Some(probe);
-    }
-    // Native installs (and rare cases where D-Bus is blocked but firewall-cmd
-    // is on PATH). In a Flatpak this usually fails; that's fine.
-    cmd_probe(port)
-}
-
-#[cfg(target_os = "linux")]
-fn dbus_probe(port: u16) -> Option<Probe> {
-    match block_on_dbus(async move { dbus_probe_async(port).await }) {
-        Ok(probe) => Some(probe),
-        Err(e) => {
-            tracing::debug!("firewalld D-Bus probe failed: {e}");
-            None
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-async fn dbus_probe_async(port: u16) -> Result<Probe, String> {
-    let conn = system_connection().await?;
-    let zones = active_or_default_zones(&conn).await?;
-    let open = port_open_in_zones(&conn, &zones, port).await;
-    Ok(Probe {
-        running: true,
-        port_open: open,
-        can_autofix: true,
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn cmd_probe(port: u16) -> Option<Probe> {
-    let state = run_maybe_host("firewall-cmd", &["--state"])?;
-    let text = String::from_utf8_lossy(&state.stdout);
+/// `firewall-cmd --state` output -> probe (`None`: no firewall-cmd answer).
+/// `query_port` is only run when firewalld is running.
+#[cfg(any(test, target_os = "linux"))]
+fn probe_from_state(
+    text: &str,
+    success: bool,
+    query_port: impl FnOnce() -> Option<bool>,
+) -> Option<Probe> {
     let text = text.trim();
-    if text.is_empty() && !state.status.success() {
+    if text.is_empty() && !success {
         return None;
     }
-    if !text.eq_ignore_ascii_case("running") && !state.status.success() {
+    if !text.eq_ignore_ascii_case("running") {
         return Some(Probe {
             running: false,
             port_open: None,
             can_autofix: false,
         });
     }
-    if !text.eq_ignore_ascii_case("running") && text.is_empty() {
-        return Some(Probe {
-            running: false,
-            port_open: None,
-            can_autofix: false,
-        });
-    }
-    if !text.is_empty() && !text.eq_ignore_ascii_case("running") {
-        return Some(Probe {
-            running: false,
-            port_open: None,
-            can_autofix: false,
-        });
-    }
-    let open = cmd_port_open(port);
     Some(Probe {
         running: true,
-        port_open: open,
+        port_open: query_port(),
         can_autofix: false,
     })
 }
 
-#[cfg(target_os = "linux")]
-fn cmd_port_open(port: u16) -> Option<bool> {
-    let arg = format!("--query-port={port}/udp");
-    let out = run_maybe_host("firewall-cmd", &[&arg])?;
-    let text = String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .to_ascii_lowercase();
-    if text == "yes" || (out.status.success() && text.is_empty()) {
+/// `firewall-cmd --query-port=P/udp` output -> open?
+#[cfg(any(test, target_os = "linux"))]
+fn parse_query_port(text: &str, success: bool) -> Option<bool> {
+    let text = text.trim().to_ascii_lowercase();
+    if text == "yes" || (success && text.is_empty()) {
         Some(true)
-    } else if text == "no" || !out.status.success() {
+    } else if text == "no" || !success {
         Some(false)
     } else {
         None
     }
 }
 
-/// Run a command, falling back to `flatpak-spawn --host` when that portal exists.
-/// No extra Flatpak permission is requested; the spawn simply fails.
-#[cfg(target_os = "linux")]
-fn run_maybe_host(program: &str, args: &[&str]) -> Option<std::process::Output> {
-    if let Ok(out) = std::process::Command::new(program).args(args).output() {
-        return Some(out);
-    }
-    let mut cmd = std::process::Command::new("flatpak-spawn");
-    cmd.arg("--host").arg(program).args(args);
-    cmd.output().ok()
-}
-
-#[cfg(target_os = "linux")]
-fn open_port_linux(port: u16) -> Result<String, String> {
-    block_on_dbus(async move { open_port_async(port).await })
-}
-
-#[cfg(target_os = "linux")]
-async fn open_port_async(port: u16) -> Result<String, String> {
-    let conn = system_connection().await?;
-    let zones = active_or_default_zones(&conn).await?;
-    if zones.is_empty() {
-        return Err("firewalld is running but no zone was found to add the port to.".into());
-    }
-
-    let mut runtime_ok = 0usize;
-    let mut permanent_ok = 0usize;
-    let mut last_err: Option<String> = None;
-    for zone in &zones {
-        match zone_add_port_runtime(&conn, zone, port).await {
-            Ok(()) => runtime_ok += 1,
-            Err(e) => last_err = Some(e),
-        }
-        match zone_add_port_permanent(&conn, zone, port).await {
-            Ok(()) => permanent_ok += 1,
-            Err(e) => last_err = Some(e),
-        }
-        if port == DEFAULT_PORT {
-            let _ = zone_add_service_runtime(&conn, zone).await;
-            let _ = zone_add_service_permanent(&conn, zone).await;
-        }
-    }
-
-    if runtime_ok == 0 && permanent_ok == 0 {
-        return Err(last_err.unwrap_or_else(|| {
-            "firewalld did not accept the request. A password prompt may have been cancelled."
-                .into()
-        }));
-    }
-    if runtime_ok > 0 && permanent_ok > 0 {
-        Ok(format!(
-            "Opened UDP {port} in firewalld (now, and after a reboot)."
-        ))
-    } else if runtime_ok > 0 {
-        Ok(format!(
-            "Opened UDP {port} in firewalld until the next reboot. To keep it: {} && sudo firewall-cmd --reload",
-            fedora_permanent_command(port)
-        ))
-    } else {
-        Ok(format!(
-            "Added UDP {port} to the permanent firewalld configuration. Run sudo firewall-cmd --reload (or reopen the port) to apply it now."
-        ))
-    }
-}
-
-#[cfg(target_os = "linux")]
-const DBUS_DEST: &str = "org.fedoraproject.FirewallD1";
-#[cfg(target_os = "linux")]
-const DBUS_PATH: &str = "/org/fedoraproject/FirewallD1";
-#[cfg(target_os = "linux")]
-const DBUS_IFACE: &str = "org.fedoraproject.FirewallD1";
-#[cfg(target_os = "linux")]
-const DBUS_ZONE_IFACE: &str = "org.fedoraproject.FirewallD1.zone";
-#[cfg(target_os = "linux")]
-const DBUS_CONFIG_IFACE: &str = "org.fedoraproject.FirewallD1.config";
-#[cfg(target_os = "linux")]
-const DBUS_CONFIG_PATH: &str = "/org/fedoraproject/FirewallD1/config";
-#[cfg(target_os = "linux")]
-const DBUS_CONFIG_ZONE_IFACE: &str = "org.fedoraproject.FirewallD1.config.zone";
-
-#[cfg(target_os = "linux")]
-async fn system_connection() -> Result<zbus::Connection, String> {
-    zbus::connection::Builder::system()
-        .method_timeout(std::time::Duration::from_secs(120))
-        .build()
-        .await
-        .map_err(dbus_err)
-}
-
-#[cfg(target_os = "linux")]
-async fn iface<'a>(
-    conn: &'a zbus::Connection,
-    path: &'a str,
-    interface: &'a str,
-) -> Result<zbus::Proxy<'a>, String> {
-    zbus::Proxy::new(conn, DBUS_DEST, path, interface)
-        .await
-        .map_err(dbus_err)
-}
-
-#[cfg(target_os = "linux")]
-async fn active_or_default_zones(conn: &zbus::Connection) -> Result<Vec<String>, String> {
-    let proxy = iface(conn, DBUS_PATH, DBUS_IFACE).await?;
-    let default_zone: String = proxy.call("getDefaultZone", &()).await.map_err(dbus_err)?;
-    let active: std::collections::HashMap<String, Vec<String>> =
-        match proxy.call("getActiveZones", &()).await {
-            Ok(map) => map,
-            Err(e) => {
-                tracing::debug!("firewalld getActiveZones failed: {e}");
-                Default::default()
-            }
-        };
-    let mut zones: Vec<String> = active.into_keys().collect();
-    if zones.is_empty() {
-        if !default_zone.is_empty() {
-            zones.push(default_zone);
-        }
-    } else if !default_zone.is_empty() && !zones.iter().any(|z| z == &default_zone) {
+/// Active zones plus the default zone, sorted, without duplicates.
+#[cfg(any(test, target_os = "linux"))]
+fn merge_zones(default_zone: String, active: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut zones: Vec<String> = active.into_iter().collect();
+    if !default_zone.is_empty() {
         zones.push(default_zone);
     }
     zones.sort();
     zones.dedup();
-    Ok(zones)
+    zones
 }
 
-#[cfg(target_os = "linux")]
-async fn port_open_in_zones(conn: &zbus::Connection, zones: &[String], port: u16) -> Option<bool> {
-    if zones.is_empty() {
-        return None;
-    }
+/// Combine per-zone answers: open only if every zone that answered allows
+/// the port; `None` when no zone answered.
+#[cfg(any(test, target_os = "linux"))]
+fn all_zones_open(answers: impl IntoIterator<Item = Option<bool>>) -> Option<bool> {
     let mut known = false;
     let mut all_open = true;
-    for zone in zones {
-        match zone_allows(conn, zone, port).await {
-            Some(true) => known = true,
-            Some(false) => {
-                known = true;
-                all_open = false;
-            }
-            None => {}
-        }
+    for answer in answers.into_iter().flatten() {
+        known = true;
+        all_open &= answer;
     }
     known.then_some(all_open)
 }
 
-#[cfg(target_os = "linux")]
-async fn zone_allows(conn: &zbus::Connection, zone: &str, port: u16) -> Option<bool> {
-    let proxy = iface(conn, DBUS_PATH, DBUS_ZONE_IFACE).await.ok()?;
-    let port_s = port.to_string();
-    let by_port: Option<bool> = match proxy
-        .call("queryPort", &(zone, port_s.as_str(), "udp"))
-        .await
-    {
-        Ok(v) => Some(v),
-        Err(e) => {
-            tracing::debug!("firewalld queryPort({zone}, {port}/udp) failed: {e}");
-            None
-        }
-    };
-    if by_port == Some(true) {
-        return Some(true);
-    }
-    if port == DEFAULT_PORT {
-        match proxy.call("queryService", &(zone, FIREWALLD_SERVICE)).await {
-            Ok(true) => return Some(true),
-            Ok(false) => {}
-            Err(e) => {
-                tracing::debug!("firewalld queryService({zone}, {FIREWALLD_SERVICE}) failed: {e}");
-            }
-        }
-    }
-    by_port
-}
-
-#[cfg(target_os = "linux")]
-async fn zone_add_port_runtime(
-    conn: &zbus::Connection,
-    zone: &str,
+/// User-facing result of an open-port request over `zones` zones.
+#[cfg(any(test, target_os = "linux"))]
+fn open_port_message(
     port: u16,
-) -> Result<(), String> {
-    let proxy = iface(conn, DBUS_PATH, DBUS_ZONE_IFACE).await?;
-    let result: Result<(), zbus::Error> = proxy
-        .call("addPort", &(zone, port.to_string(), "udp", 0i32))
-        .await;
-    accept_already_enabled(result)
-}
-
-#[cfg(target_os = "linux")]
-async fn zone_add_service_runtime(conn: &zbus::Connection, zone: &str) -> Result<(), String> {
-    let proxy = iface(conn, DBUS_PATH, DBUS_ZONE_IFACE).await?;
-    let result: Result<(), zbus::Error> = proxy
-        .call("addService", &(zone, FIREWALLD_SERVICE, 0i32))
-        .await;
-    accept_already_enabled(result)
-}
-
-#[cfg(target_os = "linux")]
-async fn zone_add_port_permanent(
-    conn: &zbus::Connection,
-    zone: &str,
-    port: u16,
-) -> Result<(), String> {
-    let path = config_zone_path(conn, zone).await?;
-    let proxy = iface(conn, path.as_str(), DBUS_CONFIG_ZONE_IFACE).await?;
-    let result: Result<(), zbus::Error> = proxy.call("addPort", &(port.to_string(), "udp")).await;
-    accept_already_enabled(result)
-}
-
-#[cfg(target_os = "linux")]
-async fn zone_add_service_permanent(conn: &zbus::Connection, zone: &str) -> Result<(), String> {
-    let path = config_zone_path(conn, zone).await?;
-    let proxy = iface(conn, path.as_str(), DBUS_CONFIG_ZONE_IFACE).await?;
-    let result: Result<(), zbus::Error> = proxy.call("addService", &(FIREWALLD_SERVICE,)).await;
-    accept_already_enabled(result)
-}
-
-#[cfg(target_os = "linux")]
-async fn config_zone_path(conn: &zbus::Connection, zone: &str) -> Result<String, String> {
-    let proxy = iface(conn, DBUS_CONFIG_PATH, DBUS_CONFIG_IFACE).await?;
-    let path: zbus::OwnedObjectPath = proxy
-        .call("getZoneByName", &(zone,))
-        .await
-        .map_err(dbus_err)?;
-    Ok(path.as_str().to_owned())
-}
-
-#[cfg(target_os = "linux")]
-fn accept_already_enabled(result: Result<(), zbus::Error>) -> Result<(), String> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(e) if is_already_enabled(&e) => Ok(()),
-        Err(e) => Err(dbus_err(e)),
+    runtime_ok: usize,
+    permanent_ok: usize,
+    last_err: Option<String>,
+) -> Result<String, String> {
+    match (runtime_ok > 0, permanent_ok > 0) {
+        (false, false) => Err(last_err.unwrap_or_else(|| {
+            "firewalld did not accept the request. A password prompt may have been cancelled."
+                .into()
+        })),
+        (true, true) => Ok(format!("Opened UDP {port} in firewalld (now, and after a reboot).")),
+        (true, false) => Ok(format!(
+            "Opened UDP {port} in firewalld until the next reboot. To keep it: {} && sudo firewall-cmd --reload",
+            fedora_permanent_command(port)
+        )),
+        (false, true) => Ok(format!(
+            "Added UDP {port} to the permanent firewalld configuration. Run sudo firewall-cmd --reload (or reopen the port) to apply it now."
+        )),
     }
 }
 
-#[cfg(target_os = "linux")]
-fn is_already_enabled(err: &zbus::Error) -> bool {
-    let s = err.to_string();
-    s.contains("ALREADY_ENABLED") || s.to_ascii_lowercase().contains("already enabled")
-}
-
-#[cfg(target_os = "linux")]
-fn dbus_err(err: impl fmt::Display) -> String {
-    let s = err.to_string();
-    if s.to_ascii_lowercase().contains("not available")
-        || s.to_ascii_lowercase()
-            .contains("without a specified timeout")
-    {
-        return s;
-    }
-    s
-}
-
-/// Run a firewalld D-Bus call on a private current-thread runtime so we never
-/// `block_on` the GUI's or presenter's existing tokio runtime.
-#[cfg(target_os = "linux")]
-fn block_on_dbus<T, F>(fut: F) -> T
-where
-    T: Send + 'static,
-    F: std::future::Future<Output = T> + Send + 'static,
-{
-    std::thread::Builder::new()
-        .name("firewalld-dbus".into())
-        .spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio runtime for firewalld")
-                .block_on(fut)
-        })
-        .expect("spawn firewalld-dbus thread")
-        .join()
-        .expect("firewalld-dbus thread")
+/// firewalld's answer when a port or service is already in the zone.
+#[cfg(any(test, target_os = "linux"))]
+fn is_already_enabled(message: &str) -> bool {
+    message.contains("ALREADY_ENABLED") || message.to_ascii_lowercase().contains("already enabled")
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -734,12 +456,126 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn probe(running: bool, port_open: Option<bool>) -> Option<Probe> {
+        Some(Probe {
+            running,
+            port_open,
+            can_autofix: running,
+        })
+    }
+
+    #[test]
+    fn hint_follows_the_firewalld_probe() {
+        let hint = |p, ufw: Option<UfwState>| {
+            hint_from_probe(
+                47_800,
+                fedora_command(47_800),
+                guide_text(47_800),
+                p,
+                || ufw,
+            )
+        };
+        let open = hint(probe(true, Some(true)), None);
+        assert!(!open.show && open.can_autofix && open.message.contains("already open"));
+        let closed = hint(probe(true, Some(false)), Some(UfwState::Open));
+        assert!(
+            closed.show && closed.prominent && closed.message.contains("not open"),
+            "ufw is ignored while firewalld runs"
+        );
+        assert_eq!(closed.command, "sudo firewall-cmd --add-port=47800/udp");
+        let unknown = hint(probe(true, None), None);
+        assert!(unknown.show && unknown.prominent && unknown.message.contains("may be blocked"));
+        // firewalld absent or stopped: ufw decides, else the general intro.
+        let ufw = hint(None, Some(UfwState::Blocked));
+        assert!(ufw.prominent && ufw.command.contains("ufw allow 47800/udp") && !ufw.can_autofix);
+        let nothing = hint(probe(false, None), None);
+        assert!(
+            nothing.show && !nothing.prominent && nothing.message.starts_with("If a viewer finds")
+        );
+        assert!(!nothing.can_autofix);
+    }
+
+    #[test]
+    fn ufw_states_map_to_hints() {
+        let g = guide_text(5000);
+        assert!(!ufw_hint(5000, UfwState::Open, g.clone()).show);
+        let inactive = ufw_hint(5000, UfwState::Inactive, g.clone());
+        assert!(inactive.show && !inactive.prominent && inactive.command.contains("firewall-cmd"));
+        let unknown = ufw_hint(5000, UfwState::Unknown, g);
+        assert!(unknown.prominent && unknown.message.contains("allow UDP 5000"));
+    }
+
+    #[test]
+    fn firewall_cmd_output_parsing() {
+        let never = || -> Option<bool> { panic!("port queried although firewalld is not running") };
+        assert_eq!(probe_from_state("", false, never), None);
+        assert_eq!(
+            probe_from_state("not running\n", false, never),
+            probe(false, None).map(|p| Probe {
+                can_autofix: false,
+                ..p
+            })
+        );
+        assert!(!probe_from_state("", true, never).unwrap().running);
+        let running = probe_from_state("running\n", true, || Some(true)).unwrap();
+        assert_eq!(
+            running,
+            Probe {
+                running: true,
+                port_open: Some(true),
+                can_autofix: false
+            }
+        );
+        assert_eq!(parse_query_port("yes\n", true), Some(true));
+        assert_eq!(parse_query_port("", true), Some(true));
+        assert_eq!(parse_query_port("no", false), Some(false));
+        assert_eq!(parse_query_port("", false), Some(false));
+        assert_eq!(parse_query_port("maybe", true), None);
+    }
+
+    #[test]
+    fn zones_and_open_port_results() {
+        assert_eq!(
+            merge_zones("public".into(), vec!["home".into(), "public".into()]),
+            ["home", "public"]
+        );
+        assert_eq!(
+            merge_zones(String::new(), Vec::<String>::new()),
+            Vec::<String>::new()
+        );
+        assert_eq!(merge_zones("public".into(), Vec::new()), ["public"]);
+        assert_eq!(all_zones_open([]), None);
+        assert_eq!(all_zones_open([None, Some(true)]), Some(true));
+        assert_eq!(all_zones_open([Some(true), Some(false), None]), Some(false));
+        assert!(open_port_message(1, 1, 1, None)
+            .unwrap()
+            .contains("after a reboot"));
+        assert!(open_port_message(1, 1, 0, None)
+            .unwrap()
+            .contains("--permanent --add-port=1/udp"));
+        assert!(open_port_message(1, 0, 2, None)
+            .unwrap()
+            .contains("--reload"));
+        assert_eq!(
+            open_port_message(1, 0, 0, Some("denied".into())),
+            Err("denied".into())
+        );
+        assert!(open_port_message(1, 0, 0, None)
+            .unwrap_err()
+            .contains("cancelled"));
+        assert!(is_already_enabled(
+            "org.fedoraproject.FirewallD1.Exception: ALREADY_ENABLED: 47800:udp"
+        ));
+        assert!(is_already_enabled("Already enabled"));
+        assert!(!is_already_enabled("ACCESS_DENIED"));
+    }
+
     #[test]
     fn non_linux_hint_is_hidden() {
         if cfg!(target_os = "linux") {
             return;
         }
-        let hint = FirewallHint::for_port(DEFAULT_PORT);
+        let hint = FirewallHint::for_port(mirrorwire_proto::DEFAULT_PORT);
         assert!(!hint.show);
         assert!(!hint.can_autofix);
     }

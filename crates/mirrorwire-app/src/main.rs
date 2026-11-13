@@ -255,3 +255,49 @@ pub fn default_name() -> String {
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "mirrorwire".into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("mirrorwire").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn present_flags_reach_the_capture_preferences() {
+        let cli = parse(&["--port", "0", "present", "--source", "test", "--fec", "20%", "--fps", "max", "--cursor", "embedded"]).unwrap();
+        assert_eq!(cli.port, Some(0));
+        let Some(Command::Present(args)) = cli.command else { panic!("not present") };
+        assert_eq!(args.fec, Some(mirrorwire_proto::fec::FecMode::Fixed(20)));
+        assert_eq!(args.fps, Some(capture_prefs::FpsPref::Max));
+        assert_eq!(args.cursor, Some(capture_prefs::CursorPref::Embedded));
+        // CLI values beat whatever is saved (empty config dir here).
+        let dir = std::env::temp_dir().join(format!("mirrorwire-cli-{}", std::process::id()));
+        let prefs = capture_prefs::resolve(args.cursor, args.fps, args.fec, &dir);
+        assert_eq!(prefs.fec, mirrorwire_proto::fec::FecMode::Fixed(20));
+        assert_eq!(prefs.cursor, capture_prefs::CursorPref::Embedded);
+    }
+
+    #[test]
+    fn invalid_values_are_rejected_by_the_parser() {
+        assert!(parse(&["present", "--fec", "150"]).is_err());
+        assert!(parse(&["present", "--fps", "0"]).is_err());
+        assert!(parse(&["present", "--cursor", "sideways"]).is_err());
+        assert!(parse(&["--renderer", "vulkan"]).is_err());
+    }
+
+    #[test]
+    fn view_flags_and_hwdec() {
+        let cli = parse(&["view", "--headless", "--duration", "5", "--simulate-loss", "2", "--simulate-burst", "4", "--software-decode", "mirrorwire://x"]).unwrap();
+        let Some(Command::View(args)) = cli.command else { panic!("not view") };
+        assert!(args.headless);
+        assert_eq!((args.duration, args.simulate_loss, args.simulate_burst), (Some(5.0), 2.0, 4.0));
+        assert!(!args.want_hwdec(), "--software-decode wins over --hwdec");
+        assert!(ViewArgs { hwdec: true, ..ViewArgs::default() }.want_hwdec());
+        assert_eq!(resolve_renderer(Some(RendererChoice::Wgpu)), RendererChoice::Wgpu);
+        let cli = parse(&["--renderer", "glow"]).unwrap();
+        assert_eq!(cli.renderer, Some(RendererChoice::Gl));
+        assert!(cli.command.is_none(), "no subcommand opens the start screen");
+    }
+}

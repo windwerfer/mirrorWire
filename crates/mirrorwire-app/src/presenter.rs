@@ -1200,4 +1200,109 @@ mod tests {
         c.prefs.fps = FpsPref::Max;
         assert!(c.needs_restart());
     }
+
+    /// End to end in one process: test-pattern presenter (x264) -> QUIC ->
+    /// viewer (software decode, RGBA) with 1 % simulated loss, so FEC,
+    /// keyframe recovery, live settings and both status paths all run.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn test_source_streams_to_an_in_process_viewer() {
+        use crate::viewer::{self, ViewerOptions};
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("mirrorwire-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let localhost = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let mut args = PresentArgs::gui_defaults();
+        args.source = SourceKind::Test;
+        (args.width, args.height) = (640, 360);
+        args.encoder = EncoderBackend::X264;
+        args.bitrate_kbps = 4000;
+        (args.port, args.bind, args.advertise_ip) = (0, localhost, localhost);
+        args.no_mdns = true;
+        args.name = Some("e2e".into());
+        let presenter = spawn(runtime.handle().clone(), args, dir.clone(), Identity::generate().unwrap(), None);
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let wait = |what: &str, done: &mut dyn FnMut() -> bool| {
+            while !done() {
+                let s = presenter.poll();
+                assert!(s.phase != PresentPhase::Failed, "presenter failed: {:?}", s.error);
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let mut uri = None;
+        wait("the presenter URI", &mut || {
+            uri = presenter.poll().uri;
+            uri.is_some()
+        });
+        let target = ConnectInfo::parse(&uri.unwrap()).unwrap();
+        assert!(target.pairing_code.is_some(), "pairing is on by default");
+        let view = viewer::spawn(
+            runtime.handle(),
+            Arc::new(Identity::generate().unwrap()),
+            target,
+            ViewerOptions {
+                hwdec: false,
+                simulate_loss: 0.01,
+                simulate_burst: 1.0,
+                rgba: true,
+                name: "e2e viewer".into(),
+            },
+            None,
+        );
+        // Waits for `n` more frames to reach the display queue.
+        let count = |n: usize| {
+            let mut shown = 0;
+            wait("decoded frames", &mut || {
+                while view.frames.try_recv().is_ok() {
+                    shown += 1;
+                }
+                assert!(view.status.lock().unwrap().error.is_none(), "{:?}", view.status.lock().unwrap().error);
+                shown >= n
+            })
+        };
+        count(20);
+
+        let status = presenter.poll();
+        assert!(status.viewer_connected);
+        assert_eq!(status.phase, PresentPhase::Streaming);
+        assert_eq!(status.capture.cursor_mode, "separate");
+        assert!(status.capture.fec.viewer_fec);
+        assert!(status.attempts.iter().any(|a| a.ok), "{:?}", status.attempts);
+        // Live changes: fixed FEC (no restart), a lower bitrate (encoder
+        // reopens with an IDR), embedded cursor (capture restarts).
+        let mut prefs = status.capture.prefs;
+        prefs.fec = FecMode::Fixed(30);
+        prefs.cursor = CursorPref::Embedded;
+        presenter.apply_capture(prefs);
+        let mut cfg = status.settings.clone();
+        cfg.bitrate_kbps = 3000;
+        presenter.apply_settings(cfg);
+        count(30);
+        let status = presenter.poll();
+        assert_eq!(status.capture.fec.mode, FecMode::Fixed(30));
+        assert_eq!(status.settings.bitrate_kbps, 3000);
+        assert_eq!(mirrorwire_net::settings::Settings::load(&dir).fec.as_deref(), Some("30%"));
+
+        let viewer_status = view.status.lock().unwrap().clone();
+        assert!(viewer_status.connected && viewer_status.first_frame);
+        view.stop();
+        let (totals, _, _) = view.done.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(totals.frames >= 50, "{} frames", totals.frames);
+        assert_eq!(totals.marker_mismatch, 0);
+        assert!(totals.link.parity_expected > 0, "FEC packets were sent");
+        // (Whether the 1 % loss hit any counted packet is left to chance.)
+        assert!(totals.link.received <= totals.link.expected);
+        presenter.stop();
+        wait("the presenter to stop", &mut || {
+            matches!(presenter.poll().phase, PresentPhase::Stopped)
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -30,6 +30,8 @@ the diff readable. See [roadmap.md](roadmap.md) "Known debt".
 | Unit | `#[cfg(test)]` in `mirrorwire-proto` | header encode/parse, fragmentation and reassembly (loss, reordering, late fragments), control framing, clock offset, stats |
 | Unit | `#[cfg(test)]` in `mirrorwire-net` | identity load/create, URI round trip (including a non-default port) and rejection of bad fingerprints, QR generation, port settings precedence, firewall guide text, ufw rule parsing |
 | Unit (FilmCraft) | `mirrorwire-media/src/filmcraft.rs`, feature `filmcraft` | FilmCraft output via the real `Encoder` decodes with FFmpeg, markers read back, keyframe on request; an `#[ignore]` x264-vs-FilmCraft benchmark |
+| Unit (app) | `#[cfg(test)]` in `mirrorwire-app` | CLI parsing, capture/FEC preference precedence, process log, and `presenter::tests::test_source_streams_to_an_in_process_viewer`: test-pattern presenter (x264) → QUIC → viewer with 1 % loss in one process, live FEC/bitrate/cursor changes, markers read back (needs FFmpeg with libx264; part of the coverage report) |
+| Unit (firewall) | `mirrorwire-net/src/firewall.rs` | hint choice for every firewalld/ufw state, `firewall-cmd` output parsing, zone merging, open-port messages (the D-Bus/process glue is `firewall/system.rs`) |
 | Loopback (end to end) | `scripts/loopback-test.sh` | test pattern → encoder → QUIC (pinned TLS, pairing) → reassembly → decoder, on localhost, with latency stats |
 | Real hardware | the owner's T480s + iMac | portal capture, VAAPI, Wi-Fi, OpenGL on a non-Metal Mac (only he can run this) |
 
@@ -161,8 +163,13 @@ screen**, not logs. So:
   unit-test coverage (`cargo llvm-cov --lcov`), then runs
   `SonarSource/sonarqube-scan-action` pinned to a full SHA. Report paths
   live in `sonar-project.properties` (`sonar.rust.clippyReport.reportPaths`,
-  `sonar.rust.lcov.reportPaths`). The loopback test is not included in
-  coverage, so this stays a short extra compile. **Automatic Analysis must
+  `sonar.rust.lcov.reportPaths`). The loopback script is not included in
+  coverage, but the in-process loopback unit test is. `sonar.coverage.exclusions`
+  lists the few whole files that can't run headless (egui/GL window code,
+  portal/PipeWire capture, VAAPI/VideoToolbox device glue, firewalld D-Bus
+  glue, the Android shell), each explained in a comment; keep it file-level
+  and don't add logic files to it. The project uses the built-in *Sonar way*
+  gate (new code coverage ≥ 80 %); custom gates need a paid plan. **Automatic Analysis must
   be off** under SonarCloud Administration › Analysis method for
   `windwerfer_mirrorWire`; if it is still on, the upload fails and should
   not be worked around in the workflow.
