@@ -10,7 +10,7 @@ use mirrorwire_net::transport::{ms, ViewerSession};
 use mirrorwire_proto::clock::{now_us, ClockSync};
 use mirrorwire_proto::control::StreamInfo;
 use mirrorwire_proto::cursor::ViewerCursor;
-use mirrorwire_proto::fec::{LinkHud, LinkStats, LinkWindow, LossSim};
+use mirrorwire_proto::fec::{BandwidthSim, LinkHud, LinkStats, LinkWindow, LossSim};
 use mirrorwire_proto::fragment::{AssembledFrame, Reassembler};
 use mirrorwire_proto::stats::StageStats;
 use std::path::Path;
@@ -107,6 +107,8 @@ pub struct ViewerOptions {
     pub hwdec: bool,
     pub simulate_loss: f64,
     pub simulate_burst: f64,
+    /// Bottleneck simulation in kbit/s (0 = off), see `BandwidthSim`.
+    pub simulate_bandwidth_kbps: u32,
     pub rgba: bool,
     pub name: String,
 }
@@ -229,6 +231,7 @@ async fn session(
     let repaint = on_frame.clone();
 
     let mut loss_sim = LossSim::new(opts.simulate_loss, opts.simulate_burst, now_us());
+    let mut bandwidth_sim = BandwidthSim::new(opts.simulate_bandwidth_kbps, 150);
     let self_healing = session.stream_info.intra_refresh;
     let need_keyframe = Arc::new(AtomicBool::new(true));
     // At most one frame waits while another decodes. When the decoder falls
@@ -286,6 +289,11 @@ async fn session(
         }
         if loss_sim.drop_next() {
             continue;
+        }
+        if let Some(bw) = &mut bandwidth_sim {
+            if !bw.admit(datagram.len(), now_us()) {
+                continue;
+            }
         }
         if let Some(window) = link_window.tick(reassembler.link_stats(), now_us()) {
             session.report_link(&window);
@@ -589,6 +597,7 @@ pub fn run_headless(args: ViewArgs, config_dir: &Path) -> Result<()> {
             hwdec: args.want_hwdec(),
             simulate_loss: args.simulate_loss / 100.0,
             simulate_burst: args.simulate_burst,
+            simulate_bandwidth_kbps: (args.simulate_bandwidth.max(0.0) * 1000.0).round() as u32,
             rgba: args.rgba,
             name: args
                 .name

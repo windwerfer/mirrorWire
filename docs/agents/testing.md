@@ -32,6 +32,7 @@ the diff readable. See [roadmap.md](roadmap.md) "Known debt".
 | Unit (FilmCraft) | `mirrorwire-media/src/filmcraft.rs`, feature `filmcraft` | FilmCraft output via the real `Encoder` decodes with FFmpeg, markers read back, keyframe on request; an `#[ignore]` x264-vs-FilmCraft benchmark |
 | Unit (app) | `#[cfg(test)]` in `mirrorwire-app` | CLI parsing, capture/FEC preference precedence, process log, and `presenter::tests::test_source_streams_to_an_in_process_viewer`: test-pattern presenter (x264) → QUIC → viewer with 1 % loss in one process, live FEC/bitrate/cursor changes, markers read back (needs FFmpeg with libx264; part of the coverage report) |
 | Unit (firewall) | `mirrorwire-net/src/firewall.rs` | hint and notice for every firewalld/ufw state, a fake `Firewalld` proving the startup probe makes no privileged call, one click = one authorization and cancel = no further prompts (D14), D-Bus error classification, zone merging, open-port messages (the D-Bus/process glue is `firewall/system.rs`) |
+| Unit (rate) | `mirrorwire-proto/src/rate.rs`, `fec.rs`, `mirrorwire-media/src/pipeline.rs` | AIMD controller (cuts on loss/RTT/backlog, floor 3 Mbit/s, ceiling = user setting, learned random-loss baseline), auto FEC caps 35 %/60 %, token-bucket bandwidth simulator, x264 bitrate change live without a keyframe, VAAPI reopen rate-limited |
 | Loopback (end to end) | `scripts/loopback-test.sh` | test pattern → encoder → QUIC (pinned TLS, pairing) → reassembly → decoder, on localhost, with latency stats |
 | Real hardware | the owner's T480s + iMac | portal capture, VAAPI, Wi-Fi, OpenGL on a non-Metal Mac (only he can run this) |
 
@@ -137,6 +138,26 @@ scripts/loopback-test.sh 30 --encoder x264 --width 1920 --height 1080 --bitrate-
 MIRRORWIRE_FEATURES=filmcraft scripts/loopback-test.sh 15 --encoder filmcraft --width 1920 --height 1080 --bitrate-kbps 30000
 scripts/loopback-test.sh 10 --intra-refresh -- --simulate-loss 0.5
 ```
+
+### 3.2 Adaptive bitrate under a simulated bottleneck (box, 2026-11-13)
+
+`scripts/loopback-test.sh 30 --encoder x264 --width 1920 --height 1080 --bitrate-kbps 40000 --
+--simulate-bandwidth <Mbit/s> --simulate-loss <pct>`; the viewer drops datagrams that exceed a
+token bucket (150 ms deep) after the random-loss simulator. "Before" is b0c90ad with only the
+simulator added; "after" is the adaptive-bitrate commit (adaptive on, FEC auto). 1800 frames sent.
+
+| Link | Before: frames, fps, packet loss, unrecoverable, FEC | After: frames, fps, Mbit/s, packet loss, unrecoverable, FEC |
+|---|---|---|
+| 20 Mbit/s + 2 % random | 6, 0.2 fps, 69.5 %, 596, 59 % | 1612, 53.7 fps, 12.1 Mbit/s, 7.9 %, 67, 34 % |
+| 8 Mbit/s + 2 % random | 2, 0.1 fps, 87.8 %, —, 59 % | 1389, 46.3 fps, 3.2 Mbit/s, 25.7 %, 220, 39 % |
+| no limit + 2 % random | 1800, 60 fps, 40.0 Mbit/s, 2.0 %, 0, 17 % | 1801, 60 fps, 17.4 Mbit/s, 2.1 %, 0, 18 % |
+
+Before, the encoder kept sending 40 Mbit/s plus up to 59 % parity into the bottleneck, so
+almost nothing got through. After, the controller backs off to what fits and the stream stays
+watchable; the mean capture→decoded latency stayed at 8–9 ms. Known gap (last row): with pure
+random loss and no bottleneck the controller still oscillates between ~10 and ~27 Mbit/s instead
+of staying at the ceiling, because 2 % loss with no RTT signal on localhost looks like
+congestion until the random-loss baseline is learned; tune on real Wi-Fi (roadmap).
 
 ## 4. Real hardware
 

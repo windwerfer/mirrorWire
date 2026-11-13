@@ -66,22 +66,32 @@ impl FecMode {
     /// `boost_pct` is extra parity added after frames could not be rebuilt
     /// (bursty loss needs more than the average loss suggests).
     ///
-    /// Auto: delta frames 10 % + 3 × loss + boost (10–60 %), keyframes
-    /// 25 % + 5 × loss + 1.5 × boost (25–100 %). Keyframes get more because
+    /// Auto: delta frames 10 % + 3 × loss + boost (10–35 %), keyframes
+    /// 25 % + 5 × loss + 1.5 × boost (25–60 %). Keyframes get more because
     /// losing one costs a keyframe round trip and stalls every frame after it.
+    /// The caps are low on purpose: parity is paid from the same bitrate
+    /// budget (see `rate`), and on a congested link more parity means more
+    /// loss (the 2026-11 Wi-Fi test sat at +60 %/+100 % with 22 % loss).
     pub fn overhead(&self, loss_pct: f32, boost_pct: f32, keyframe: bool) -> Option<f32> {
         let finite = |v: f32| if v.is_finite() { v.max(0.0) } else { 0.0 };
         let (loss, boost) = (finite(loss_pct), finite(boost_pct));
         let pct = match *self {
             FecMode::Off => return None,
-            FecMode::Auto if keyframe => (25.0 + 5.0 * loss + 1.5 * boost).clamp(25.0, 100.0),
-            FecMode::Auto => (10.0 + 3.0 * loss + boost).clamp(10.0, 60.0),
+            FecMode::Auto if keyframe => {
+                (25.0 + 5.0 * loss + 1.5 * boost).clamp(25.0, AUTO_MAX_KEYFRAME_PCT)
+            }
+            FecMode::Auto => (10.0 + 3.0 * loss + boost).clamp(10.0, AUTO_MAX_DELTA_PCT),
             FecMode::Fixed(n) if keyframe => (n as f32 * 1.5).min(100.0),
             FecMode::Fixed(n) => n as f32,
         };
         Some(pct / 100.0)
     }
 }
+
+/// Ceiling of auto FEC for delta frames (percent of data packets).
+pub const AUTO_MAX_DELTA_PCT: f32 = 35.0;
+/// Ceiling of auto FEC for keyframes.
+pub const AUTO_MAX_KEYFRAME_PCT: f32 = 60.0;
 
 /// Number of parity packets for `data` data packets in `blocks` blocks: the
 /// overhead rounded up, at least one per block (two for keyframes).
@@ -492,6 +502,44 @@ impl LossSim {
     }
 }
 
+/// Test helper: a bottleneck link of `kbps` with a `depth_ms` buffer
+/// (token bucket, tail drop). Packets that don't fit are lost, like a
+/// saturated Wi-Fi hop, so a sender above the capacity sees loss.
+#[derive(Debug, Clone)]
+pub struct BandwidthSim {
+    bytes_per_us: f64,
+    depth: f64,
+    tokens: f64,
+    last_us: Option<u64>,
+}
+
+impl BandwidthSim {
+    /// `None` for `kbps == 0` (no limit).
+    pub fn new(kbps: u32, depth_ms: u32) -> Option<Self> {
+        if kbps == 0 {
+            return None;
+        }
+        let bytes_per_us = kbps as f64 * 1000.0 / 8.0 / 1e6;
+        let depth = (bytes_per_us * depth_ms.max(1) as f64 * 1000.0).max(1500.0);
+        Some(Self { bytes_per_us, depth, tokens: depth, last_us: None })
+    }
+
+    /// Whether a packet of `len` bytes arriving at `now_us` gets through.
+    pub fn admit(&mut self, len: usize, now_us: u64) -> bool {
+        if let Some(last) = self.last_us {
+            let dt = now_us.saturating_sub(last) as f64;
+            self.tokens = (self.tokens + dt * self.bytes_per_us).min(self.depth);
+        }
+        self.last_us = Some(now_us);
+        if self.tokens >= len as f64 {
+            self.tokens -= len as f64;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,6 +550,23 @@ mod tests {
         encoded_us: 2,
         sent_us: 3,
     };
+
+    #[test]
+    fn bandwidth_sim_passes_the_capacity_and_drops_the_rest() {
+        assert!(BandwidthSim::new(0, 30).is_none());
+        let mut bw = BandwidthSim::new(8_000, 30).unwrap(); // 1 byte/us
+        // 2 s of 1200-byte packets offered at 16 Mbit/s: about half get through.
+        let (mut ok, mut t) = (0usize, 0u64);
+        for _ in 0..3_333 {
+            t += 600;
+            ok += usize::from(bw.admit(1200, t));
+        }
+        let delivered_kbps = ok as f64 * 1200.0 * 8.0 / 2.0 / 1000.0;
+        assert!((7_500.0..8_600.0).contains(&delivered_kbps), "{delivered_kbps}");
+        // Below the capacity nothing is lost.
+        let mut bw = BandwidthSim::new(8_000, 30).unwrap();
+        assert!((1..=1000u64).all(|i| bw.admit(1200, i * 2_400)));
+    }
 
     fn payload(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 7 % 251) as u8).collect()
@@ -535,7 +600,9 @@ mod tests {
         assert_eq!(FecMode::Auto.overhead(5.0, 0.0, false), Some(0.25));
         assert_eq!(FecMode::Auto.overhead(5.0, 0.0, true), Some(0.50));
         assert_eq!(FecMode::Auto.overhead(5.0, 10.0, false), Some(0.35));
-        assert_eq!(FecMode::Auto.overhead(30.0, 30.0, false), Some(0.60));
+        assert_eq!(FecMode::Auto.overhead(30.0, 30.0, false), Some(0.35));
+        assert_eq!(FecMode::Auto.overhead(30.0, 30.0, true), Some(0.60));
+        assert_eq!(FecMode::Auto.overhead(8.0, 0.0, true), Some(0.60));
         assert_eq!(
             FecMode::Auto.overhead(f32::NAN, f32::INFINITY, true),
             Some(0.25)

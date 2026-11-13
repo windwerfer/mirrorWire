@@ -173,7 +173,8 @@ cargo build --release
 Useful presenter options: `--fps 30|60|max` (frame-rate cap asked of the compositor; default
 60, `max` = the display refresh rate; also `MIRRORWIRE_FPS`), `--cursor separate|embedded|hidden`
 (default `separate`, also `MIRRORWIRE_CURSOR`), `--fec auto|off|20` (forward error
-correction, default `auto`; also `MIRRORWIRE_FEC`), `--bitrate-kbps 40000` (or `--bitrate-mbps 40`),
+correction, default `auto`; also `MIRRORWIRE_FEC`), `--adaptive-bitrate on|off` (default on;
+also `MIRRORWIRE_ADAPTIVE_BITRATE`), `--bitrate-kbps 40000` (or `--bitrate-mbps 40`; the maximum when adaptive),
 `--rc auto|cbr|vbr|cqp|icq`, `--qp 18`, `--keyint` (frames; 0 = 10 s),
 `--encoder auto|vaapi|x264|filmcraft`, `--intra-refresh`, `--source test`, `--no-pairing`,
 `--port` (or `MIRRORWIRE_PORT`; the GUI also saves the port in `settings.json`),
@@ -200,11 +201,21 @@ without a dialog). Typing still goes through the video, so only 60 fps helps the
 few lost Wi-Fi packets without waiting for a keyframe. The viewer rebuilds a frame as soon as
 enough packets of it have arrived, with no round trip. With `--fec auto` (the default) parity is
 10 % of a delta frame's packets and 25 % of a keyframe's at no loss, and rises with the loss the
-viewer reports, and further while frames still can't be rebuilt (bursts; up to 60 % and 100 %). `--fec 20` fixes it at 20 % (30 % for keyframes); `--fec off`
-sends no parity. Parity is extra bandwidth on top of the bitrate. Older viewers get plain packets.
+viewer reports, and further while frames still can't be rebuilt (bursts; up to 35 % and 60 %). `--fec 20` fixes it at 20 % (30 % for keyframes); `--fec off`
+sends no parity. Parity is paid from the bitrate (the encoder gets the rest). Older viewers get plain packets.
 FEC can be changed live in the presenter's Quality panel (saved in `settings.json`). The presenter
 window shows `FEC: auto · parity +N% delta / +M% keyframes · viewer loss … · rebuilt … packets/s ·
 unrecoverable frames …`; the viewer overlay shows `fec +N%  rebuilt N/s  loss N%  unrecoverable frames N`.
+
+**Adaptive bitrate** (default on; `--adaptive-bitrate on|off`, `MIRRORWIRE_ADAPTIVE_BITRATE`,
+a checkbox in the Quality panel, saved in `settings.json`). The bitrate setting is the maximum.
+When the viewer reports loss above what the link always loses, or the round-trip time grows (a
+queue is building), the presenter lowers the rate (down to 3 Mbit/s); on a clean link it raises
+it again slowly. FEC parity is counted inside that budget, so more parity never pushes the
+stream above what the link can carry. x264 changes rate without a keyframe; VAAPI has to be
+reopened (one keyframe), at most every 5 s. The presenter window shows
+`Bitrate: target X of max Y Mbit/s (adaptive)`. x264 no longer pads frames to the bitrate
+(`nal-hrd=cbr` filler is gone), so a simple screen sends less than the setting.
 
 ## Build and run: viewer on macOS
 
@@ -372,7 +383,7 @@ See [packaging/linux/README-firewalld.md](packaging/linux/README-firewalld.md).
 3. Zero-copy on the viewer: VideoToolbox -> texture, YUV->RGB in a wgpu shader
    (the presenter's PipeWire DMA-BUF -> VAAPI path is built; the presenter shows
    "Capture path: dmabuf-zero-copy" when it is active).
-4. Adaptive bitrate from QUIC RTT/loss stats.
+4. Adaptive bitrate: built (loss/RTT AIMD, FEC inside the budget); tune on real Wi-Fi.
 5. Vendor cargo sources (flatpak-cargo-generator) for a Flathub submission; notarized Mac builds.
 6. QR scanning with the viewer's camera, virtual-monitor (extend) mode via portal.
 7. Optional Miracast sink as a second `VideoSink`.

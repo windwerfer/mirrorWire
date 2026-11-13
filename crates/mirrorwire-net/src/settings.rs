@@ -24,6 +24,9 @@ pub struct Settings {
     /// Forward error correction for video: `off`, `auto` or a percentage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fec: Option<String>,
+    /// Adaptive bitrate: `on` or `off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptive_bitrate: Option<String>,
 }
 
 impl Settings {
@@ -57,17 +60,20 @@ impl Settings {
 
 /// Persist the presenter's cursor mode, frame-rate cap and FEC setting for
 /// the next start.
-pub fn save_capture(config_dir: &Path, cursor: &str, fps: &str, fec: &str) -> Result<()> {
+pub fn save_capture(config_dir: &Path, cursor: &str, fps: &str, fec: &str, adaptive: bool) -> Result<()> {
     let mut settings = Settings::load(config_dir);
+    let adaptive = if adaptive { "on" } else { "off" };
     if settings.cursor.as_deref() == Some(cursor)
         && settings.fps.as_deref() == Some(fps)
         && settings.fec.as_deref() == Some(fec)
+        && settings.adaptive_bitrate.as_deref() == Some(adaptive)
     {
         return Ok(());
     }
     settings.cursor = Some(cursor.to_owned());
     settings.fps = Some(fps.to_owned());
     settings.fec = Some(fec.to_owned());
+    settings.adaptive_bitrate = Some(adaptive.to_owned());
     settings.save(config_dir)
 }
 
@@ -167,7 +173,7 @@ mod tests {
     #[test]
     fn save_and_load_roundtrip() {
         let dir = temp_dir();
-        let settings = Settings { port: Some(47901), cursor: Some("embedded".into()), fps: Some("max".into()), fec: Some("20%".into()) };
+        let settings = Settings { port: Some(47901), cursor: Some("embedded".into()), fps: Some("max".into()), fec: Some("20%".into()), adaptive_bitrate: Some("on".into()) };
         settings.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), settings);
         std::fs::remove_dir_all(&dir).ok();
@@ -185,10 +191,11 @@ mod tests {
     fn capture_settings_keep_the_port() {
         let dir = temp_dir();
         save_port(&dir, 47555).unwrap();
-        save_capture(&dir, "separate", "60", "auto").unwrap();
+        save_capture(&dir, "separate", "60", "auto", false).unwrap();
         let s = Settings::load(&dir);
         assert_eq!((s.port, s.cursor.as_deref(), s.fps.as_deref()), (Some(47555), Some("separate"), Some("60")));
         assert_eq!(s.fec.as_deref(), Some("auto"));
+        assert_eq!(s.adaptive_bitrate.as_deref(), Some("off"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

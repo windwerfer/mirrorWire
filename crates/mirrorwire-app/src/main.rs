@@ -92,6 +92,10 @@ pub struct ViewArgs {
     /// independent losses; e.g. 4 to mimic Wi-Fi bursts at the same average).
     #[arg(long, default_value_t = 1.0)]
     pub simulate_burst: f64,
+    /// Act like a bottleneck of this many Mbit/s (30 ms buffer, tail drop)
+    /// in front of the viewer, to test the adaptive bitrate. 0 = off.
+    #[arg(long, default_value_t = 0.0)]
+    pub simulate_bandwidth: f64,
     /// Name shown to the presenter.
     #[arg(long)]
     pub name: Option<String>,
@@ -108,6 +112,7 @@ impl Default for ViewArgs {
             rgba: false,
             simulate_loss: 0.0,
             simulate_burst: 1.0,
+            simulate_bandwidth: 0.0,
             name: None,
         }
     }
@@ -144,7 +149,7 @@ fn main() -> Result<()> {
         Some(Command::Present(mut args)) => {
             args.port = port;
             let cli_cursor = if args.hide_cursor { Some(capture_prefs::CursorPref::Hidden) } else { args.cursor };
-            args.capture = capture_prefs::resolve(cli_cursor, args.fps, args.fec, &config_dir);
+            args.capture = capture_prefs::resolve(cli_cursor, args.fps, args.fec, args.adaptive_bitrate, &config_dir);
             presenter::run(args, &config_dir)
         }
         Some(Command::View(args)) if args.headless => viewer::run_headless(args, &config_dir),
@@ -274,7 +279,7 @@ mod tests {
         assert_eq!(args.cursor, Some(capture_prefs::CursorPref::Embedded));
         // CLI values beat whatever is saved (empty config dir here).
         let dir = std::env::temp_dir().join(format!("mirrorwire-cli-{}", std::process::id()));
-        let prefs = capture_prefs::resolve(args.cursor, args.fps, args.fec, &dir);
+        let prefs = capture_prefs::resolve(args.cursor, args.fps, args.fec, args.adaptive_bitrate, &dir);
         assert_eq!(prefs.fec, mirrorwire_proto::fec::FecMode::Fixed(20));
         assert_eq!(prefs.cursor, capture_prefs::CursorPref::Embedded);
     }

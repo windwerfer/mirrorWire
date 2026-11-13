@@ -19,6 +19,7 @@ use mirrorwire_proto::cursor::{
 };
 use mirrorwire_proto::fec::{fec_fragment, FecHeader, FecMode, LinkStats, CAP_FEC};
 use mirrorwire_proto::fragment::{fragment, FrameTiming};
+use mirrorwire_proto::rate::{AdaptiveBitrate, Sample};
 use mirrorwire_proto::stats::StageStats;
 use mirrorwire_proto::PROTOCOL_VERSION;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -39,16 +40,18 @@ pub fn should_drop_for_backlog(keyframe: bool, frame_len: usize, free_space: usi
 }
 
 /// Ceiling for [`FecState::boost_pct`].
-const MAX_FEC_BOOST: f32 = 30.0;
+const MAX_FEC_BOOST: f32 = 15.0;
 
-/// Presenter-side FEC state, shared with the app: the setting, and what the
-/// current viewer last reported about the link.
+/// Presenter-side link control, shared with the app: the FEC setting, what
+/// the current viewer last reported about the link, and the adaptive
+/// bitrate budget (video + parity) derived from it.
 #[derive(Debug)]
 pub struct FecControl {
     state: Mutex<FecState>,
+    started: Instant,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct FecState {
     pub mode: FecMode,
     /// The connected viewer can rebuild FEC packets.
@@ -60,10 +63,36 @@ pub struct FecState {
     /// Frames the viewer could not rebuild since it connected.
     pub unrecoverable: u64,
     /// Extra parity (percentage points, auto mode) added while frames are
-    /// still lost: +5 per report with unrecoverable frames, -1 per clean one.
+    /// still lost: +5 per report with unrecoverable frames, -1 per clean
+    /// one. It does not grow while the loss looks like congestion (more
+    /// parity would only add load).
     pub boost_pct: f32,
     pub reports: u64,
     last_report: Option<Instant>,
+    /// Adaptive bitrate on (budget follows the link) or off (budget = setting).
+    pub adaptive: bool,
+    /// AIMD controller; its ceiling is the user's bitrate setting.
+    pub rate: AdaptiveBitrate,
+    /// Latest QUIC RTT estimate (ms).
+    pub rtt_ms: f32,
+}
+
+impl Default for FecState {
+    fn default() -> Self {
+        Self {
+            mode: FecMode::default(),
+            viewer_fec: false,
+            loss_pct: 0.0,
+            recovered_per_s: 0.0,
+            unrecoverable: 0,
+            boost_pct: 0.0,
+            reports: 0,
+            last_report: None,
+            adaptive: true,
+            rate: AdaptiveBitrate::new(40_000),
+            rtt_ms: 0.0,
+        }
+    }
 }
 
 impl FecState {
@@ -78,15 +107,54 @@ impl FecState {
             self.mode.overhead(self.loss_pct, self.boost_pct, true)?,
         ))
     }
+
+    /// Total budget on the wire (kbit/s): the adaptive one, or the setting.
+    pub fn budget_kbps(&self) -> u32 {
+        if self.adaptive {
+            self.rate.budget_kbps()
+        } else {
+            self.rate.ceiling_kbps()
+        }
+    }
+
+    /// Presenter status line, e.g. `Bitrate: target 18.0 of max 40.0 Mbit/s
+    /// (adaptive)  ·  video 15.7 + FEC parity`.
+    pub fn bitrate_line(&self) -> String {
+        let mode = if self.adaptive { "adaptive" } else { "fixed" };
+        let mut line = format!(
+            "Bitrate: target {:.1} of max {:.1} Mbit/s ({mode})",
+            self.budget_kbps() as f32 / 1000.0,
+            self.rate.ceiling_kbps() as f32 / 1000.0,
+        );
+        if self.overheads().is_some() {
+            line += &format!("  ·  video {:.1} + FEC parity", self.encoder_kbps() as f32 / 1000.0);
+        }
+        if self.adaptive && self.rate.congested() {
+            line += "  ·  lowered: the link is congested";
+        }
+        line
+    }
+
+    /// Encoder target: the budget minus room for delta-frame parity.
+    pub fn encoder_kbps(&self) -> u32 {
+        mirrorwire_proto::rate::encoder_kbps(self.budget_kbps(), self.overheads().map(|o| o.0))
+    }
 }
 
 impl FecControl {
     pub fn new(mode: FecMode) -> Arc<Self> {
-        Arc::new(Self { state: Mutex::new(FecState { mode, ..Default::default() }) })
+        Arc::new(Self {
+            state: Mutex::new(FecState { mode, ..Default::default() }),
+            started: Instant::now(),
+        })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, FecState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
     }
 
     pub fn snapshot(&self) -> FecState {
@@ -97,10 +165,29 @@ impl FecControl {
         self.lock().mode = mode;
     }
 
+    pub fn set_adaptive(&self, on: bool) {
+        let mut s = self.lock();
+        if s.adaptive != on {
+            s.adaptive = on;
+            s.rate.reset();
+        }
+    }
+
+    /// The user's bitrate setting (kbit/s): the adaptive ceiling.
+    pub fn set_ceiling(&self, kbps: u32) {
+        self.lock().rate.set_ceiling(kbps);
+    }
+
+    /// The encoder target for the next frames (kbit/s), see [`FecState::encoder_kbps`].
+    pub fn encoder_kbps(&self) -> u32 {
+        self.lock().encoder_kbps()
+    }
+
     fn viewer_connected(&self, fec: bool) {
         let mut s = self.lock();
-        let mode = s.mode;
-        *s = FecState { mode, viewer_fec: fec, ..Default::default() };
+        let (mode, adaptive, mut rate) = (s.mode, s.adaptive, s.rate);
+        rate.reset();
+        *s = FecState { mode, viewer_fec: fec, adaptive, rate, ..Default::default() };
     }
 
     fn overhead(&self, keyframe: bool) -> Option<f32> {
@@ -111,7 +198,8 @@ impl FecControl {
         s.mode.overhead(s.loss_pct, s.boost_pct, keyframe)
     }
 
-    fn on_report(&self, loss_permille: u32, recovered: u32, unrecoverable: u32) {
+    fn on_report(&self, loss_permille: u32, recovered: u32, unrecoverable: u32, rtt: Option<Duration>) {
+        let now_ms = self.now_ms();
         let mut s = self.lock();
         let loss = (loss_permille.min(1000) as f32) / 10.0;
         // Rise fast, decay slowly: a loss burst should get more parity at once.
@@ -125,13 +213,34 @@ impl FecControl {
             .unwrap_or(0.5);
         s.recovered_per_s = recovered as f32 / secs;
         s.unrecoverable += unrecoverable as u64;
-        s.boost_pct = if unrecoverable > 0 {
+        let rtt_ms = rtt.map(|r| r.as_secs_f32() * 1000.0);
+        if let Some(r) = rtt_ms {
+            s.rtt_ms = r;
+        }
+        // The controller runs even when adaptive is off, so switching it on
+        // starts from what it learned; it only decides the budget when on.
+        s.rate.on_sample(Sample { loss_pct: Some(loss), rtt_ms, backlog_drops: 0 }, now_ms);
+        s.boost_pct = if unrecoverable > 0 && !s.rate.congested() {
             (s.boost_pct + 5.0 * unrecoverable.min(3) as f32).min(MAX_FEC_BOOST)
         } else {
             (s.boost_pct - 1.0).max(0.0)
         };
         s.reports += 1;
         s.last_report = Some(now);
+    }
+
+    /// The presenter's own view, once per send window: frames dropped for
+    /// backlog, and the RTT (for viewers that send no reports).
+    fn on_send_window(&self, backlog_drops: u32, rtt: Option<Duration>) {
+        let now_ms = self.now_ms();
+        let mut s = self.lock();
+        let rtt_ms = rtt.map(|r| r.as_secs_f32() * 1000.0);
+        if let Some(r) = rtt_ms {
+            s.rtt_ms = r;
+        }
+        if backlog_drops > 0 || s.reports == 0 {
+            s.rate.on_sample(Sample { loss_pct: None, rtt_ms, backlog_drops }, now_ms);
+        }
     }
 }
 
@@ -433,7 +542,7 @@ async fn handle_viewer(incoming: quinn::Incoming, shared: Arc<SessionShared>) ->
                         "viewer link: loss {:.1}% of {packets} packets, {recovered} rebuilt, {unrecoverable} frames lost",
                         loss_permille as f32 / 10.0
                     );
-                    shared.fec.on_report(loss_permille, recovered, unrecoverable);
+                    shared.fec.on_report(loss_permille, recovered, unrecoverable, Some(conn.rtt()));
                 }
                 Control::Bye => return Ok::<_, anyhow::Error>(()),
                 other => tracing::debug!("ignoring {other:?}"),
@@ -615,6 +724,7 @@ async fn send_loop(
                 fec_summary(&fec.snapshot(), window_parity, window_packets),
                 stats.report()
             );
+            fec.on_send_window(backlog_drops, Some(conn.rtt()));
             backlog_drops = 0;
             (window_parity, window_packets) = (0, 0);
             stats.clear();
@@ -625,6 +735,23 @@ async fn send_loop(
 }
 
 fn fec_summary(s: &FecState, parity: usize, packets: usize) -> String {
+    format!("{}, {}", rate_summary(s), fec_part(s, parity, packets))
+}
+
+/// `bitrate 18.0 of 40.0 Mbit/s (adaptive), encoder 15.2, rtt 6 ms`
+pub fn rate_summary(s: &FecState) -> String {
+    format!(
+        "bitrate {:.1} of {:.1} Mbit/s ({}), encoder {:.1}, rtt {:.0} ms{}",
+        s.budget_kbps() as f32 / 1000.0,
+        s.rate.ceiling_kbps() as f32 / 1000.0,
+        if s.adaptive { "adaptive" } else { "fixed" },
+        s.encoder_kbps() as f32 / 1000.0,
+        s.rtt_ms,
+        if s.adaptive && s.rate.congested() { ", congested" } else { "" }
+    )
+}
+
+fn fec_part(s: &FecState, parity: usize, packets: usize) -> String {
     match s.overheads() {
         None if !s.viewer_fec => "fec off (viewer without FEC)".into(),
         None => "fec off".into(),
@@ -1125,14 +1252,41 @@ mod tests {
         let fec = presenter.fec.snapshot();
         assert!((fec.loss_pct - 5.0).abs() < 0.01, "{}", fec.loss_pct);
         assert_eq!(fec.overheads(), Some((0.25, 0.5)));
-        viewer.report_link(&LinkStats { expected: 1000, received: 950, unrecoverable_frames: 1, ..Default::default() });
+        // Lost frames on a link that is not congested: more parity.
+        viewer.report_link(&LinkStats { expected: 1000, received: 990, unrecoverable_frames: 1, ..Default::default() });
         while presenter.fec.snapshot().reports < 2 {
             assert!(Instant::now() < deadline, "second link report never arrived");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let fec = presenter.fec.snapshot();
         assert_eq!((fec.boost_pct, fec.unrecoverable), (5.0, 1));
-        assert_eq!(fec.overheads(), Some((0.30, 0.575)));
+        assert!(!fec.rate.congested());
+        // Sustained heavy loss is congestion: the budget is cut and parity
+        // is not raised further (it would add load).
+        for n in 3..=4 {
+            viewer.report_link(&LinkStats { expected: 1000, received: 800, unrecoverable_frames: 2, ..Default::default() });
+            while presenter.fec.snapshot().reports < n {
+                assert!(Instant::now() < deadline, "link report {n} never arrived");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        let fec = presenter.fec.snapshot();
+        assert!(fec.rate.congested());
+        assert!(fec.boost_pct <= 5.0, "boost grew under congestion: {}", fec.boost_pct);
+        assert!(fec.budget_kbps() < 40_000, "{}", fec.budget_kbps());
+        let (delta, _) = fec.overheads().unwrap();
+        assert!(delta <= 0.35);
+        assert!(fec.encoder_kbps() < fec.budget_kbps(), "parity is paid from the budget");
+        assert!(rate_summary(&fec).contains("(adaptive)"), "{}", rate_summary(&fec));
+        let line = fec.bitrate_line();
+        assert!(line.starts_with("Bitrate: target ") && line.contains("of max 40.0 Mbit/s (adaptive)"), "{line}");
+        assert!(line.contains("FEC parity") && line.contains("congested"), "{line}");
+        presenter.fec.set_adaptive(false);
+        assert_eq!(presenter.fec.snapshot().budget_kbps(), 40_000);
+        assert!(presenter.fec.snapshot().bitrate_line().contains("target 40.0 of max 40.0 Mbit/s (fixed)"));
+        presenter.fec.set_ceiling(8_000);
+        assert_eq!(presenter.fec.snapshot().rate.ceiling_kbps(), 8_000);
+        assert!(presenter.fec.encoder_kbps() < 8_000);
         presenter.set_fec_mode(FecMode::Off);
         assert_eq!(presenter.fec.snapshot().overheads(), None);
 

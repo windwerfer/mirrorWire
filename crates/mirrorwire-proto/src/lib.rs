@@ -3,6 +3,7 @@ pub mod control;
 pub mod cursor;
 pub mod fec;
 pub mod fragment;
+pub mod rate;
 pub mod stats;
 
 pub const PROTOCOL_VERSION: u32 = 1;

@@ -33,6 +33,15 @@ agrees, update the entry (status, date, reason) in the same commit as the change
 
 Newest first. Add an entry when the owner decides something non-obvious.
 
+- **2026-11 (Adaptive bitrate):** after a Wi-Fi test with 22–24 % loss, ~2000 unrecoverable
+  frames and 9 fps at the viewer (auto FEC had climbed to +60 %/+100 %: more parity, more
+  load, more loss), the owner approved: FEC parity is paid from the bitrate budget, auto FEC is
+  capped at 35 % (delta) / 60 % (keyframes) and its boost does not grow under congestion, and an
+  AIMD controller (floor 3 Mbit/s, ceiling = the bitrate setting) follows the viewer's loss
+  reports and the RTT. On by default; `--adaptive-bitrate`, `MIRRORWIRE_ADAPTIVE_BITRATE`,
+  `settings.json`, Quality panel. x264 dropped `nal-hrd=cbr` (filler padded every frame to the
+  target and blocks live rate changes).
+
 - **2026-11 (No unprompted password dialogs, D14):** on Fedora KDE (Flatpak) a polkit
   dialog opened as soon as presenting started, although 47800/udp was already open: the
   firewall probe called firewalld's `queryPort`/`queryService`, which need

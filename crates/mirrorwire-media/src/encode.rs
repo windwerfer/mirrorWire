@@ -325,6 +325,41 @@ impl Encoder {
         &self.config
     }
 
+    /// Whether [`Self::set_bitrate_live`] works for this encoder: libx264 in
+    /// a bitrate mode re-reads `bit_rate`/`rc_max_rate`/`rc_buffer_size`
+    /// before each frame (FFmpeg calls `x264_encoder_reconfig`). VAAPI,
+    /// VideoToolbox and FilmCraft only read them when opened.
+    pub fn supports_live_bitrate(&self) -> bool {
+        matches!(self.inner, Core::Ffmpeg(_))
+            && self.name == "libx264"
+            && !matches!(
+                effective_rc(EncoderBackend::X264, self.config.rate_control),
+                RateControl::Cqp | RateControl::Icq
+            )
+    }
+
+    /// Change the target bitrate for the next frames without reopening the
+    /// encoder (no keyframe). Returns `false` (nothing changed) when the
+    /// encoder can't do that; the caller reopens it instead.
+    pub fn set_bitrate_live(&mut self, kbps: u32) -> bool {
+        if !self.supports_live_bitrate() {
+            return false;
+        }
+        let rc = effective_rc(EncoderBackend::X264, self.config.rate_control);
+        #[allow(irrefutable_let_patterns)]
+        let Core::Ffmpeg(enc) = &mut self.inner
+        else {
+            return false;
+        };
+        if apply_rate_control(enc, EncoderBackend::X264, rc, kbps as i64 * 1000, self.config.qp).is_err() {
+            return false;
+        }
+        self.config.bitrate_kbps = kbps;
+        let conversion = self.conversion;
+        self.rc_summary = describe_rc(enc, self.name, rc, &self.config, conversion);
+        true
+    }
+
     pub fn last_timings_ms(&self) -> (f64, f64) {
         (
             self.last_convert_us as f64 / 1000.0,
@@ -411,13 +446,13 @@ impl Encoder {
                 if config.intra_refresh {
                     opts.set("intra-refresh", "1");
                 }
-                match rc {
-                    RateControl::Cqp => {
-                        opts.set("crf", &config.qp.to_string());
-                    }
-                    _ => {
-                        opts.set("nal-hrd", "cbr");
-                    }
+                // Bitrate modes use a VBV cap (apply_rate_control) and no
+                // `nal-hrd=cbr`: HRD filler pads every frame to the target
+                // (wasted airtime on a congested link), and x264 refuses VBV
+                // changes while HRD is on, which the adaptive bitrate needs
+                // (set_bitrate_live).
+                if rc == RateControl::Cqp {
+                    opts.set("crf", &config.qp.to_string());
                 }
                 Upload::Software
             }
@@ -1375,6 +1410,74 @@ mod tests {
         assert_eq!(format_pixel(Pixel::BGRZ), "bgr0");
         assert_eq!(format_pixel(Pixel::BGRA), "bgra");
         assert_eq!(format_pixel(Pixel::RGBZ), "rgb0");
+    }
+
+    /// Noise at 30 fps: x264 spends whatever the rate control allows.
+    fn noise_frame(seq: u64, w: u32, h: u32, rng: &mut u64) -> RawFrame {
+        let mut data = vec![0u8; (w * h * 4) as usize];
+        for px in data.chunks_mut(8) {
+            *rng ^= *rng << 13;
+            *rng ^= *rng >> 7;
+            *rng ^= *rng << 17;
+            px.copy_from_slice(&rng.to_le_bytes()[..px.len()]);
+        }
+        RawFrame {
+            seq,
+            width: w,
+            height: h,
+            stride: (w * 4) as usize,
+            format: crate::frame::PixelFormat::Bgrx,
+            data,
+            capture_us: 1_000_000 + seq * 33_333,
+            dmabuf: None,
+        }
+    }
+
+    #[test]
+    fn x264_bitrate_changes_live_without_a_keyframe() {
+        crate::init().unwrap();
+        let cfg = EncoderConfig {
+            backend: EncoderBackend::X264,
+            width: 320,
+            height: 240,
+            fps: 30,
+            bitrate_kbps: 4000,
+            ..EncoderConfig::default()
+        };
+        let mut enc = Encoder::new(cfg).unwrap();
+        assert!(enc.supports_live_bitrate());
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut run = |enc: &mut Encoder, from: u64| {
+            let (mut bytes, mut keyframes) = (0usize, 0usize);
+            for seq in from..from + 60 {
+                for f in enc.encode(&noise_frame(seq, 320, 240, &mut rng), seq == 0).unwrap() {
+                    if seq >= from + 30 {
+                        bytes += f.data.len();
+                    }
+                    keyframes += usize::from(f.keyframe && seq > 0);
+                }
+            }
+            (bytes, keyframes)
+        };
+        let (high, _) = run(&mut enc, 0);
+        assert!(enc.set_bitrate_live(1000));
+        assert_eq!(enc.config().bitrate_kbps, 1000);
+        assert!(enc.rc_summary().contains("1.0"), "{}", enc.rc_summary());
+        let (low, keyframes) = run(&mut enc, 60);
+        eprintln!("x264 noise 320x240: 4 Mbit/s -> {high} B/s, live 1 Mbit/s -> {low} B/s");
+        assert_eq!(keyframes, 0, "no IDR for a bitrate change");
+        // 1 s at 4 vs 1 Mbit/s (generous: VBV start-up, frame overhead).
+        assert!(
+            (low as f64) < high as f64 * 0.5,
+            "bitrate did not drop: {high} -> {low} bytes per second"
+        );
+        // A quality mode can't change live; nothing is touched.
+        let mut cqp = Encoder::new(EncoderConfig {
+            rate_control: RateControl::Cqp,
+            ..enc.config().clone()
+        })
+        .unwrap();
+        assert!(!cqp.set_bitrate_live(500));
     }
 
     #[test]

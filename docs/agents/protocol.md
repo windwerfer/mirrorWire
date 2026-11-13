@@ -128,13 +128,24 @@ Receivers drop packets whose header is inconsistent (zero blocks, `frame_len` no
 counts, payload length not what the index implies) or whose layout differs from the first packet
 seen for that frame, and keep at most 64 partial frames.
 
-**Overhead** (`FecMode::overhead`): `auto` gives delta frames 10 % + 3 × loss + boost (10–60 %)
-parity and keyframes 25 % + 5 × loss + 1.5 × boost (25–100 %), from the loss the viewer reports in
-`link_report` (smoothed: rises at once, decays slowly). The boost (0–30 points) grows by 5 for
+**Overhead** (`FecMode::overhead`): `auto` gives delta frames 10 % + 3 × loss + boost (10–35 %)
+parity and keyframes 25 % + 5 × loss + 1.5 × boost (25–60 %), from the loss the viewer reports in
+`link_report` (smoothed: rises at once, decays slowly). The boost (0–15 points) grows by 5 for
 every report with unrecoverable frames and shrinks by 1 per clean report, because bursty loss
-needs more parity than its average suggests. A fixed setting `N%` gives delta frames N % and
-keyframes 1.5 × N %. At least one parity packet per block (two for keyframes). Parity is extra
-bandwidth on top of the encoder bitrate.
+needs more parity than its average suggests; it does not grow while the adaptive bitrate sees
+congestion (parity would only add load). A fixed setting `N%` gives delta frames N % and
+keyframes 1.5 × N %. At least one parity packet per block (two for keyframes). Parity is paid
+from the bitrate budget: the encoder target is budget / (1 + delta overhead).
+
+**Adaptive bitrate** (presenter only, no wire change; `mirrorwire-proto/src/rate.rs`): the
+same `link_report` loss plus the presenter's QUIC RTT and backlog drops drive an AIMD
+controller. Its ceiling is the bitrate setting, its floor 3 Mbit/s. Congestion (loss ≥ 3 points
+above the learned background loss in two reports in a row, ≥ 10 points once, RTT > 1.5 × min
++ 25 ms twice, or a backlog drop) cuts the budget ×0.85 (×0.75 at ≥ 10 points, ×0.6 at ≥ 20),
+at most once per second; a clean link (< 1.5 points excess, no queue) adds 4 % of the ceiling
+per second from 4 s after the last cut. Loss that stays at ≥ 70 % of its level for 3 s after a
+cut is learned as background loss (random Wi-Fi loss that FEC covers). x264 takes the new rate
+live (no keyframe); VAAPI/FilmCraft reopen (keyframe), at most every 5 s and only for ≥ 15 %.
 
 **Loss accounting**: the viewer counts, per frame, packets sent (`data_count + parity_count`)
 against packets received, once the frame is 30 frames old (so late packets still count). Frames

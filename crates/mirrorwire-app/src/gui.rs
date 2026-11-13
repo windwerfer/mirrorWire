@@ -104,7 +104,7 @@ pub fn run(
             let initial = initial.clone();
             let log = log.clone();
             Box::new(move |cc: &eframe::CreationContext<'_>| {
-                let capture = crate::capture_prefs::resolve(None, None, None, &config_dir);
+                let capture = crate::capture_prefs::resolve(None, None, None, None, &config_dir);
                 let mut app = MirrorApp {
                     identity,
                     runtime: handle,
@@ -242,6 +242,7 @@ impl MirrorApp {
                 hwdec: self.hwdec,
                 simulate_loss: 0.0,
                 simulate_burst: 1.0,
+                simulate_bandwidth_kbps: 0,
                 rgba: self.renderer != ResolvedRenderer::Glow,
                 name: self.name.clone(),
             },
@@ -427,6 +428,10 @@ impl MirrorApp {
                             status.firewall.as_ref(),
                             status.viewer_connected || !status.attempts.is_empty(),
                         );
+                        if status.viewer_connected {
+                            ui.add_space(4.0);
+                            ui.label(status.capture.fec.bitrate_line());
+                        }
                         quality_controls(ui, self, &status.settings);
                         ui.add_space(8.0);
                         // Diagnostics stay one click away; the essentials above fit a laptop screen.
@@ -1197,7 +1202,7 @@ fn quality_controls(ui: &mut egui::Ui, app: &mut MirrorApp, live: &EncoderConfig
                     ui.selectable_value(&mut app.encoder, b, b.as_str());
                 }
             });
-        ui.label("Bitrate (Mbit/s)");
+        ui.label("Bitrate max (Mbit/s)");
         ui.add(
             egui::DragValue::new(&mut app.bitrate_mbps)
                 .range(1.0..=80.0)
@@ -1255,13 +1260,14 @@ fn quality_controls(ui: &mut egui::Ui, app: &mut MirrorApp, live: &EncoderConfig
                     ui.selectable_value(&mut app.capture.fec, m, m.as_string());
                 }
             });
+        ui.checkbox(&mut app.capture.adaptive, "Adaptive bitrate");
         if app.capture != before {
             if let Some(h) = &app.presenting {
                 h.apply_capture(app.capture);
             }
         }
     });
-    ui.weak("FEC adds parity packets so frames survive Wi-Fi loss without a keyframe round trip (auto adapts to the loss the viewer reports; the percentage is extra bandwidth on top of the bitrate). Applies to the next frame.");
+    ui.weak("FEC adds parity packets so frames survive Wi-Fi loss without a keyframe round trip (auto adapts to the loss the viewer reports, up to +35 % / +60 % for keyframes). Parity is paid from the bitrate, so the video gets a bit less. Adaptive bitrate treats the bitrate as a maximum: it lowers the rate when the viewer reports loss or the delay grows, and raises it slowly when the link is clean. Both apply to the next frame and are saved.");
     ui.weak("Cursor and Max fps apply at once (the capture restarts without a dialog) and are saved. separate: the viewer draws the cursor from coordinates, so it moves without waiting for video; embedded: the old way, for viewers or desktops where separate misbehaves.");
     ui.weak("Apply restarts the encoder with an IDR. filmcraft is the optional pure-Rust encoder (CPU, for comparison; auto never picks it). Switching away from vaapi uses shared-memory capture until the next start. 4:4:4 chroma is not available with VAAPI on UHD 620 or with VideoToolbox decode.");
 }

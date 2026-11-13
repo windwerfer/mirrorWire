@@ -3,11 +3,17 @@
 # usage: scripts/loopback-test.sh [seconds] [presenter args...] [-- viewer args...]
 # Extra cargo features via MIRRORWIRE_FEATURES, e.g.
 #   MIRRORWIRE_FEATURES=filmcraft scripts/loopback-test.sh 10 --encoder filmcraft
+# MIRRORWIRE_BIN=/path/to/mirrorwire skips the build (compare two builds).
+# Bottleneck + loss (adaptive bitrate), e.g.
+#   scripts/loopback-test.sh 30 --encoder x264 -- --simulate-bandwidth 8 --simulate-loss 2
 set -euo pipefail
 cd "$(dirname "$0")/.."
 FEAT=(); [[ -n "${MIRRORWIRE_FEATURES:-}" ]] && FEAT=(--features "$MIRRORWIRE_FEATURES")
-cargo build --release -q -p mirrorwire-app --no-default-features "${FEAT[@]}"
-BIN=target/release/mirrorwire
+BIN=${MIRRORWIRE_BIN:-}
+if [[ -z "$BIN" ]]; then
+  cargo build --release -q -p mirrorwire-app --no-default-features "${FEAT[@]}"
+  BIN=target/release/mirrorwire
+fi
 DUR=${1:-10}; shift || true
 PA=(); while [[ $# -gt 0 && "$1" != "--" ]]; do PA+=("$1"); shift; done
 [[ $# -gt 0 ]] && shift

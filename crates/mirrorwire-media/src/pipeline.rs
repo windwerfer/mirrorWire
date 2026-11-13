@@ -1,8 +1,8 @@
-use crate::encode::{DmaBufError, Encoder, EncoderConfig};
+use crate::encode::{DmaBufError, Encoder, EncoderConfig, RateControl};
 use crate::frame::{EncodedFrame, RawFrame};
 use crate::source::FrameSource;
 use anyhow::Result;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,9 @@ pub struct Controls {
     /// Ask the encode loop to hand back the encoder so the capture source can
     /// be reopened (new cursor mode or frame rate), see [`CaptureExit`].
     pub restart_source: Arc<AtomicBool>,
+    /// Encoder bitrate the network allows right now (kbit/s, adaptive
+    /// bitrate minus FEC room); 0 = no limit, use the setting.
+    pub bitrate_cap_kbps: Arc<AtomicU32>,
 }
 
 impl Controls {
@@ -46,6 +49,14 @@ impl Controls {
 
     pub fn request_source_restart(&self) {
         self.restart_source.store(true, Ordering::Release);
+    }
+
+    pub fn set_bitrate_cap(&self, kbps: u32) {
+        self.bitrate_cap_kbps.store(kbps, Ordering::Release);
+    }
+
+    pub fn bitrate_cap(&self) -> u32 {
+        self.bitrate_cap_kbps.load(Ordering::Acquire)
     }
 }
 
@@ -299,6 +310,7 @@ pub fn continue_capture_encode(
     mut on_tick: impl FnMut(&Encoder, u32, u32, Tick),
 ) -> Result<CaptureExit> {
     let mut first_for_viewer = true;
+    let mut track = BitrateTrack::default();
     let mut last_sent = Instant::now();
     let mut last_size = (0u32, 0u32);
     let mut repeat_seq = u64::MAX / 2;
@@ -317,7 +329,7 @@ pub fn continue_capture_encode(
             .clamp(Duration::from_millis(5), Duration::from_millis(50));
         match source.poll_frame(poll)? {
             Some(raw) => {
-                maybe_replace_encoder(&mut encoder, &raw, &settings, &mut on_reopen, &mut first_for_viewer)?;
+                maybe_replace_encoder(&mut encoder, &raw, &settings, controls, &mut track, &mut on_reopen, &mut first_for_viewer)?;
                 if sink.wants_frames() {
                     if let Some(old) = held.take() {
                         source.recycle(old.data);
@@ -345,7 +357,7 @@ pub fn continue_capture_encode(
                 }
                 if first_for_viewer {
                     if let Some(raw) = held.take() {
-                        maybe_replace_encoder(&mut encoder, &raw, &settings, &mut on_reopen, &mut first_for_viewer)?;
+                        maybe_replace_encoder(&mut encoder, &raw, &settings, controls, &mut track, &mut on_reopen, &mut first_for_viewer)?;
                         let (cw, ch) = (raw.width, raw.height);
                         if encode_one(&mut encoder, raw, source, sink, controls, &mut first_for_viewer)? {
                             last_sent = Instant::now();
@@ -366,17 +378,80 @@ pub fn continue_capture_encode(
     Ok(CaptureExit::Finished)
 }
 
+/// What the encode loop does about a changed bitrate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitrateAction {
+    Keep,
+    /// Change the running encoder's bitrate (x264; no keyframe).
+    Live,
+    /// Reopen the encoder (VAAPI & co.; costs a keyframe).
+    Reopen,
+}
+
+/// Network-driven changes reopen an encoder at most this often.
+pub const ADAPTIVE_REOPEN_GAP: Duration = Duration::from_secs(5);
+
+/// Decide how to reach `wanted` kbit/s from `current`. A change of the
+/// user's setting is applied at once; network-driven changes are applied
+/// live when the encoder can, else by reopening, but only every
+/// [`ADAPTIVE_REOPEN_GAP`] and only for a change of 15 % or more.
+pub fn bitrate_action(
+    current: u32,
+    wanted: u32,
+    user_changed: bool,
+    live_ok: bool,
+    since_reopen: Option<Duration>,
+) -> BitrateAction {
+    if current == wanted {
+        return BitrateAction::Keep;
+    }
+    if user_changed {
+        return if live_ok { BitrateAction::Live } else { BitrateAction::Reopen };
+    }
+    if live_ok {
+        return BitrateAction::Live;
+    }
+    let rel = (wanted as f64 - current as f64).abs() / current.max(1) as f64;
+    let rested = since_reopen.is_none_or(|d| d >= ADAPTIVE_REOPEN_GAP);
+    if rel >= 0.15 && rested {
+        BitrateAction::Reopen
+    } else {
+        BitrateAction::Keep
+    }
+}
+
+/// The encoder bitrate for `user` kbit/s (the setting) under `cap` (0 = none).
+pub fn effective_bitrate(user: u32, cap: u32) -> u32 {
+    if cap == 0 {
+        user
+    } else {
+        user.min(cap).max(100)
+    }
+}
+
+/// Encode-loop memory for bitrate decisions.
+#[derive(Debug, Default)]
+struct BitrateTrack {
+    user_kbps: Option<u32>,
+    last_reopen: Option<Instant>,
+}
+
 fn maybe_replace_encoder(
     encoder: &mut Encoder,
     raw: &RawFrame,
     settings: &Arc<Mutex<EncoderConfig>>,
+    controls: &Controls,
+    track: &mut BitrateTrack,
     on_reopen: &mut impl FnMut(&Encoder) -> Result<()>,
     first_for_viewer: &mut bool,
 ) -> Result<bool> {
-    let want = settings.lock().expect("encoder settings").clone();
+    let mut want = settings.lock().expect("encoder settings").clone();
+    let user_kbps = want.bitrate_kbps;
+    let user_changed = track.user_kbps.is_some_and(|u| u != user_kbps);
+    track.user_kbps = Some(user_kbps);
+    want.bitrate_kbps = effective_bitrate(user_kbps, controls.bitrate_cap());
     let (out_w, out_h) = want.resolved_size(raw.width, raw.height);
-    let reopen = encoder.output_size() != (out_w, out_h)
-        || encoder.config().bitrate_kbps != want.bitrate_kbps
+    let other_change = encoder.output_size() != (out_w, out_h)
         || encoder.config().rate_control != want.rate_control
         || encoder.config().qp != want.qp
         || encoder.config().keyint != want.keyint
@@ -384,8 +459,32 @@ fn maybe_replace_encoder(
         || encoder.config().backend != want.backend
         || encoder.config().fps != want.fps
         || encoder.config().vaapi_device != want.vaapi_device;
-    if !reopen {
-        return Ok(false);
+    if !other_change {
+        let quality_mode = matches!(want.rate_control, RateControl::Cqp | RateControl::Icq);
+        let current = encoder.config().bitrate_kbps;
+        let action = if quality_mode && !user_changed {
+            BitrateAction::Keep
+        } else {
+            bitrate_action(
+                current,
+                want.bitrate_kbps,
+                user_changed,
+                encoder.supports_live_bitrate(),
+                track.last_reopen.map(|t| t.elapsed()),
+            )
+        };
+        match action {
+            BitrateAction::Keep => return Ok(false),
+            BitrateAction::Live => {
+                if encoder.set_bitrate_live(want.bitrate_kbps) {
+                    tracing::debug!("encoder bitrate {current} -> {} kbit/s (live)", want.bitrate_kbps);
+                    return Ok(false);
+                }
+            }
+            BitrateAction::Reopen => {
+                tracing::info!("encoder bitrate {current} -> {} kbit/s (reopen)", want.bitrate_kbps);
+            }
+        }
     }
     let fresh = match open_encoder_for(raw, &want) {
         Ok(e) => e,
@@ -403,6 +502,7 @@ fn maybe_replace_encoder(
         Err(e) => return Err(e),
     };
     *encoder = fresh;
+    track.last_reopen = Some(Instant::now());
     on_reopen(encoder)?;
     *first_for_viewer = true;
     Ok(true)
@@ -456,6 +556,60 @@ mod tests {
             self.0 += 1;
             Ok(())
         }
+    }
+
+    #[test]
+    fn bitrate_changes_are_live_or_rate_limited() {
+        use BitrateAction::*;
+        let s = |n| Some(Duration::from_secs(n));
+        assert_eq!(bitrate_action(8000, 8000, true, true, None), Keep);
+        // The user's setting applies at once.
+        assert_eq!(bitrate_action(8000, 4000, true, false, s(0)), Reopen);
+        assert_eq!(bitrate_action(8000, 4000, true, true, s(0)), Live);
+        // Network changes: live when possible (x264)…
+        assert_eq!(bitrate_action(8000, 7900, false, true, s(0)), Live);
+        // …else a reopen only every 5 s and for a 15 % change.
+        assert_eq!(bitrate_action(8000, 7000, false, false, s(10)), Keep);
+        assert_eq!(bitrate_action(8000, 6000, false, false, s(2)), Keep);
+        assert_eq!(bitrate_action(8000, 6000, false, false, s(5)), Reopen);
+        assert_eq!(bitrate_action(8000, 9500, false, false, None), Reopen);
+        assert_eq!(effective_bitrate(40_000, 0), 40_000);
+        assert_eq!(effective_bitrate(40_000, 12_000), 12_000);
+        assert_eq!(effective_bitrate(5_000, 12_000), 5_000);
+        assert_eq!(effective_bitrate(5_000, 1), 100);
+    }
+
+    #[test]
+    fn network_cap_changes_x264_without_a_keyframe() {
+        crate::init().unwrap();
+        let cfg = EncoderConfig {
+            backend: EncoderBackend::X264,
+            bitrate_kbps: 8000,
+            ..EncoderConfig::default()
+        };
+        let settings = Arc::new(Mutex::new(cfg.clone()));
+        let mut source = OneShot { sent: false, until: Instant::now() };
+        let raw = source.poll_frame(Duration::ZERO).unwrap().unwrap();
+        let mut encoder = open_encoder_for(&raw, &cfg).unwrap();
+        let controls = Controls::default();
+        let mut track = BitrateTrack::default();
+        let (mut reopened, mut first) = (0, false);
+        let mut step = |enc: &mut Encoder, track: &mut BitrateTrack| {
+            maybe_replace_encoder(enc, &raw, &settings, &controls, track, &mut |_| { reopened += 1; Ok(()) }, &mut first).unwrap()
+        };
+        assert!(!step(&mut encoder, &mut track));
+        controls.set_bitrate_cap(3000);
+        assert!(!step(&mut encoder, &mut track), "no reopen for a network change");
+        assert_eq!(encoder.config().bitrate_kbps, 3000);
+        // The user's new maximum still applies (and is capped by the network).
+        settings.lock().unwrap().bitrate_kbps = 2000;
+        step(&mut encoder, &mut track);
+        assert_eq!(encoder.config().bitrate_kbps, 2000);
+        controls.set_bitrate_cap(0);
+        step(&mut encoder, &mut track);
+        assert_eq!(encoder.config().bitrate_kbps, 2000);
+        drop(step);
+        assert_eq!(reopened, 0);
     }
 
     #[test]

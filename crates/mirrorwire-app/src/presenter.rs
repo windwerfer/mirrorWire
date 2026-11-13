@@ -68,6 +68,12 @@ pub struct PresentArgs {
     /// Older viewers always get plain packets.
     #[arg(long, value_parser = crate::capture_prefs::parse_fec_arg, value_name = "auto|off|PERCENT")]
     pub fec: Option<FecMode>,
+    /// Adaptive bitrate (default on): the bitrate setting is the maximum;
+    /// the presenter lowers it when the viewer reports loss or the RTT grows
+    /// and raises it again slowly. FEC parity is counted inside it. Also
+    /// MIRRORWIRE_ADAPTIVE_BITRATE or the saved setting.
+    #[arg(long, value_parser = crate::capture_prefs::parse_on_off_arg, value_name = "on|off")]
+    pub adaptive_bitrate: Option<bool>,
     /// Resolved from --fps / --cursor / --fec / env / settings.json in `main`.
     #[arg(skip)]
     pub capture: CapturePrefs,
@@ -163,6 +169,7 @@ impl PresentArgs {
             fps: None,
             cursor: None,
             fec: None,
+            adaptive_bitrate: None,
             capture: CapturePrefs::default(),
             bitrate_kbps: DEFAULT_BITRATE_KBPS,
             bitrate_mbps: None,
@@ -320,6 +327,7 @@ impl PresenterHandle {
             prefs.cursor.as_str(),
             &prefs.fps.label(),
             &prefs.fec.as_string(),
+            prefs.adaptive,
         ) {
             tracing::warn!("could not save capture settings: {e:#}");
         }
@@ -328,8 +336,12 @@ impl PresenterHandle {
             if c.prefs.fec != prefs.fec {
                 tracing::info!("FEC set to {}", prefs.fec.as_string());
             }
-            // FEC applies to the next frame; no restart needed.
+            if c.prefs.adaptive != prefs.adaptive {
+                tracing::info!("adaptive bitrate {}", if prefs.adaptive { "on" } else { "off" });
+            }
+            // FEC and adaptive bitrate apply to the next frame; no restart needed.
             c.fec.set_mode(prefs.fec);
+            c.fec.set_adaptive(prefs.adaptive);
             c.prefs = prefs;
             c.needs_restart()
         };
@@ -426,8 +438,10 @@ pub struct CaptureCtl {
 
 impl CaptureCtl {
     fn new(prefs: CapturePrefs) -> Self {
+        let fec = FecControl::new(prefs.fec);
+        fec.set_adaptive(prefs.adaptive);
         Self {
-            fec: FecControl::new(prefs.fec),
+            fec,
             prefs,
             legacy_viewer: false,
             asked_cursor: CursorCapture::Embedded,
@@ -694,7 +708,7 @@ fn present_session(
                 }
             })),
             cursor_events: Some(cursor_rx),
-            fec,
+            fec: fec.clone(),
         },
         Arc::new(move || keyframe_controls.request_keyframe()),
     )?;
@@ -771,6 +785,7 @@ fn present_session(
     let result = loop {
         let hud_reopen = hud.clone();
         let hud_tick = hud.clone();
+        let (rate_fec, rate_controls, rate_settings) = (fec.clone(), controls.clone(), settings.clone());
         let exit = continue_capture_encode(
             source.as_mut(),
             held.take(),
@@ -786,6 +801,11 @@ fn present_session(
                 Ok(())
             },
             move |enc, cw, ch, tick| {
+                // Adaptive bitrate: the setting is the ceiling, the link
+                // feedback decides the budget, FEC parity comes out of it.
+                let ceiling = rate_settings.lock().expect("encoder settings").bitrate_kbps;
+                rate_fec.set_ceiling(ceiling);
+                rate_controls.set_bitrate_cap(rate_fec.encoder_kbps());
                 if let Ok(mut h) = hud_tick.lock() {
                     match tick {
                         Tick::Captured => h.note_frame(enc, cw, ch),
@@ -1027,7 +1047,7 @@ pub fn spawn_for_gui(
     let mut args = PresentArgs::gui_defaults();
     args.name = Some(name);
     args.port = port;
-    args.capture = crate::capture_prefs::resolve(None, None, None, &config_dir);
+    args.capture = crate::capture_prefs::resolve(None, None, None, None, &config_dir);
     spawn(runtime, args, config_dir, identity, on_update)
 }
 
@@ -1251,6 +1271,7 @@ mod tests {
                 hwdec: false,
                 simulate_loss: 0.01,
                 simulate_burst: 1.0,
+                simulate_bandwidth_kbps: 0,
                 rgba: true,
                 name: "e2e viewer".into(),
             },

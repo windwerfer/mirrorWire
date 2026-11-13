@@ -22,6 +22,7 @@ target), **planned**, **idea**. Update this file when an item moves.
 | 60 fps / max frame-rate setting, negotiated rate shown | built (2026-11-13); KWin's reported max untested |
 | Click-freeze in the viewer (egui nested input lock) | fixed (2026-11-13), untested on the iMac |
 | Forward error correction for video (Reed-Solomon per block, interleaved, adaptive from viewer loss reports; `--fec auto|off|N`, Quality panel) | built (2026-11-13), loopback-tested with simulated random and bursty loss (protocol.md §3b); untested on real Wi-Fi and on Android hardware |
+| Adaptive bitrate (AIMD on viewer loss + QUIC RTT, FEC parity inside the budget, auto FEC capped at 35 %/60 %; `--adaptive-bitrate`, Quality panel) | built (2026-11-13), loopback-tested with a simulated bottleneck (testing.md §3.2); untested on real Wi-Fi |
 | Latency spikes on scene changes (2 s VBV, unbounded QUIC queue, 4-frame decode backlog, no pacing) | fixed (2026-11-13): 100 ms VBV, 2 MiB datagram queue with delta-frame drop, 2-frame decode queue flushed on overflow, 500 Mbit/s pacing; untested on Wi-Fi hardware |
 
 ## Next (owner-agreed order)
@@ -39,12 +40,32 @@ target), **planned**, **idea**. Update this file when an item moves.
 4. **Optional system FFmpeg:** ship without x264 and use an installed FFmpeg for VAAPI when the
    user wants it (Flatpak: `org.freedesktop.Platform.ffmpeg-full` extension). Would make Linux
    builds GPL-free (D8).
+5. **Bottleneck diagnosis line (next up):** a "Bottleneck: <stage> – <reason> + hint" line on
+   the viewer HUD and the presenter status, from the per-stage stats (capture fps vs requested,
+   encode time and hw/sw encoder, network loss/RTT/jitter, reassembly, decode time and hw/sw
+   decoder, render). Examples: "network – 22 % loss, likely Wi-Fi; cable or 5 GHz helps",
+   "presenter – desktop sends only 11 fps", "driver – CPU encoding, no hardware H.264 encoder",
+   "viewer – software decode 11 ms, OK". A coarse rating (good / OK / weak), no percentages;
+   documented thresholds with hysteresis so it does not flicker. The viewer reports its stats to
+   the presenter so both show the same verdict (capability-negotiated, protocol.md update).
+   Unit-test the classifier. LOW priority follow-up: "percent of achievable quality/speed, Wi-Fi
+   vs cable detection" – unreliable, because the achievable maximum depends on the encoder,
+   content and the other traffic on the link, and the OS does not tell us reliably whether the
+   path crosses Wi-Fi.
+6. **Extend mode / virtual monitor (next up):** presenter setting Mirror/Extend (CLI, env,
+   settings.json, start screen, Quality panel). Extend asks the ScreenCast portal for source
+   type VIRTUAL (4) after checking AvailableSourceTypes (KDE Plasma 6 and GNOME mutter support
+   it); Mirror asks for MONITOR. Switching mode re-opens the portal dialog; one restore token per
+   mode. If VIRTUAL is unavailable, fall back to Mirror with a clear note. Ideally the viewer
+   sends its window/display size in hello; otherwise the UI says resolution and position are set
+   in the system display settings. Must work in the Flatpak (check the portal version needed).
+   Tests, docs.
 
 ## Planned
 
-- **Adaptive bitrate** from QUIC RTT/loss and reassembly loss. The viewer's `link_report`
-  (built for FEC) already carries the loss; FEC parity is currently extra bandwidth on top of the
-  encoder bitrate, so a later step could take it out of the bitrate budget.
+- **Adaptive bitrate follow-ups:** tune the thresholds on the T480s → iMac Wi-Fi; a live
+  bitrate change for VAAPI (FFmpeg's h264_vaapi only reads the rate when opened, so today it
+  reopens with a keyframe, rate-limited); per-frame pacing to the budget.
 - **FEC follow-ups:** spread a keyframe's parity over the next frame interval (covers longer
   bursts at the cost of latency); measure on real Wi-Fi and tune the auto curve.
 - **Zero-copy (viewer):** VideoToolbox → texture and a YUV→RGB shader on the wgpu path too
