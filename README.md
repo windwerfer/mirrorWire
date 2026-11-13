@@ -100,14 +100,13 @@ MirrorWire to find devices on your local network.
 Launching the app without arguments opens a start screen with **Present this screen**
 and **View**. Present starts capture and the pairing window (Linux only; the button is
 disabled on macOS until capture exists there). The presenter window shows the pairing
-code, a live quality panel (bitrate, CBR/VBR/CQP/ICQ, keyint), connection attempts,
-and a firewall panel if the presenter port looks blocked. The default port is
+code and QR, the viewer status, a short firewall note, a live quality panel (bitrate,
+CBR/VBR/CQP/ICQ, keyint) and a collapsed **Details** section (encoder, capture path,
+FEC, frame rate, connection attempts); the window scrolls on small screens. The default port is
 UDP 47800; it can be changed in the start screen (saved for next time), with
 `--port`, or with `MIRRORWIRE_PORT`. The mDNS announcement and the QR/link already
-include the port, so the viewer finds it automatically. If firewalld is running,
-**Open port in firewall** asks the system (a password prompt may appear) to allow
-the port now and after a reboot; the app never runs as root. Otherwise the panel
-shows a short general guide. **View** lists
+include the port, so the viewer finds it automatically. Firewall handling is described
+under [Firewall](#firewall) below. **View** lists
 presenters and, while connecting, a staged status (handshake, certificate, pairing,
 first frame) plus a copyable log. After a timeout it shows the same short firewall
 guide. The CLI subcommands (`present`, `view`,
@@ -145,7 +144,8 @@ flatpak run io.github.windwerfer.MirrorWire present     # Flatpak
 **Flatpak permissions:** `--socket=wayland`, `--socket=fallback-x11`, `--share=ipc`
 (for X11 only), `--share=network` (QUIC and mDNS), `--device=dri` (VAAPI and GPU
 rendering), and `--system-talk-name=org.fedoraproject.FirewallD1` (so the presenter
-can ask firewalld to query or open its UDP port; a password prompt may appear).
+can see whether firewalld runs and, only after you click **Open port for me…**, ask it
+to open the UDP port; that click shows one password dialog).
 There is no host filesystem access. Screen capture goes through the
 ScreenCast portal, which needs no extra permission. Settings live in
 `~/.var/app/io.github.windwerfer.MirrorWire/config/mirrorwire`.
@@ -324,13 +324,31 @@ The source is MIT OR Apache-2.0. The Linux release builds statically link x264
 (GPL-2.0-or-later), so those binaries are distributed under the GPL. The macOS
 builds use only FFmpeg's LGPL parts plus VideoToolbox.
 
+## Firewall
+
+MirrorWire never asks for an admin password on its own. When presenting starts it only
+asks firewalld things that need no authorization (is it running, which zones are
+active). Reading the zone rules needs admin rights on Fedora's default polkit policy,
+so the app reads them only if polkit already allows it without a dialog; otherwise
+the port state is "unknown".
+
+- **Port open, or a viewer has reached the presenter:** a quiet "Firewall OK".
+- **Port blocked or unknown:** a note that the firewall may block UDP 47800 (or your
+  port), the command to run with a **Copy command** button, and, when firewalld is
+  reachable, an **Open port for me…** button. That button says that it asks for your
+  admin password, and it is the only thing that can cause a password dialog: one click
+  shows at most one dialog (runtime and permanent rule for the active zones). If you
+  cancel, nothing changes, the app says so, and it does not ask again unless you click
+  the button again.
+
 ## Troubleshooting
 
 **A viewer lists the presenter but cannot connect** (it sits on "connecting…", then times out).
 The presenter is visible via mDNS, but the QUIC packets on the presenter UDP port
 (default 47800, or the port shown in the presenter window and in the link) are
-probably being dropped by a firewall. On the presenter, use **Open port in firewall**
-if the button is offered (a password prompt may appear). Otherwise:
+probably being dropped by a firewall. On the presenter, run the command shown in the
+firewall note, or click **Open port for me…** if it is offered (it asks for your
+admin password once). The commands:
 
 ```
 On Fedora: sudo firewall-cmd --add-port=47800/udp

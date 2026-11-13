@@ -121,9 +121,16 @@ Deleting the directory resets identity and pairings; viewers then see a new fing
 The presenter UDP port defaults to 47800. A changed port is what mDNS advertises and
 what the QR/`mirrorwire://` URI contains, so the viewer does not need a matching
 setting. On Linux the presenter probes firewalld over the system bus when it can
-(and ufw's readable config otherwise). If the port looks blocked, the GUI offers
-**Open port in firewall** (D-Bus add-port, polkit prompt, runtime + permanent) or
-the short general guide. The app never runs as root.
+(and ufw's readable config otherwise), using only calls polkit allows without
+authentication (D14): `getDefaultZone`/`getActiveZones` (`…FirewallD1.info`), and
+`queryPort`/`queryService` (`…config.info`, `auth_admin_keep` in firewalld's default
+server policy) only after a non-interactive polkit `CheckAuthorization` says yes (in
+the Flatpak the bus proxy blocks polkit, so the state is "unknown"). A viewer connection
+or attempt counts as "firewall OK". If the port is blocked or unknown, the GUI shows
+the command with a Copy button and **Open port for me…** (D-Bus add-port, runtime +
+permanent per zone, stops at the first cancelled or denied authorization: one click,
+at most one dialog). The logic is `mirrorwire-net/src/firewall.rs` against a
+`Firewalld` trait; the D-Bus code is `firewall/system.rs`. The app never runs as root.
 
 ## 5. Packaging
 

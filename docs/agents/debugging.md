@@ -5,9 +5,9 @@
 mDNS working proves multicast gets through, not that UDP 47800 does.
 
 1. **Firewall on the presenter (most common on Fedora).** firewalld allows mDNS but blocks
-   the presenter UDP port (default 47800) silently. In the presenter window, use
-   **Open port in firewall** if it is offered (a password prompt may appear; the app
-   does not run as root). Otherwise:
+   the presenter UDP port (default 47800) silently. In the presenter window, run the
+   command from the firewall note or click **Open port for me…** if it is offered (one
+   password dialog; the app does not run as root). The commands:
 
    ```
    On Fedora: sudo firewall-cmd --add-port=47800/udp

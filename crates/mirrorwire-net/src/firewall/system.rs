@@ -1,97 +1,25 @@
-//! firewalld D-Bus calls and `firewall-cmd` processes: the parts of the
-//! firewall helper that need a real system bus / host. The decisions they
-//! feed (`probe_from_state`, `merge_zones`, `open_port_message`, …) live in
-//! the parent module and are unit-tested there.
+//! firewalld over the system D-Bus and the `firewall-cmd --state` fallback:
+//! the parts of the firewall helper that need a real system bus / host. The
+//! decisions (what to call, when to stop) live in the parent module and are
+//! unit-tested there against a fake [`Firewalld`].
+//!
+//! polkit actions (firewalld's `dbus_polkit_require_auth`; firewalld always
+//! asks polkit with "allow user interaction", so any call that is not `yes`
+//! for the caller shows a password dialog):
+//! - `getDefaultZone`, `getActiveZones`: `…FirewallD1.info`, `yes` in the
+//!   shipped server and desktop policies.
+//! - `queryPort`, `queryService`: `…FirewallD1.config.info`, `auth_admin_keep`
+//!   in the server policy (the default symlink) and `yes` in the desktop one.
+//! - `addPort`, `addService`, `config.getZoneByName`, `config.zone.add*`:
+//!   `…FirewallD1.config`, `auth_admin_keep` everywhere.
 
 use super::{
-    all_zones_open, is_already_enabled, merge_zones, open_port_message, parse_query_port,
-    probe_from_state, Probe, FIREWALLD_SERVICE,
+    all_zones_open, classify_step_error, merge_zones, probe_from_state, Firewalld, OpenStep, Probe,
+    StepError, FIREWALLD_SERVICE,
 };
 use mirrorwire_proto::DEFAULT_PORT;
-
-pub(super) fn probe_firewalld(port: u16) -> Option<Probe> {
-    if let Some(probe) = dbus_probe(port) {
-        return Some(probe);
-    }
-    // Native installs (and rare cases where D-Bus is blocked but firewall-cmd
-    // is on PATH). In a Flatpak this usually fails; that's fine.
-    cmd_probe(port)
-}
-
-fn dbus_probe(port: u16) -> Option<Probe> {
-    match block_on_dbus(async move { dbus_probe_async(port).await }) {
-        Ok(probe) => Some(probe),
-        Err(e) => {
-            tracing::debug!("firewalld D-Bus probe failed: {e}");
-            None
-        }
-    }
-}
-
-async fn dbus_probe_async(port: u16) -> Result<Probe, String> {
-    let conn = system_connection().await?;
-    let zones = active_or_default_zones(&conn).await?;
-    let open = port_open_in_zones(&conn, &zones, port).await;
-    Ok(Probe {
-        running: true,
-        port_open: open,
-        can_autofix: true,
-    })
-}
-
-fn cmd_probe(port: u16) -> Option<Probe> {
-    let state = run_maybe_host("firewall-cmd", &["--state"])?;
-    let text = String::from_utf8_lossy(&state.stdout).into_owned();
-    probe_from_state(&text, state.status.success(), || cmd_port_open(port))
-}
-
-fn cmd_port_open(port: u16) -> Option<bool> {
-    let arg = format!("--query-port={port}/udp");
-    let out = run_maybe_host("firewall-cmd", &[&arg])?;
-    parse_query_port(&String::from_utf8_lossy(&out.stdout), out.status.success())
-}
-
-/// Run a command, falling back to `flatpak-spawn --host` when that portal exists.
-/// No extra Flatpak permission is requested; the spawn simply fails.
-fn run_maybe_host(program: &str, args: &[&str]) -> Option<std::process::Output> {
-    if let Ok(out) = std::process::Command::new(program).args(args).output() {
-        return Some(out);
-    }
-    let mut cmd = std::process::Command::new("flatpak-spawn");
-    cmd.arg("--host").arg(program).args(args);
-    cmd.output().ok()
-}
-
-pub(super) fn open_port(port: u16) -> Result<String, String> {
-    block_on_dbus(async move { open_port_async(port).await })
-}
-
-async fn open_port_async(port: u16) -> Result<String, String> {
-    let conn = system_connection().await?;
-    let zones = active_or_default_zones(&conn).await?;
-    if zones.is_empty() {
-        return Err("firewalld is running but no zone was found to add the port to.".into());
-    }
-
-    let mut runtime_ok = 0usize;
-    let mut permanent_ok = 0usize;
-    let mut last_err: Option<String> = None;
-    for zone in &zones {
-        match zone_add_port_runtime(&conn, zone, port).await {
-            Ok(()) => runtime_ok += 1,
-            Err(e) => last_err = Some(e),
-        }
-        match zone_add_port_permanent(&conn, zone, port).await {
-            Ok(()) => permanent_ok += 1,
-            Err(e) => last_err = Some(e),
-        }
-        if port == DEFAULT_PORT {
-            let _ = zone_add_service_runtime(&conn, zone).await;
-            let _ = zone_add_service_permanent(&conn, zone).await;
-        }
-    }
-    open_port_message(port, runtime_ok, permanent_ok, last_err)
-}
+use std::collections::HashMap;
+use std::time::Duration;
 
 const DBUS_DEST: &str = "org.fedoraproject.FirewallD1";
 const DBUS_PATH: &str = "/org/fedoraproject/FirewallD1";
@@ -100,49 +28,207 @@ const DBUS_ZONE_IFACE: &str = "org.fedoraproject.FirewallD1.zone";
 const DBUS_CONFIG_IFACE: &str = "org.fedoraproject.FirewallD1.config";
 const DBUS_CONFIG_PATH: &str = "/org/fedoraproject/FirewallD1/config";
 const DBUS_CONFIG_ZONE_IFACE: &str = "org.fedoraproject.FirewallD1.config.zone";
+const PK_DEST: &str = "org.freedesktop.PolicyKit1";
+const PK_PATH: &str = "/org/freedesktop/PolicyKit1/Authority";
+const PK_IFACE: &str = "org.freedesktop.PolicyKit1.Authority";
+const PK_CONFIG_INFO: &str = "org.fedoraproject.FirewallD1.config.info";
 
-async fn system_connection() -> Result<zbus::Connection, String> {
-    zbus::connection::Builder::system()
-        .method_timeout(std::time::Duration::from_secs(120))
-        .build()
-        .await
-        .map_err(dbus_err)
+/// The real firewalld: one system-bus connection on a private runtime.
+pub(super) struct SystemFirewalld {
+    rt: tokio::runtime::Runtime,
+    conn: zbus::Connection,
 }
 
-async fn iface<'a>(
+/// Connect and run `f` on a dedicated thread with its own current-thread
+/// runtime, so we never `block_on` inside the GUI's or presenter's runtime.
+pub(super) fn with_firewalld<T, F>(f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut SystemFirewalld) -> T + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("firewalld-dbus".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let conn = rt.block_on(async {
+                zbus::connection::Builder::system()
+                    // Long enough for someone to type a password.
+                    .method_timeout(Duration::from_secs(120))
+                    .build()
+                    .await
+                    .map_err(|e| e.to_string())
+            })?;
+            let mut fw = SystemFirewalld { rt, conn };
+            Ok(f(&mut fw))
+        })
+        .map_err(|e| e.to_string())?
+        .join()
+        .map_err(|_| "firewalld thread panicked".to_owned())?
+}
+
+impl Firewalld for SystemFirewalld {
+    fn zones(&mut self) -> Result<Vec<String>, String> {
+        let conn = &self.conn;
+        self.rt.block_on(async {
+            let proxy = proxy(conn, DBUS_PATH, DBUS_IFACE).await?;
+            let default_zone: String = proxy
+                .call("getDefaultZone", &())
+                .await
+                .map_err(|e| e.to_string())?;
+            let active: HashMap<String, Vec<String>> = match proxy.call("getActiveZones", &()).await
+            {
+                Ok(map) => map,
+                Err(e) => {
+                    tracing::debug!("firewalld getActiveZones failed: {e}");
+                    HashMap::new()
+                }
+            };
+            Ok(merge_zones(default_zone, active.into_keys()))
+        })
+    }
+
+    fn may_read_rules_silently(&mut self) -> bool {
+        let conn = &self.conn;
+        let check = async {
+            let name = conn
+                .unique_name()
+                .ok_or_else(|| "no unique bus name".to_owned())?
+                .to_string();
+            let proxy = zbus::Proxy::new(conn, PK_DEST, PK_PATH, PK_IFACE)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut subject: HashMap<&str, zbus::Variant<'_>> = HashMap::new();
+            subject.insert("name", zbus::Variant::from(name.as_str()));
+            let details: HashMap<&str, &str> = HashMap::new();
+            // flags 0: no user interaction. Never a dialog.
+            let (authorized, _challenge, _details): (bool, bool, HashMap<String, String>) = proxy
+                .call(
+                    "CheckAuthorization",
+                    &(
+                        ("system-bus-name", subject),
+                        PK_CONFIG_INFO,
+                        details,
+                        0u32,
+                        "",
+                    ),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok::<bool, String>(authorized)
+        };
+        match self
+            .rt
+            .block_on(async { tokio::time::timeout(Duration::from_secs(3), check).await })
+        {
+            Ok(Ok(authorized)) => authorized,
+            Ok(Err(e)) => {
+                // In the Flatpak the bus proxy only lets us talk to firewalld.
+                tracing::debug!("polkit check not available: {e}");
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn port_open(&mut self, zones: &[String], port: u16) -> Option<bool> {
+        let conn = &self.conn;
+        self.rt.block_on(async {
+            let proxy = proxy(conn, DBUS_PATH, DBUS_ZONE_IFACE).await.ok()?;
+            let mut answers = Vec::with_capacity(zones.len());
+            for zone in zones {
+                answers.push(zone_allows(&proxy, zone, port).await);
+            }
+            all_zones_open(answers)
+        })
+    }
+
+    fn apply(&mut self, step: &OpenStep) -> Result<(), StepError> {
+        let conn = &self.conn;
+        let result = self.rt.block_on(async {
+            match step {
+                OpenStep::RuntimePort { zone, port } => {
+                    let proxy = proxy(conn, DBUS_PATH, DBUS_ZONE_IFACE).await?;
+                    proxy
+                        .call::<_, _, String>(
+                            "addPort",
+                            &(zone.as_str(), port.to_string(), "udp", 0i32),
+                        )
+                        .await
+                        .map(drop)
+                        .map_err(|e| e.to_string())
+                }
+                OpenStep::RuntimeService { zone } => {
+                    let proxy = proxy(conn, DBUS_PATH, DBUS_ZONE_IFACE).await?;
+                    proxy
+                        .call::<_, _, String>(
+                            "addService",
+                            &(zone.as_str(), FIREWALLD_SERVICE, 0i32),
+                        )
+                        .await
+                        .map(drop)
+                        .map_err(|e| e.to_string())
+                }
+                OpenStep::PermanentPort { zone, port } => {
+                    let proxy = config_zone(conn, zone).await?;
+                    proxy
+                        .call::<_, _, ()>("addPort", &(port.to_string(), "udp"))
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                OpenStep::PermanentService { zone } => {
+                    let proxy = config_zone(conn, zone).await?;
+                    proxy
+                        .call::<_, _, ()>("addService", &(FIREWALLD_SERVICE,))
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            }
+        });
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) => classify_step_error(&e),
+        }
+    }
+}
+
+async fn proxy<'a>(
     conn: &'a zbus::Connection,
     path: &'a str,
     interface: &'a str,
 ) -> Result<zbus::Proxy<'a>, String> {
-    zbus::Proxy::new(conn, DBUS_DEST, path, interface)
+    zbus::proxy::Builder::new(conn)
+        .destination(DBUS_DEST)
+        .path(path)
+        .interface(interface)
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
         .await
-        .map_err(dbus_err)
+        .map_err(|e| e.to_string())
 }
 
-async fn active_or_default_zones(conn: &zbus::Connection) -> Result<Vec<String>, String> {
-    let proxy = iface(conn, DBUS_PATH, DBUS_IFACE).await?;
-    let default_zone: String = proxy.call("getDefaultZone", &()).await.map_err(dbus_err)?;
-    let active: std::collections::HashMap<String, Vec<String>> =
-        match proxy.call("getActiveZones", &()).await {
-            Ok(map) => map,
-            Err(e) => {
-                tracing::debug!("firewalld getActiveZones failed: {e}");
-                Default::default()
-            }
-        };
-    Ok(merge_zones(default_zone, active.into_keys()))
+async fn config_zone<'a>(
+    conn: &'a zbus::Connection,
+    zone: &str,
+) -> Result<zbus::Proxy<'a>, String> {
+    let config = proxy(conn, DBUS_CONFIG_PATH, DBUS_CONFIG_IFACE).await?;
+    let path: zbus::OwnedObjectPath = config
+        .call("getZoneByName", &(zone,))
+        .await
+        .map_err(|e| e.to_string())?;
+    zbus::proxy::Builder::new(conn)
+        .destination(DBUS_DEST)
+        .path(path)
+        .interface(DBUS_CONFIG_ZONE_IFACE)
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+        .map_err(|e| e.to_string())
 }
 
-async fn port_open_in_zones(conn: &zbus::Connection, zones: &[String], port: u16) -> Option<bool> {
-    let mut answers = Vec::with_capacity(zones.len());
-    for zone in zones {
-        answers.push(zone_allows(conn, zone, port).await);
-    }
-    all_zones_open(answers)
-}
-
-async fn zone_allows(conn: &zbus::Connection, zone: &str, port: u16) -> Option<bool> {
-    let proxy = iface(conn, DBUS_PATH, DBUS_ZONE_IFACE).await.ok()?;
+async fn zone_allows(proxy: &zbus::Proxy<'_>, zone: &str, port: u16) -> Option<bool> {
     let port_s = port.to_string();
     let by_port: Option<bool> = match proxy
         .call("queryPort", &(zone, port_s.as_str(), "udp"))
@@ -169,82 +255,23 @@ async fn zone_allows(conn: &zbus::Connection, zone: &str, port: u16) -> Option<b
     by_port
 }
 
-async fn zone_add_port_runtime(
-    conn: &zbus::Connection,
-    zone: &str,
-    port: u16,
-) -> Result<(), String> {
-    let proxy = iface(conn, DBUS_PATH, DBUS_ZONE_IFACE).await?;
-    let result: Result<(), zbus::Error> = proxy
-        .call("addPort", &(zone, port.to_string(), "udp", 0i32))
-        .await;
-    accept_already_enabled(result)
+/// `firewall-cmd --state` (native installs where D-Bus failed). Only the
+/// state: `--query-port` would need authorization.
+pub(super) fn cmd_probe() -> Option<Probe> {
+    let state = run_maybe_host("firewall-cmd", &["--state"])?;
+    probe_from_state(
+        &String::from_utf8_lossy(&state.stdout),
+        state.status.success(),
+    )
 }
 
-async fn zone_add_service_runtime(conn: &zbus::Connection, zone: &str) -> Result<(), String> {
-    let proxy = iface(conn, DBUS_PATH, DBUS_ZONE_IFACE).await?;
-    let result: Result<(), zbus::Error> = proxy
-        .call("addService", &(zone, FIREWALLD_SERVICE, 0i32))
-        .await;
-    accept_already_enabled(result)
-}
-
-async fn zone_add_port_permanent(
-    conn: &zbus::Connection,
-    zone: &str,
-    port: u16,
-) -> Result<(), String> {
-    let path = config_zone_path(conn, zone).await?;
-    let proxy = iface(conn, path.as_str(), DBUS_CONFIG_ZONE_IFACE).await?;
-    let result: Result<(), zbus::Error> = proxy.call("addPort", &(port.to_string(), "udp")).await;
-    accept_already_enabled(result)
-}
-
-async fn zone_add_service_permanent(conn: &zbus::Connection, zone: &str) -> Result<(), String> {
-    let path = config_zone_path(conn, zone).await?;
-    let proxy = iface(conn, path.as_str(), DBUS_CONFIG_ZONE_IFACE).await?;
-    let result: Result<(), zbus::Error> = proxy.call("addService", &(FIREWALLD_SERVICE,)).await;
-    accept_already_enabled(result)
-}
-
-async fn config_zone_path(conn: &zbus::Connection, zone: &str) -> Result<String, String> {
-    let proxy = iface(conn, DBUS_CONFIG_PATH, DBUS_CONFIG_IFACE).await?;
-    let path: zbus::OwnedObjectPath = proxy
-        .call("getZoneByName", &(zone,))
-        .await
-        .map_err(dbus_err)?;
-    Ok(path.as_str().to_owned())
-}
-
-fn accept_already_enabled(result: Result<(), zbus::Error>) -> Result<(), String> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(e) if is_already_enabled(&e.to_string()) => Ok(()),
-        Err(e) => Err(dbus_err(e)),
+/// Run a command, falling back to `flatpak-spawn --host` when that portal exists.
+/// No extra Flatpak permission is requested; the spawn simply fails.
+fn run_maybe_host(program: &str, args: &[&str]) -> Option<std::process::Output> {
+    if let Ok(out) = std::process::Command::new(program).args(args).output() {
+        return Some(out);
     }
-}
-
-fn dbus_err(err: impl std::fmt::Display) -> String {
-    err.to_string()
-}
-
-/// Run a firewalld D-Bus call on a private current-thread runtime so we never
-/// `block_on` the GUI's or presenter's existing tokio runtime.
-fn block_on_dbus<T, F>(fut: F) -> T
-where
-    T: Send + 'static,
-    F: std::future::Future<Output = T> + Send + 'static,
-{
-    std::thread::Builder::new()
-        .name("firewalld-dbus".into())
-        .spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio runtime for firewalld")
-                .block_on(fut)
-        })
-        .expect("spawn firewalld-dbus thread")
-        .join()
-        .expect("firewalld-dbus thread")
+    let mut cmd = std::process::Command::new("flatpak-spawn");
+    cmd.arg("--host").arg(program).args(args);
+    cmd.output().ok()
 }

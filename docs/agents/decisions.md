@@ -18,6 +18,7 @@ agrees, update the entry (status, date, reason) in the same commit as the change
 | D10 | **Renderer default:** OpenGL (`glow`) on macOS x86_64, wgpu elsewhere, with automatic fallback to glow if wgpu fails. | Old Intel Macs (Radeon HD 6770M) have no Metal; OCLP-patched macOS runs OpenGL more reliably. |
 | D11 | **Target hardware.** Presenter: Lenovo ThinkPad T480s, Fedora, KDE Plasma (Wayland), Intel UHD 620 (VAAPI via RPM Fusion `intel-media-driver`). Viewer: iMac 27" Mid 2011 (i5, Radeon HD 6770M, 2560×1440) on macOS 15 Sequoia via OpenCore Legacy Patcher. | Every performance decision is judged on these two machines, not on a fast dev box. |
 | D13 | **Linux is Wayland-first.** Native Wayland is the target for presenter and viewer. X11 that comes for free (winit's X11 backend, Flatpak `--socket=fallback-x11`) stays, but no X11-specific code paths or workarounds are written (no Xlib/XCB, X11 clipboard, or X11 capture). The app only *reports* which window system it runs on. | The owner's decision (2026-11). Fedora KDE is Wayland; X11 branches cost testing time and drift. Example: the clipboard uses egui/winit (smithay-clipboard on Wayland), not an X11 clipboard. |
+| D14 | **Never ask for elevated privileges without an explicit user click after an explanation.** Nothing on the startup, reconnect or refresh path may cause a polkit/sudo/password dialog. A privileged action runs only from a button whose text says it will ask for the admin password; one click causes at most one dialog, a cancel or denial stops it with no retry, and the app does not ask again until the next click. If the needed information is only available with authorization, show "unknown" instead. | The owner (2026-11, after a polkit prompt opened at app start on the T480s): "we do NOT want a random app asking for root/user password, nobody will trust us." |
 | D12 | **Push policy:** direct pushes to `main` are allowed (no PR required); never force-push or rewrite history; commit identity `Thomas Grok Bot Barth <windwerfer@gmail.com>`. | Small single-owner project; the owner wants fast iteration but an intact history. |
 
 ## Not goals (decided)
@@ -32,12 +33,22 @@ agrees, update the entry (status, date, reason) in the same commit as the change
 
 Newest first. Add an entry when the owner decides something non-obvious.
 
+- **2026-11 (No unprompted password dialogs, D14):** on Fedora KDE (Flatpak) a polkit
+  dialog opened as soon as presenting started, although 47800/udp was already open: the
+  firewall probe called firewalld's `queryPort`/`queryService`, which need
+  `org.fedoraproject.FirewallD1.config.info` (`auth_admin_keep` in firewalld's default
+  server policy; firewalld always lets polkit interact). Cancelling the Open-port
+  dialog showed it again for each following call. Now the probe uses only
+  `.info` calls (rules only after a non-interactive polkit check), a viewer reaching
+  the presenter counts as OK, and the opt-in button stops at the first cancelled
+  authorization. The presenter window also scrolls, with diagnostics under "Details".
+
 - **2026-11 (Presenter port and firewall):** the owner does not want a "magic always-open
   port" (none exists across distros). Keep default UDP 47800 (D5). The port is configurable
   (`--port`, `MIRRORWIRE_PORT`, a saved field on the presenter start screen). mDNS and the
   QR/URI already carry the port, so the viewer finds a changed port automatically. If a
-  firewall is detected, the presenter shows a prompt: an **Open port in firewall** button
-  when firewalld is reachable over D-Bus (polkit password prompt, runtime + permanent),
+  firewall is detected, the presenter shows a prompt: an **Open port for me…** button
+  when firewalld is reachable over D-Bus (polkit password prompt, runtime + permanent; see D14),
   otherwise a short general guide (Fedora `firewall-cmd`, one Ubuntu `ufw` line, and "look
   up your own distro if different") — not a list of every OS. The same guide is in the
   README troubleshooting section. A `mirrorwire.xml` firewalld service (UDP 47800) is

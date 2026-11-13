@@ -10,6 +10,7 @@ use mirrorwire_media::encode::{
     EncoderBackend, EncoderConfig, RateControl, DEFAULT_BITRATE_KBPS, DEFAULT_QP,
 };
 use mirrorwire_net::diag::{ConnectStep, FirewallHint, IncomingAttempt, StepState};
+use mirrorwire_net::firewall::{Notice, OpenResult, UserConfirmed, NOT_CHANGED_NOTE};
 use mirrorwire_net::discovery::{Browser, Presenter};
 use mirrorwire_net::identity::{short_fingerprint, Identity};
 use mirrorwire_net::pairing::ConnectInfo;
@@ -19,11 +20,12 @@ use std::time::Instant;
 
 const PRESENT_AVAILABLE: bool = cfg!(all(target_os = "linux", feature = "portal"));
 
-/// Background result of the "Open port in firewall" button.
+/// Background result of the "Open port for me…" button.
 enum FirewallFix {
     Running,
     Ok(String),
     Applied(String),
+    NotChanged,
     Err(String),
 }
 
@@ -363,163 +365,176 @@ impl MirrorApp {
             return;
         }
 
-        ui.add_space(8.0);
-        ui.heading(format!("Presenting: {}", status.name));
-        ui.add_space(8.0);
-
-        match status.phase {
-            PresentPhase::Starting | PresentPhase::WaitingForCapture => {
-                ui.label("Waiting for the screen share dialog…");
-                ui.weak("Choose the display or window to share, then come back to this window for the pairing code.");
-                firewall_panel(ui, self, status.firewall.as_ref(), false);
-            }
-            PresentPhase::Streaming => {
-                if let Some(code) = &status.pairing_code {
-                    ui.label("Pairing code (first connection only):");
-                    ui.label(egui::RichText::new(code).monospace().size(42.0).strong());
-                } else {
-                    ui.label("Pairing is off; any viewer can connect.");
-                }
+        // Everything below scrolls, so small windows and laptop screens can
+        // always reach the controls; the pairing code and QR stay first.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
                 ui.add_space(8.0);
-                if let Some(uri) = &status.uri {
-                    if self.qr_texture.is_none() {
-                        match qr_color_image(uri) {
-                            Ok(image) => {
-                                self.qr_texture = Some(ui.ctx().load_texture(
-                                    "presenter-qr",
-                                    image,
-                                    egui::TextureOptions::NEAREST,
+                ui.heading(format!("Presenting: {}", status.name));
+                ui.add_space(8.0);
+
+                match status.phase {
+                    PresentPhase::Starting | PresentPhase::WaitingForCapture => {
+                        ui.label("Waiting for the screen share dialog…");
+                        ui.weak("Choose the display or window to share, then come back to this window for the pairing code.");
+                        firewall_panel(ui, self, status.firewall.as_ref(), false);
+                    }
+                    PresentPhase::Streaming => {
+                        if let Some(code) = &status.pairing_code {
+                            ui.label("Pairing code (first connection only):");
+                            ui.label(egui::RichText::new(code).monospace().size(42.0).strong());
+                        } else {
+                            ui.label("Pairing is off; any viewer can connect.");
+                        }
+                        ui.add_space(8.0);
+                        if let Some(uri) = &status.uri {
+                            if self.qr_texture.is_none() {
+                                match qr_color_image(uri) {
+                                    Ok(image) => {
+                                        self.qr_texture = Some(ui.ctx().load_texture(
+                                            "presenter-qr",
+                                            image,
+                                            egui::TextureOptions::NEAREST,
+                                        ));
+                                    }
+                                    Err(e) => self.error = Some(format!("QR code: {e:#}")),
+                                }
+                            }
+                            if let Some(tex) = &self.qr_texture {
+                                let side = 240.0;
+                                ui.image((tex.id(), egui::vec2(side, side)));
+                            }
+                            ui.add_space(4.0);
+                            ui.monospace(uri);
+                            if ui.button("Copy link").clicked() {
+                                copy_with_feedback(ui.ctx(), uri.clone(), &mut self.copy_note);
+                            }
+                            show_copy_note(ui, &self.copy_note);
+                        }
+                        ui.add_space(8.0);
+                        if status.viewer_connected {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0, 180, 80),
+                                "A viewer is connected.",
+                            );
+                        } else {
+                            ui.label("Waiting for a viewer…");
+                        }
+                        firewall_panel(
+                            ui,
+                            self,
+                            status.firewall.as_ref(),
+                            status.viewer_connected || !status.attempts.is_empty(),
+                        );
+                        quality_controls(ui, self, &status.settings);
+                        ui.add_space(8.0);
+                        // Diagnostics stay one click away; the essentials above fit a laptop screen.
+                        egui::CollapsingHeader::new("Details")
+                            .id_salt("presenter-details")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                            if let Some(addr) = &status.listen_addr {
+                                ui.weak(format!("Listening on {addr}"));
+                            }
+                            if let (Some(enc), Some(src)) = (&status.encoder, &status.source) {
+                                // The HUD name follows live encoder switches; `status.encoder` is the first one.
+                                let enc = if status.hud.encoder.is_empty() {
+                                    enc
+                                } else {
+                                    &status.hud.encoder
+                                };
+                                ui.weak(format!("Encoder: {enc}  ·  Source: {src}"));
+                            }
+                            if let Some(fp) = &status.fingerprint {
+                                ui.weak(format!("Fingerprint: {}", short_fingerprint(fp)));
+                            }
+                            ui.weak(format!("UDP port {}", status.port));
+                            if !status.advertised.is_empty() {
+                                ui.weak(format!("Advertised: {}", status.advertised.join(", ")));
+                            }
+                            if let Some(sum) = &status.rc_summary {
+                                ui.weak(sum);
+                            }
+                            let hud = &status.hud;
+                            let path = if hud.path.is_empty() {
+                                status.conversion.as_deref().unwrap_or("?")
+                            } else {
+                                hud.path.as_str()
+                            };
+                            let zero_copy = path == mirrorwire_media::encode::path::DMABUF_ZERO_COPY;
+                            ui.horizontal(|ui| {
+                                ui.weak("Capture path:");
+                                if zero_copy {
+                                    ui.colored_label(egui::Color32::from_rgb(0, 180, 80), path);
+                                } else {
+                                    ui.colored_label(egui::Color32::from_rgb(230, 160, 40), path);
+                                }
+                            });
+                            if let Some(note) = &hud.fallback_note {
+                                ui.colored_label(egui::Color32::from_rgb(230, 160, 40), note);
+                            }
+                            let cap = &status.capture;
+                            ui.horizontal(|ui| {
+                                ui.weak("Cursor:");
+                                let text = match cap.cursor_mode.as_str() {
+                                    "separate" => "separate (sent as coordinates, drawn by the viewer)",
+                                    "embedded" => "embedded (drawn into the video)",
+                                    other => other,
+                                };
+                                let color = if cap.cursor_mode == "separate" || cap.prefs.cursor != CursorPref::Separate {
+                                    egui::Color32::from_rgb(0, 180, 80)
+                                } else {
+                                    egui::Color32::from_rgb(230, 160, 40)
+                                };
+                                ui.colored_label(color, text);
+                            });
+                            if let Some(note) = &cap.cursor_note {
+                                ui.colored_label(egui::Color32::from_rgb(230, 160, 40), note);
+                            }
+                            ui.weak(format!(
+                                "Frame rate: asked up to {} fps  ·  compositor allows {}  ·  encoder runs at {} fps",
+                                cap.fps_requested,
+                                cap.fps_negotiated.map(|f| format!("{f} fps")).unwrap_or_else(|| "? (not reported)".into()),
+                                status.settings.fps
+                            ));
+                            ui.weak(fec_status_line(&cap.fec, status.viewer_connected));
+                            if hud.capture_w > 0 {
+                                ui.weak(format!(
+                                    "Capture {}x{}  →  encode {}x{}  ·  source {:.1} fps (+{:.1} repeats/s)  ·  map/pack {:.1} ms  convert {:.1} ms  upload {:.1} ms  encode {:.1} ms (avg {:.1} ms)",
+                                    hud.capture_w,
+                                    hud.capture_h,
+                                    status.settings.width,
+                                    status.settings.height,
+                                    hud.source_fps,
+                                    hud.repeat_fps,
+                                    hud.pack_ms,
+                                    hud.convert_ms,
+                                    hud.upload_ms,
+                                    hud.encode_ms,
+                                    hud.encode_avg_ms
                                 ));
                             }
-                            Err(e) => self.error = Some(format!("QR code: {e:#}")),
-                        }
+                                attempts_panel(ui, &status.attempts);
+                            });
+                        log_panel(ui, &self.log, &mut self.copy_note);
                     }
-                    if let Some(tex) = &self.qr_texture {
-                        let side = 240.0;
-                        ui.image((tex.id(), egui::vec2(side, side)));
+                    PresentPhase::Failed => {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_RED,
+                            status.error.as_deref().unwrap_or("presenter failed"),
+                        );
                     }
-                    ui.add_space(4.0);
-                    ui.monospace(uri);
-                    if ui.button("Copy link").clicked() {
-                        copy_with_feedback(ui.ctx(), uri.clone(), &mut self.copy_note);
+                    PresentPhase::Stopped => {
+                        ui.label("Presenter stopped.");
                     }
-                    show_copy_note(ui, &self.copy_note);
                 }
-                ui.add_space(8.0);
-                if status.viewer_connected {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0, 180, 80),
-                        "A viewer is connected.",
-                    );
-                } else {
-                    ui.label("Waiting for a viewer…");
-                }
-                if let Some(addr) = &status.listen_addr {
-                    ui.weak(format!("Listening on {addr}"));
-                }
-                if let (Some(enc), Some(src)) = (&status.encoder, &status.source) {
-                    // The HUD name follows live encoder switches; `status.encoder` is the first one.
-                    let enc = if status.hud.encoder.is_empty() {
-                        enc
-                    } else {
-                        &status.hud.encoder
-                    };
-                    ui.weak(format!("Encoder: {enc}  ·  Source: {src}"));
-                }
-                if let Some(fp) = &status.fingerprint {
-                    ui.weak(format!("Fingerprint: {}", short_fingerprint(fp)));
-                }
-                ui.weak(format!("UDP port {}", status.port));
-                if !status.advertised.is_empty() {
-                    ui.weak(format!("Advertised: {}", status.advertised.join(", ")));
-                }
-                if let Some(sum) = &status.rc_summary {
-                    ui.weak(sum);
-                }
-                let hud = &status.hud;
-                let path = if hud.path.is_empty() {
-                    status.conversion.as_deref().unwrap_or("?")
-                } else {
-                    hud.path.as_str()
-                };
-                let zero_copy = path == mirrorwire_media::encode::path::DMABUF_ZERO_COPY;
-                ui.horizontal(|ui| {
-                    ui.weak("Capture path:");
-                    if zero_copy {
-                        ui.colored_label(egui::Color32::from_rgb(0, 180, 80), path);
-                    } else {
-                        ui.colored_label(egui::Color32::from_rgb(230, 160, 40), path);
-                    }
-                });
-                if let Some(note) = &hud.fallback_note {
-                    ui.colored_label(egui::Color32::from_rgb(230, 160, 40), note);
-                }
-                let cap = &status.capture;
-                ui.horizontal(|ui| {
-                    ui.weak("Cursor:");
-                    let text = match cap.cursor_mode.as_str() {
-                        "separate" => "separate (sent as coordinates, drawn by the viewer)",
-                        "embedded" => "embedded (drawn into the video)",
-                        other => other,
-                    };
-                    let color = if cap.cursor_mode == "separate" || cap.prefs.cursor != CursorPref::Separate {
-                        egui::Color32::from_rgb(0, 180, 80)
-                    } else {
-                        egui::Color32::from_rgb(230, 160, 40)
-                    };
-                    ui.colored_label(color, text);
-                });
-                if let Some(note) = &cap.cursor_note {
-                    ui.colored_label(egui::Color32::from_rgb(230, 160, 40), note);
-                }
-                ui.weak(format!(
-                    "Frame rate: asked up to {} fps  ·  compositor allows {}  ·  encoder runs at {} fps",
-                    cap.fps_requested,
-                    cap.fps_negotiated.map(|f| format!("{f} fps")).unwrap_or_else(|| "? (not reported)".into()),
-                    status.settings.fps
-                ));
-                ui.weak(fec_status_line(&cap.fec, status.viewer_connected));
-                if hud.capture_w > 0 {
-                    ui.weak(format!(
-                        "Capture {}x{}  →  encode {}x{}  ·  source {:.1} fps (+{:.1} repeats/s)  ·  map/pack {:.1} ms  convert {:.1} ms  upload {:.1} ms  encode {:.1} ms (avg {:.1} ms)",
-                        hud.capture_w,
-                        hud.capture_h,
-                        status.settings.width,
-                        status.settings.height,
-                        hud.source_fps,
-                        hud.repeat_fps,
-                        hud.pack_ms,
-                        hud.convert_ms,
-                        hud.upload_ms,
-                        hud.encode_ms,
-                        hud.encode_avg_ms
-                    ));
-                }
-                quality_controls(ui, self, &status.settings);
-                firewall_panel(
-                    ui,
-                    self,
-                    status.firewall.as_ref(),
-                    status.attempts.is_empty() && !status.viewer_connected,
-                );
-                attempts_panel(ui, &status.attempts);
-                log_panel(ui, &self.log, &mut self.copy_note);
-            }
-            PresentPhase::Failed => {
-                ui.colored_label(
-                    egui::Color32::LIGHT_RED,
-                    status.error.as_deref().unwrap_or("presenter failed"),
-                );
-            }
-            PresentPhase::Stopped => {
-                ui.label("Presenter stopped.");
-            }
-        }
 
-        if let Some(err) = &self.error {
-            ui.colored_label(egui::Color32::LIGHT_RED, err);
-        }
-        self.footer(ui);
+                if let Some(err) = &self.error {
+                    ui.colored_label(egui::Color32::LIGHT_RED, err);
+                }
+                self.footer(ui);
+            });
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(250));
     }
@@ -1016,35 +1031,11 @@ fn firewall_panel(
     ui: &mut egui::Ui,
     app: &mut MirrorApp,
     hint: Option<&FirewallHint>,
-    waiting_for_viewer: bool,
+    viewer_reached_us: bool,
 ) {
     let Some(hint) = hint else { return };
-    let show = hint.show
-        || matches!(
-            app.firewall_fix
-                .as_ref()
-                .and_then(|s| s.lock().ok().map(|g| !matches!(*g, FirewallFix::Running))),
-            Some(true)
-        );
-    if !show {
-        return;
-    }
-    ui.add_space(8.0);
-    let color = if hint.prominent || waiting_for_viewer && hint.show {
-        egui::Color32::from_rgb(230, 160, 40)
-    } else {
-        egui::Color32::GRAY
-    };
-    if hint.show {
-        ui.colored_label(color, &hint.message);
-        if waiting_for_viewer && hint.prominent {
-            ui.colored_label(
-                color,
-                "If a viewer is stuck on connecting, the packets are probably being dropped here.",
-            );
-        }
-    }
 
+    // A successful "Open port for me…" re-runs the (unprivileged) probe once.
     if let Some(slot) = &app.firewall_fix {
         if let Ok(mut g) = slot.lock() {
             if let FirewallFix::Ok(msg) = &*g {
@@ -1056,36 +1047,77 @@ fn firewall_panel(
             }
         }
     }
-
-    let fix_snapshot = app.firewall_fix.as_ref().and_then(|s| {
+    let fix = app.firewall_fix.as_ref().and_then(|s| {
         s.lock().ok().map(|g| match &*g {
-            FirewallFix::Running => "running".to_owned(),
-            FirewallFix::Ok(m) | FirewallFix::Applied(m) => format!("ok:{m}"),
-            FirewallFix::Err(m) => format!("err:{m}"),
+            FirewallFix::Running => FirewallFix::Running,
+            FirewallFix::Ok(m) | FirewallFix::Applied(m) => FirewallFix::Applied(m.clone()),
+            FirewallFix::NotChanged => FirewallFix::NotChanged,
+            FirewallFix::Err(m) => FirewallFix::Err(m.clone()),
         })
     });
+    let green = egui::Color32::from_rgb(0, 180, 80);
 
-    if hint.can_autofix && hint.show {
-        ui.horizontal(|ui| {
-            let busy = matches!(fix_snapshot.as_deref(), Some("running"));
-            let label = if busy {
-                "Opening port… (a password prompt may appear)"
+    let notice = hint.notice(viewer_reached_us);
+    match notice {
+        Notice::Hidden => return,
+        Notice::Ok => {
+            ui.add_space(4.0);
+            if let Some(FirewallFix::Applied(msg)) = &fix {
+                ui.colored_label(green, msg);
             } else {
-                "Open port in firewall"
+                ui.weak("Firewall OK");
+            }
+            return;
+        }
+        Notice::Unknown | Notice::Blocked => {}
+    }
+
+    ui.add_space(8.0);
+    let color = if notice == Notice::Blocked {
+        egui::Color32::from_rgb(230, 160, 40)
+    } else {
+        egui::Color32::GRAY
+    };
+    ui.colored_label(color, &hint.message);
+    ui.label("To open it, run this in a terminal:");
+    ui.horizontal(|ui| {
+        ui.monospace(&hint.command);
+        if ui.button("Copy command").clicked() {
+            copy_with_feedback(ui.ctx(), hint.command.clone(), &mut app.copy_note);
+        }
+        show_copy_note(ui, &app.copy_note);
+    });
+    egui::CollapsingHeader::new("Other systems, and keeping it after a reboot")
+        .id_salt("firewall-guide")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.weak(&hint.guide);
+        });
+
+    if hint.can_autofix {
+        let busy = matches!(fix, Some(FirewallFix::Running));
+        ui.horizontal(|ui| {
+            let label = if busy {
+                "Waiting for the password dialog…"
+            } else {
+                "Open port for me…"
             };
+            // The only place that may cause a password dialog (decision D14).
             if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
                 let port = hint.port;
+                let confirmed = UserConfirmed::from_button_click();
                 let slot = Arc::new(Mutex::new(FirewallFix::Running));
                 app.firewall_fix = Some(slot.clone());
                 let ctx = ui.ctx().clone();
                 std::thread::Builder::new()
                     .name("firewall-open".into())
                     .spawn(move || {
-                        let result = FirewallHint::open_port(port);
+                        let result = FirewallHint::open_port(port, confirmed);
                         if let Ok(mut g) = slot.lock() {
                             *g = match result {
-                                Ok(msg) => FirewallFix::Ok(msg),
-                                Err(msg) => FirewallFix::Err(msg),
+                                OpenResult::Opened(msg) => FirewallFix::Ok(msg),
+                                OpenResult::NotChanged => FirewallFix::NotChanged,
+                                OpenResult::Failed(msg) => FirewallFix::Err(msg),
                             };
                         }
                         ctx.request_repaint();
@@ -1093,28 +1125,21 @@ fn firewall_panel(
                     .ok();
             }
         });
-        ui.weak("Your system may ask for your password. The app does not run as root.");
+        ui.weak("This asks for your admin password once. If you cancel, nothing changes and MirrorWire won't ask again.");
     }
 
-    if let Some(text) = fix_snapshot.as_deref() {
-        if let Some(msg) = text.strip_prefix("ok:") {
-            ui.colored_label(egui::Color32::from_rgb(0, 180, 80), msg);
-        } else if let Some(msg) = text.strip_prefix("err:") {
-            ui.colored_label(egui::Color32::LIGHT_RED, msg);
-            ui.weak("If the password prompt was cancelled, or this system does not use firewalld, use the commands below.");
+    match &fix {
+        Some(FirewallFix::Applied(msg)) => {
+            ui.colored_label(green, msg);
         }
-    }
-
-    if hint.show {
-        ui.add_space(4.0);
-        ui.weak(&hint.guide);
-        ui.horizontal(|ui| {
-            ui.monospace(&hint.command);
-            if ui.button("Copy command").clicked() {
-                copy_with_feedback(ui.ctx(), hint.command.clone(), &mut app.copy_note);
-            }
-            show_copy_note(ui, &app.copy_note);
-        });
+        Some(FirewallFix::NotChanged) => {
+            ui.weak(NOT_CHANGED_NOTE);
+        }
+        Some(FirewallFix::Err(msg)) => {
+            ui.colored_label(egui::Color32::LIGHT_RED, msg);
+            ui.weak("You can open the port yourself with the command above.");
+        }
+        _ => {}
     }
 }
 
