@@ -2149,7 +2149,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "dirs",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "hex",
  "hostname",
  "if-addrs",
