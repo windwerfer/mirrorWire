@@ -129,7 +129,7 @@ jobs:
       - name: Build
         env:
           PKG_CONFIG_PATH: ${{ github.workspace }}/.ffmpeg/lib/pkgconfig
-        run: cargo build --release --locked -p mirrorwire-app --features static-ffmpeg
+        run: cargo build --release --locked -p mirrorwire-app --features static-ffmpeg,filmcraft
       - name: Smoke test
         run: target/release/mirrorwire --version && ldd target/release/mirrorwire
       - name: Package AppImage

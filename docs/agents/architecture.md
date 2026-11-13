@@ -70,13 +70,17 @@ source renegotiates shared memory with the compositor. `--no-dmabuf` or
 `MIRRORWIRE_NO_DMABUF=1` skips DMA-BUF entirely. The release FFmpeg builds need
 `--enable-libdrm` for the zero-copy path.
 
-Encoder selection (`--encoder auto|vaapi|x264|videotoolbox`): `auto` tries VAAPI on Linux,
-VideoToolbox on macOS, then x264. The chosen encoder is reported in `StreamInfo` and shown in
-both GUIs.
+Encoder selection (`--encoder auto|vaapi|x264|videotoolbox|filmcraft`): `auto` tries VAAPI on
+Linux, VideoToolbox on macOS, then x264. The chosen encoder is reported in `StreamInfo` and shown
+in both GUIs. The presenter GUI's Quality panel has an Encoder selector; Apply re-opens the
+encoder live, and if the new one can't open, the old one keeps running (logged).
 
-Planned encoder options (see [roadmap.md](roadmap.md)): the pure-Rust `filmcraft-h264enc`
-(MIT/Apache, no GPL in Linux builds) as a selectable software encoder for comparison with x264,
-and an optional "use the system FFmpeg" mode (Flatpak: the `org.freedesktop.Platform.ffmpeg-full`
+`filmcraft` is the pure-Rust `filmcraft-h264enc` (MIT/Apache), compiled only with cargo feature
+`filmcraft` (`mirrorwire-media/src/filmcraft.rs`). It takes the same swscale I420 picture as
+x264, so the two software encoders compare like for like. Encoder name and per-frame encode
+time (last and 1 s mean) are in the presenter's per-second log line and status panel.
+
+Planned encoder option (see [roadmap.md](roadmap.md)): an optional "use the system FFmpeg" mode (Flatpak: the `org.freedesktop.Platform.ffmpeg-full`
 extension) so bundled builds can drop x264.
 
 Renderer selection (`--renderer gl|wgpu|auto`, env `MIRRORWIRE_RENDERER`): `auto` is glow

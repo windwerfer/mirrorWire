@@ -80,7 +80,7 @@ modules:
         CARGO_HOME: /run/build/mirrorwire/cargo
         PKG_CONFIG_PATH: /app/lib/pkgconfig
     build-commands:
-      - cargo build --release --locked -p mirrorwire-app --features static-ffmpeg
+      - cargo build --release --locked -p mirrorwire-app --features static-ffmpeg,filmcraft
       - install -Dm755 target/release/mirrorwire /app/bin/mirrorwire
       - install -Dm644 packaging/linux/io.github.windwerfer.MirrorWire.desktop /app/share/applications/io.github.windwerfer.MirrorWire.desktop
       - install -Dm644 packaging/linux/io.github.windwerfer.MirrorWire.metainfo.xml /app/share/metainfo/io.github.windwerfer.MirrorWire.metainfo.xml

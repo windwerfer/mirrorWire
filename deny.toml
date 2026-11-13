@@ -1,5 +1,6 @@
 # Supply-chain policy for cargo-deny.
-# Policy: licences in AGENTS.md §1.10, crates.io only, no wildcard deps.
+# Policy: licences in AGENTS.md §1.10, crates.io only (plus the pinned git
+# sources listed under [sources]), no wildcard deps.
 # Run: cargo deny --all-features --locked check advisories bans licenses sources
 #
 # Dual-licensed crates are accepted if at least one licence is on the allow
@@ -65,4 +66,10 @@ allow-wildcard-paths = true
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# Optional `filmcraft` feature (decision log 2026-11): the pure-Rust H.264
+# encoder is not on crates.io. Cargo.toml pins it to a commit `rev`, and it
+# pulls craft-media from craft-libs at a pinned rev. Nothing else from git.
+allow-git = [
+  "https://github.com/storytold/filmcraft",
+  "https://github.com/storytold/craft-libs",
+]

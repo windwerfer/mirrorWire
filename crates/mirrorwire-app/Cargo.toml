@@ -14,6 +14,7 @@ path = "src/main.rs"
 default = ["gui", "portal"]
 gui = ["dep:eframe"]
 portal = ["mirrorwire-media/portal"]
+filmcraft = ["mirrorwire-media/filmcraft"]
 static-ffmpeg = ["mirrorwire-media/static-ffmpeg"]
 
 [dependencies]

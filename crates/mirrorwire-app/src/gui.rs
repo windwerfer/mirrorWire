@@ -5,7 +5,7 @@ use crate::yuv_glow::{YuvPaint, YuvRenderer};
 use crate::{GuiLaunch, RendererChoice, ViewArgs};
 use anyhow::{anyhow, Result};
 use eframe::egui;
-use mirrorwire_media::encode::{EncoderConfig, RateControl, DEFAULT_BITRATE_KBPS, DEFAULT_QP};
+use mirrorwire_media::encode::{EncoderBackend, EncoderConfig, RateControl, DEFAULT_BITRATE_KBPS, DEFAULT_QP};
 use mirrorwire_net::diag::{ConnectStep, FirewallHint, IncomingAttempt, StepState};
 use mirrorwire_net::discovery::{Browser, Presenter};
 use mirrorwire_net::identity::{short_fingerprint, Identity};
@@ -129,6 +129,7 @@ pub fn run(
                     rc: RateControl::Auto,
                     qp: DEFAULT_QP,
                     keyint_sec: 10,
+                    encoder: EncoderBackend::Auto,
                 };
                 if let Some(target) = initial {
                     app.screen = Screen::View;
@@ -197,6 +198,7 @@ struct MirrorApp {
     rc: RateControl,
     qp: u32,
     keyint_sec: u32,
+    encoder: EncoderBackend,
 }
 
 impl MirrorApp {
@@ -378,6 +380,8 @@ impl MirrorApp {
                     ui.weak(format!("Listening on {addr}"));
                 }
                 if let (Some(enc), Some(src)) = (&status.encoder, &status.source) {
+                    // The HUD name follows live encoder switches; `status.encoder` is the first one.
+                    let enc = if status.hud.encoder.is_empty() { enc } else { &status.hud.encoder };
                     ui.weak(format!("Encoder: {enc}  ·  Source: {src}"));
                 }
                 if let Some(fp) = &status.fingerprint {
@@ -410,7 +414,7 @@ impl MirrorApp {
                 }
                 if hud.capture_w > 0 {
                     ui.weak(format!(
-                        "Capture {}x{}  →  encode {}x{}  ·  source {:.1} fps (+{:.1} repeats/s)  ·  map/pack {:.1} ms  convert {:.1} ms  upload {:.1} ms  encode {:.1} ms",
+                        "Capture {}x{}  →  encode {}x{}  ·  source {:.1} fps (+{:.1} repeats/s)  ·  map/pack {:.1} ms  convert {:.1} ms  upload {:.1} ms  encode {:.1} ms (avg {:.1} ms)",
                         hud.capture_w,
                         hud.capture_h,
                         status.settings.width,
@@ -420,7 +424,8 @@ impl MirrorApp {
                         hud.pack_ms,
                         hud.convert_ms,
                         hud.upload_ms,
-                        hud.encode_ms
+                        hud.encode_ms,
+                        hud.encode_avg_ms
                     ));
                 }
                 quality_controls(ui, self, &status.settings);
@@ -910,6 +915,14 @@ fn quality_controls(ui: &mut egui::Ui, app: &mut MirrorApp, live: &EncoderConfig
     ui.add_space(8.0);
     ui.strong("Quality");
     ui.horizontal(|ui| {
+        ui.label("Encoder");
+        egui::ComboBox::from_id_salt("encoder")
+            .selected_text(app.encoder.as_str())
+            .show_ui(ui, |ui| {
+                for b in EncoderBackend::selectable() {
+                    ui.selectable_value(&mut app.encoder, b, b.as_str());
+                }
+            });
         ui.label("Bitrate (Mbit/s)");
         ui.add(egui::DragValue::new(&mut app.bitrate_mbps).range(1.0..=80.0).speed(0.5));
         ui.label("RC");
@@ -933,10 +946,11 @@ fn quality_controls(ui: &mut egui::Ui, app: &mut MirrorApp, live: &EncoderConfig
                 cfg.rate_control = app.rc;
                 cfg.qp = app.qp;
                 cfg.keyint = Some(app.keyint_sec.saturating_mul(cfg.fps.max(1)));
+                cfg.backend = app.encoder;
                 h.apply_settings(cfg);
             }
         }
     });
-    ui.weak("Apply restarts the encoder with an IDR. 4:4:4 chroma is not available with VAAPI on UHD 620 or with VideoToolbox decode.");
+    ui.weak("Apply restarts the encoder with an IDR. filmcraft is the optional pure-Rust encoder (CPU, for comparison; auto never picks it). Switching away from vaapi uses shared-memory capture until the next start. 4:4:4 chroma is not available with VAAPI on UHD 620 or with VideoToolbox decode.");
 }
 

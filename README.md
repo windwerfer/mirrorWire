@@ -164,8 +164,11 @@ cargo build --release
 
 Useful presenter options: `--fps 60 --bitrate-kbps 40000` (or `--bitrate-mbps 40`),
 `--rc auto|cbr|vbr|cqp|icq`, `--qp 18`, `--keyint` (frames; 0 = 10 s),
-`--encoder auto|vaapi|x264`, `--intra-refresh`, `--source test`, `--no-pairing`, `--port`,
+`--encoder auto|vaapi|x264|filmcraft`, `--intra-refresh`, `--source test`, `--no-pairing`, `--port`,
 `--no-dmabuf` (capture through shared memory instead of zero-copy GPU buffers).
+`filmcraft` is an optional pure-Rust H.264 encoder for comparison (built into the Flatpak
+and AppImage; from source add `--features filmcraft`). It can also be switched live in the
+presenter window under Quality › Encoder. FFmpeg (VAAPI, then x264) stays the default.
 The default size is the native capture. `--size 1920x1080` (or `--width` / `--height`)
 overrides it and scales. If a viewer finds the presenter but cannot connect, open
 the port on Fedora: `sudo firewall-cmd --add-port=47800/udp`.
@@ -205,6 +208,7 @@ point `PKG_CONFIG_PATH` at it.
 ```sh
 scripts/loopback-test.sh 10 --encoder x264            # 10 s, native test pattern 1920x1080@60, 40 Mbit/s
 scripts/loopback-test.sh 10 --intra-refresh -- --simulate-loss 0.5
+MIRRORWIRE_FEATURES=filmcraft scripts/loopback-test.sh 10 --encoder filmcraft
 mirrorwire view --headless --duration 10 '<uri>'          # against a real presenter
 mirrorwire discover                                       # list presenters via mDNS
 ```

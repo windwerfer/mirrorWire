@@ -10,6 +10,8 @@ publish.workspace = true
 default = []
 portal = ["dep:ashpd", "dep:pipewire"]
 static-ffmpeg = ["ffmpeg-next/static"]
+# Pure-Rust FilmCraft H.264 encoder as an optional presenter backend (`--encoder filmcraft`).
+filmcraft = ["dep:filmcraft-h264enc"]
 
 [dependencies]
 anyhow.workspace = true
@@ -18,6 +20,9 @@ crossbeam-channel.workspace = true
 tracing.workspace = true
 ffmpeg-next = "9"
 mirrorwire-proto = { path = "../mirrorwire-proto" }
+# Not on crates.io; pinned to a reviewed commit (deny.toml allows only this git source
+# and craft-libs, which it depends on).
+filmcraft-h264enc = { git = "https://github.com/storytold/filmcraft", rev = "cb9783ba1a2b658ba2adc7cb131226d156bb2356", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.14", optional = true, default-features = false, features = ["tokio", "screencast"] }

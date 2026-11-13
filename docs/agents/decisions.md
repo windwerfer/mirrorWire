@@ -32,6 +32,19 @@ agrees, update the entry (status, date, reason) in the same commit as the change
 
 Newest first. Add an entry when the owner decides something non-obvious.
 
+- **2026-11 (FilmCraft encoder built):** `filmcraft-h264enc` is an optional presenter encoder
+  behind cargo feature `filmcraft` (`--encoder filmcraft`, or the Encoder selector in the
+  presenter's Quality panel). FFmpeg stays the default; `auto` never picks FilmCraft. The git
+  dependency is pinned to rev `cb9783ba` of `storytold/filmcraft` (it pulls `craft-media` from
+  `storytold/craft-libs` at a pinned rev); `deny.toml` allows exactly those two git sources.
+  Input is the same swscale I420 picture x264 gets (shared-memory capture; a DMA-BUF stream is
+  switched to shared memory). Settings: Constrained Baseline, `speed` preset, no B-frames,
+  no scenecut, CBR/VBR/QP from the usual RC options, one slice per core (2–8,
+  `MIRRORWIRE_FILMCRAFT_SLICES` overrides). FilmCraft has no force-IDR call and no intra
+  refresh, so a keyframe request re-creates the encoder (rate-control history restarts).
+  Enabled in the Flatpak and AppImage (+0.8 MB stripped, a few seconds of build time); not in
+  the DMG (the Mac is a viewer) or the APK (viewer only). Box numbers are in
+  [testing.md](testing.md) §3.1; T480s numbers are still untested on target.
 - **2026-11 (Wayland-first, D13):** after "Copy log" failed on the T480s (arboard tried an X11
   connection in the Flatpak), the owner fixed Linux as Wayland-first: keep free X11 fallback,
   never write X11-specific code. Clipboard now goes through egui/winit (smithay-clipboard).

@@ -365,7 +365,22 @@ fn maybe_replace_encoder(
     if !reopen {
         return Ok(false);
     }
-    *encoder = open_encoder_for(raw, &want)?;
+    let fresh = match open_encoder_for(raw, &want) {
+        Ok(e) => e,
+        Err(e) if encoder.config().backend != want.backend => {
+            // A live switch to an encoder that can't open here (no VAAPI,
+            // feature not built…) must not end the stream: keep the old one.
+            tracing::warn!(
+                "switching to encoder {} failed ({e:#}); staying on {}",
+                want.backend.as_str(),
+                encoder.name()
+            );
+            settings.lock().expect("encoder settings").backend = encoder.config().backend;
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
+    *encoder = fresh;
     on_reopen(encoder)?;
     *first_for_viewer = true;
     Ok(true)

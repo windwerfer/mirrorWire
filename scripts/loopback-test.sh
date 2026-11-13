@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # End-to-end loopback test: test-pattern presenter -> QUIC -> headless viewer.
 # usage: scripts/loopback-test.sh [seconds] [presenter args...] [-- viewer args...]
+# Extra cargo features via MIRRORWIRE_FEATURES, e.g.
+#   MIRRORWIRE_FEATURES=filmcraft scripts/loopback-test.sh 10 --encoder filmcraft
 set -euo pipefail
 cd "$(dirname "$0")/.."
-cargo build --release -q -p mirrorwire-app --no-default-features
+FEAT=(); [[ -n "${MIRRORWIRE_FEATURES:-}" ]] && FEAT=(--features "$MIRRORWIRE_FEATURES")
+cargo build --release -q -p mirrorwire-app --no-default-features "${FEAT[@]}"
 BIN=target/release/mirrorwire
 DUR=${1:-10}; shift || true
 PA=(); while [[ $# -gt 0 && "$1" != "--" ]]; do PA+=("$1"); shift; done

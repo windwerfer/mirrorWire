@@ -26,9 +26,11 @@ target), **planned**, **idea**. Update this file when an item moves.
    scaling to the GPU (VAAPI `scale_vaapi`/hw upload) so `capture_to_encoded` drops.
 2. **Connection diagnostics in the GUI:** per-step status (resolve, handshake, cert, pairing,
    stream) with actionable advice, for photo-based debugging.
-3. **FilmCraft encoder comparison:** add `filmcraft-h264enc` (pure Rust, MIT/Apache) as a
-   switchable software encoder next to x264; pin a git revision (not on crates.io, very young
-   project, no intra refresh). Compare with the loopback stats on the T480s.
+3. **FilmCraft encoder comparison:** built (feature `filmcraft`, `--encoder filmcraft`, GUI
+   selector; see decisions.md log and testing.md §3.1). Still open: the owner's side-by-side on
+   the T480s (photos of the presenter status with each encoder), a real force-IDR / intra
+   refresh upstream instead of re-creating the encoder, and switching back to DMA-BUF capture
+   when the user returns to VAAPI without restarting.
 4. **Optional system FFmpeg:** ship without x264 and use an installed FFmpeg for VAAPI when the
    user wants it (Flatpak: `org.freedesktop.Platform.ffmpeg-full` extension). Would make Linux
    builds GPL-free (D8).

@@ -54,7 +54,8 @@ pub struct PresentArgs {
     /// Target bitrate in Mbit/s; overrides --bitrate-kbps when set.
     #[arg(long)]
     bitrate_mbps: Option<f64>,
-    /// auto, vaapi, x264, videotoolbox
+    /// auto, vaapi, x264, videotoolbox, filmcraft (pure-Rust; only in builds with the
+    /// `filmcraft` feature, never chosen by auto).
     #[arg(long, default_value = "auto")]
     encoder: EncoderBackend,
     /// Rate control: auto, cbr, vbr, cqp, icq. auto is CBR at the target bitrate.
@@ -170,6 +171,10 @@ pub enum PresentPhase {
 #[cfg(feature = "gui")]
 #[derive(Debug, Clone)]
 pub struct EncodeHud {
+    /// Encoder actually running (e.g. "h264_vaapi", "filmcraft-h264enc").
+    pub encoder: String,
+    /// Mean encode time over the last ~1 s window (steadier than `encode_ms`).
+    pub encode_avg_ms: f64,
     pub pack_ms: f64,
     pub convert_ms: f64,
     pub upload_ms: f64,
@@ -187,6 +192,8 @@ pub struct EncodeHud {
 impl Default for EncodeHud {
     fn default() -> Self {
         Self {
+            encoder: String::new(),
+            encode_avg_ms: 0.0,
             pack_ms: 0.0,
             convert_ms: 0.0,
             upload_ms: 0.0,
@@ -531,6 +538,9 @@ fn present_session(
 /// Timings the encode loop updates; the GUI polls them.
 #[derive(Debug, Clone, Default)]
 struct EncodeHudShim {
+    encoder: String,
+    encode_sum_ms: f64,
+    encode_avg_ms: f64,
     pack_ms: f64,
     convert_ms: f64,
     upload_ms: f64,
@@ -556,6 +566,10 @@ impl EncodeHudShim {
         self.convert_ms = c;
         self.upload_ms = u;
         self.encode_ms = e;
+        self.encode_sum_ms += e;
+        if self.encoder != enc.name() {
+            self.encoder = enc.name().to_owned();
+        }
         self.path = enc.conversion_path().to_owned();
         let (w, h) = enc.output_size();
         self.output_w = w;
@@ -583,8 +597,12 @@ impl EncodeHudShim {
             let secs = elapsed.as_secs_f64();
             self.source_fps = self.frames_window as f64 / secs;
             self.repeat_fps = self.repeats_window as f64 / secs;
+            if self.frames_window > 0 {
+                self.encode_avg_ms = self.encode_sum_ms / self.frames_window as f64;
+            }
             tracing::info!(
-                "capture path {}  {}x{}  source {:.1} fps (+{:.1} repeats/s)  pack/map {:.2} ms  convert {:.2} ms  upload {:.2} ms  encode {:.2} ms{}",
+                "encoder {}  capture path {}  {}x{}  source {:.1} fps (+{:.1} repeats/s)  pack/map {:.2} ms  convert {:.2} ms  upload {:.2} ms  encode {:.2} ms (avg {:.2} ms){}",
+                self.encoder,
                 self.path,
                 self.capture_w,
                 self.capture_h,
@@ -594,8 +612,10 @@ impl EncodeHudShim {
                 self.convert_ms,
                 self.upload_ms,
                 self.encode_ms,
+                self.encode_avg_ms,
                 self.fallback_note.as_deref().map(|n| format!("  [{n}]")).unwrap_or_default()
             );
+            self.encode_sum_ms = 0.0;
             self.frames_window = 0;
             self.repeats_window = 0;
             self.window_start = Some(now);
@@ -605,6 +625,8 @@ impl EncodeHudShim {
     #[cfg(feature = "gui")]
     fn to_hud(&self) -> EncodeHud {
         EncodeHud {
+            encoder: self.encoder.clone(),
+            encode_avg_ms: self.encode_avg_ms,
             pack_ms: self.pack_ms,
             convert_ms: self.convert_ms,
             upload_ms: self.upload_ms,

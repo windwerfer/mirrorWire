@@ -17,6 +17,8 @@ pub enum EncoderBackend {
     Vaapi,
     X264,
     VideoToolbox,
+    /// Pure-Rust FilmCraft encoder (cargo feature `filmcraft`), never picked by `Auto`.
+    Filmcraft,
 }
 
 impl std::str::FromStr for EncoderBackend {
@@ -27,7 +29,8 @@ impl std::str::FromStr for EncoderBackend {
             "vaapi" => Self::Vaapi,
             "x264" | "software" => Self::X264,
             "videotoolbox" => Self::VideoToolbox,
-            _ => bail!("unknown encoder backend {s:?} (auto, vaapi, x264, videotoolbox)"),
+            "filmcraft" => Self::Filmcraft,
+            _ => bail!("unknown encoder backend {s:?} (auto, vaapi, x264, videotoolbox, filmcraft)"),
         })
     }
 }
@@ -39,7 +42,29 @@ impl EncoderBackend {
             Self::Vaapi => "vaapi",
             Self::X264 => "x264",
             Self::VideoToolbox => "videotoolbox",
+            Self::Filmcraft => "filmcraft",
         }
+    }
+
+    /// Whether this build can open the backend at all (FilmCraft is a cargo feature).
+    pub fn compiled_in(self) -> bool {
+        !matches!(self, Self::Filmcraft) || cfg!(feature = "filmcraft")
+    }
+
+    /// Backends worth offering on this platform in this build (for the GUI selector).
+    pub fn selectable() -> Vec<Self> {
+        let mut v = vec![Self::Auto];
+        if cfg!(target_os = "linux") {
+            v.push(Self::Vaapi);
+        }
+        if cfg!(target_os = "macos") {
+            v.push(Self::VideoToolbox);
+        }
+        v.push(Self::X264);
+        if Self::Filmcraft.compiled_in() {
+            v.push(Self::Filmcraft);
+        }
+        v
     }
 }
 
@@ -221,8 +246,15 @@ unsafe impl Send for VaapiVpp {}
 /// Low-latency H.264 encoder: no B-frames, no lookahead, one packet out per
 /// frame in, IDR on demand. Input is converted to NV12 on the GPU (VAAPI VPP)
 /// when that path is available, otherwise on the CPU.
+/// The codec doing the actual encoding.
+enum Core {
+    Ffmpeg(encoder::Video),
+    #[cfg(feature = "filmcraft")]
+    Filmcraft(Box<crate::filmcraft::FcEncoder>),
+}
+
 pub struct Encoder {
-    inner: encoder::Video,
+    inner: Core,
     upload: Upload,
     scaler: Option<Scaler>,
     staging: ffmpeg_next::frame::Video,
@@ -258,6 +290,7 @@ impl Encoder {
             EncoderBackend::Vaapi => &[EncoderBackend::Vaapi],
             EncoderBackend::X264 => &[EncoderBackend::X264],
             EncoderBackend::VideoToolbox => &[EncoderBackend::VideoToolbox],
+            EncoderBackend::Filmcraft => &[EncoderBackend::Filmcraft],
         };
         let mut last_err = anyhow!("no encoder backend tried");
         for &backend in order {
@@ -310,11 +343,14 @@ impl Encoder {
     }
 
     fn open(config: &EncoderConfig, backend: EncoderBackend) -> Result<Self> {
+        if backend == EncoderBackend::Filmcraft {
+            return Self::open_filmcraft(config);
+        }
         let (codec_name, sw_format) = match backend {
             EncoderBackend::Vaapi => ("h264_vaapi", Pixel::NV12),
             EncoderBackend::X264 => ("libx264", Pixel::YUV420P),
             EncoderBackend::VideoToolbox => ("h264_videotoolbox", Pixel::NV12),
-            EncoderBackend::Auto => unreachable!(),
+            EncoderBackend::Auto | EncoderBackend::Filmcraft => unreachable!(),
         };
         let codec = encoder::find_by_name(codec_name)
             .ok_or_else(|| anyhow!("{codec_name} not built into this FFmpeg"))?;
@@ -396,7 +432,7 @@ impl Encoder {
                 }
                 Upload::Software
             }
-            EncoderBackend::Auto => unreachable!(),
+            EncoderBackend::Auto | EncoderBackend::Filmcraft => unreachable!(),
         };
 
         let inner = enc
@@ -439,7 +475,7 @@ impl Encoder {
         tracing::info!("{rc_summary}");
 
         Ok(Self {
-            inner,
+            inner: Core::Ffmpeg(inner),
             upload,
             scaler: None,
             staging: ffmpeg_next::frame::Video::new(sw_format, config.width, config.height),
@@ -457,6 +493,37 @@ impl Encoder {
             last_upload_us: 0,
             last_encode_us: 0,
         })
+    }
+
+    #[cfg(feature = "filmcraft")]
+    fn open_filmcraft(config: &EncoderConfig) -> Result<Self> {
+        let fc = crate::filmcraft::FcEncoder::new(config)?;
+        let rc_summary = fc.summary.clone();
+        tracing::info!("{rc_summary}");
+        Ok(Self {
+            inner: Core::Filmcraft(Box::new(fc)),
+            upload: Upload::Software,
+            scaler: None,
+            staging: ffmpeg_next::frame::Video::new(Pixel::YUV420P, config.width, config.height),
+            packed: ffmpeg_next::frame::Video::empty(),
+            config: config.clone(),
+            name: crate::filmcraft::NAME,
+            conversion: path::SHM_CPU,
+            rc_summary,
+            start_us: None,
+            last_pts: None,
+            have_frame: false,
+            fallback_note: None,
+            last_pack_us: 0,
+            last_convert_us: 0,
+            last_upload_us: 0,
+            last_encode_us: 0,
+        })
+    }
+
+    #[cfg(not(feature = "filmcraft"))]
+    fn open_filmcraft(_config: &EncoderConfig) -> Result<Self> {
+        bail!("this build has no FilmCraft encoder (cargo feature `filmcraft`)")
     }
 
     /// Whether this encoder can take DMA-BUF frames (VAAPI only).
@@ -509,11 +576,27 @@ impl Encoder {
             ffmpeg_next::picture::Type::None
         };
 
+        let mut out = Vec::with_capacity(1);
+        #[cfg(feature = "filmcraft")]
+        if let Core::Filmcraft(fc) = &mut self.inner {
+            self.last_upload_us = 0;
+            let t_enc0 = now_us();
+            let aus = fc.encode(&self.staging, pts, force_keyframe)?;
+            for (data, keyframe) in aus {
+                out.push(EncodedFrame { seq, keyframe, data: Bytes::from(data), capture_us, encoded_us: now_us() });
+            }
+            self.last_encode_us = now_us().saturating_sub(t_enc0);
+            return Ok(out);
+        }
+        // libx264 does its work inside send_frame, so the encode timer starts
+        // there for software; for VAAPI it starts after the upload.
+        let mut t_send = None;
         match &self.upload {
             Upload::Software => {
                 self.staging.set_pts(Some(pts));
                 self.staging.set_kind(kind);
-                self.inner.send_frame(&self.staging)?;
+                t_send = Some(now_us());
+                ffmpeg_of(&mut self.inner)?.send_frame(&self.staging)?;
                 self.last_upload_us = 0;
             }
             Upload::Vaapi { frames, .. } => {
@@ -522,7 +605,7 @@ impl Encoder {
                     // Already a GPU surface (VPP output, from shared memory or DMA-BUF).
                     self.packed.set_pts(Some(pts));
                     self.packed.set_kind(kind);
-                    self.inner.send_frame(&self.packed)?;
+                    ffmpeg_of(&mut self.inner)?.send_frame(&self.packed)?;
                     self.last_upload_us = 0; // upload (if any) happened inside VPP
                 } else {
                     // Prefer the VPP/CPU output in `packed` when it holds NV12
@@ -532,11 +615,11 @@ impl Encoder {
                 }
             }
         }
-        let t_enc0 = now_us();
+        let t_enc0 = t_send.unwrap_or_else(now_us);
 
-        let mut out = Vec::with_capacity(1);
         let mut packet = Packet::empty();
-        while self.inner.receive_packet(&mut packet).is_ok() {
+        let inner = ffmpeg_of(&mut self.inner)?;
+        while inner.receive_packet(&mut packet).is_ok() {
             if let Some(data) = packet.data() {
                 out.push(EncodedFrame {
                     seq,
@@ -665,7 +748,7 @@ impl Encoder {
             }
             hw_frame.set_pts(Some(pts));
             hw_frame.set_kind(kind);
-            self.inner.send_frame(&hw_frame)?;
+            ffmpeg_of(&mut self.inner)?.send_frame(&hw_frame)?;
         }
         Ok(())
     }
@@ -1120,6 +1203,14 @@ fn format_pixel(p: Pixel) -> String {
         return format!("{p:?}").to_ascii_lowercase();
     }
     unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned()
+}
+
+fn ffmpeg_of(inner: &mut Core) -> Result<&mut encoder::Video> {
+    match inner {
+        Core::Ffmpeg(e) => Ok(e),
+        #[cfg(feature = "filmcraft")]
+        Core::Filmcraft(_) => bail!("not an FFmpeg encoder"),
+    }
 }
 
 fn is_vaapi_pixel(p: Pixel) -> bool {

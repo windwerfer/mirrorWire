@@ -1,5 +1,7 @@
 pub mod decode;
 pub mod encode;
+#[cfg(feature = "filmcraft")]
+pub mod filmcraft;
 pub mod frame;
 mod hw;
 pub mod pattern;

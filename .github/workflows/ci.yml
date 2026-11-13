@@ -48,3 +48,8 @@ jobs:
       - run: cargo test --workspace --locked
       - name: Loopback test (test pattern -> QUIC -> headless viewer)
         run: scripts/loopback-test.sh 5 --encoder x264
+      # Optional pure-Rust FilmCraft encoder (cargo feature `filmcraft`).
+      - run: cargo clippy -p mirrorwire-media -p mirrorwire-app --all-targets --locked --features mirrorwire-app/filmcraft -- -D warnings
+      - run: cargo test -p mirrorwire-media --locked --features filmcraft
+      - name: Loopback test with FilmCraft
+        run: MIRRORWIRE_FEATURES=filmcraft scripts/loopback-test.sh 5 --encoder filmcraft

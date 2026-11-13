@@ -29,6 +29,7 @@ the diff readable. See [roadmap.md](roadmap.md) "Known debt".
 |---|---|---|
 | Unit | `#[cfg(test)]` in `mirrorwire-proto` | header encode/parse, fragmentation and reassembly (loss, reordering, late fragments), control framing, clock offset, stats |
 | Unit | `#[cfg(test)]` in `mirrorwire-net` | identity load/create, URI round trip and rejection of bad fingerprints, QR generation |
+| Unit (FilmCraft) | `mirrorwire-media/src/filmcraft.rs`, feature `filmcraft` | FilmCraft output via the real `Encoder` decodes with FFmpeg, markers read back, keyframe on request; an `#[ignore]` x264-vs-FilmCraft benchmark |
 | Loopback (end to end) | `scripts/loopback-test.sh` | test pattern → encoder → QUIC (pinned TLS, pairing) → reassembly → decoder, on localhost, with latency stats |
 | Real hardware | the owner's T480s + iMac | portal capture, VAAPI, Wi-Fi, OpenGL on a non-Metal Mac (only he can run this) |
 
@@ -69,10 +70,42 @@ Rules (adapted from FilmCraft's "report progress honestly"):
   baseline; a sharpness claim needs a photo/screenshot of text at 100 % or a PSNR/SSIM number
   from a decoded dump.
 
+### 3.1 FilmCraft vs x264 (box, 2026-11-13)
+
+Machine: the agent box, 8 vCPU Intel Xeon VM, no GPU, release build, so this says nothing about
+the T480s (untested on target). Two measurements:
+
+Encoder-only benchmark (synthetic gradient + moving pattern, 120 frames, CBR 15 Mbit/s, Y-PSNR
+against a BT.601 reference, so the ceiling is ~50 dB):
+`MIRRORWIRE_BENCH_SIZE=1920x1080 cargo test --release -p mirrorwire-media --features filmcraft -- --ignored bench_ --nocapture`
+
+| Encoder | Size | encode mean / p95 | max fps | Mbit/s @60 | Y-PSNR |
+|---|---|---|---|---|---|
+| libx264 | 1920×1080 | 2.57 / 2.98 ms | ~389 | 14.4 | 42.10 dB |
+| filmcraft-h264enc | 1920×1080 | 10.31 / 14.94 ms | ~97 | 14.6 | 41.71 dB |
+| libx264 | 2000×1000 | 2.65 / 3.16 ms | ~377 | 14.3 | 41.87 dB |
+| filmcraft-h264enc | 2000×1000 | 11.97 / 15.46 ms | ~84 | 14.7 | 41.54 dB |
+
+End-to-end loopback, 15 s, test pattern at 60 fps, all frame markers read back, 0 mismatches
+(`MIRRORWIRE_FEATURES=filmcraft scripts/loopback-test.sh 15 --encoder filmcraft --width W --height H --bitrate-kbps K`):
+
+| Encoder | Size, bitrate | fps | Mbit/s | capture_to_encoded mean / p95 | capture_to_decoded mean / p95 |
+|---|---|---|---|---|---|
+| x264 | 1920×1080, 30 Mbit/s | 59.8 | 28.7 | 6.37 / 7.95 ms | 7.81 / 9.71 ms |
+| filmcraft | 1920×1080, 30 Mbit/s | 59.9 | 21.0 | 14.67 / 19.23 ms | 15.74 / 20.82 ms |
+| x264 | 2000×1000, 15 Mbit/s | 59.7 | 14.8 | 6.41 / 8.11 ms | 7.84 / 10.12 ms |
+| filmcraft | 2000×1000, 15 Mbit/s | 59.9 | 15.0 | 15.61 / 20.13 ms | 17.13 / 22.70 ms |
+
+Reading: FilmCraft keeps 60 fps at these sizes on 8 cores with similar quality per bit, but
+costs ~8–9 ms more per frame than x264 (ultrafast/zerolatency) and much more CPU. At 30 Mbit/s
+it undershot the target (21 Mbit/s) on this easy content. On the 4-core T480s expect it to be
+slower still; VAAPI remains the default there.
+
 Useful runs:
 
 ```sh
 scripts/loopback-test.sh 30 --encoder x264 --width 1920 --height 1080 --bitrate-kbps 30000
+MIRRORWIRE_FEATURES=filmcraft scripts/loopback-test.sh 15 --encoder filmcraft --width 1920 --height 1080 --bitrate-kbps 30000
 scripts/loopback-test.sh 10 --intra-refresh -- --simulate-loss 0.5
 ```
 
@@ -92,6 +125,7 @@ screen**, not logs. So:
 ## 5. CI and artifacts
 
 - `ci.yml` (push to `main`, PRs): clippy `-D warnings`, `cargo test`, 5 s loopback with x264,
+  then clippy/tests/5 s loopback again with feature `filmcraft` and `--encoder filmcraft`,
   the reusable audit workflow, and the reusable SonarCloud scan (`needs: audit`).
 - `sonarcloud.yml` (called from CI; also from Build on `v*` tags and
   `workflow_dispatch`; can be dispatched on its own): if `SONAR_TOKEN` is
