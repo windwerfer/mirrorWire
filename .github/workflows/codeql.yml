@@ -6,9 +6,18 @@
 name: CodeQL
 
 on:
+  # Docs-only changes skip this workflow.
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE*'
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE*'
   schedule:
     # Wednesday 07:27 UTC, staggered from the Monday 06:27 audit cron.
     - cron: "27 7 * * 3"

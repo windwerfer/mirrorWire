@@ -1,9 +1,18 @@
 name: CI
 
 on:
+  # Docs-only changes skip this workflow.
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE*'
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE*'
   workflow_dispatch:
 
 permissions:
