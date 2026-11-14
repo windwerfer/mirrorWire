@@ -4,6 +4,12 @@ These were decided with the owner (windwerfer). Agents do not change them on the
 propose a change, write down the problem, the alternative and its cost, and ask. When the owner
 agrees, update the entry (status, date, reason) in the same commit as the change.
 
+Every new or changed decision also records **Alternatives considered**: what else was on the
+table and why it lost (cost, risk, owner preference). The table stays short; put the details in
+the decision log below the table. The point is that a different agent, months later, can see
+not only what was chosen but what was already rejected and why, so it isn't proposed again
+without new information.
+
 | # | Decision | Why |
 |---|---|---|
 | D1 | **No special privileges.** Capture only via xdg-desktop-portal ScreenCast + PipeWire. No root, `setcap`, KMS/DRM capture, kernel modules, uinput. | The owner refuses tools that need elevated rights (the reason Sunshine was ruled out). Portals are the sanctioned Wayland path and work in a Flatpak. |
