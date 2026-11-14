@@ -7,6 +7,7 @@
 //! platform `MediaCodec` (hardware first, Google's software decoder as the
 //! fallback).
 
+pub mod codec_list;
 pub mod h264;
 pub mod stats;
 pub mod yuv;
