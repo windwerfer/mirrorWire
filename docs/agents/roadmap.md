@@ -88,7 +88,7 @@ target), **planned**, **idea**. Update this file when an item moves.
    Part of the same safe API: a `Decoder` trait with our own frame type (today `decode.rs`
    returns `ffmpeg_next::frame::Video`, and there is only one FFmpeg-based decoder), so other
    decoders (VideoToolbox direct, FilmCraft) can be plugged in like the encoder backends. ~1 day.
-   Later, for fun: try a FilmCraft decoder behind `--decoder filmcraft` if one exists.
+   (A FilmCraft decoder option is its own item under Planned.)
 
 1. **Quality and latency fix:** stream at the screen's native resolution (no fixed
    2000×1000 scaling), higher default bitrate for desktop text, move colour conversion and
@@ -145,6 +145,10 @@ target), **planned**, **idea**. Update this file when an item moves.
   texture instead of the CPU YUV→RGBA copy; soft keyboard for the link field (today: QR via
   the camera app, or the keypad + mDNS list); a stable release keystore so updates install
   over each other (CI debug keys change per run).
+- **FilmCraft pure-Rust decoder (later, owner request 2026-11-14):** an opt-in option
+  (`--decoder filmcraft`, cargo feature, GUI selector), like the FilmCraft encoder. It is never
+  picked automatically. The goal is for the owner to judge whether its latency is acceptable,
+  with decode time shown in the HUD next to FFmpeg's. Depends on the 0c `Decoder` trait.
 - **Android presenter** later (MediaProjection + MediaCodec encode; needs Java/JNI glue).
 - **Browser viewer (WebAssembly), sketch:** see also [Future: phone/tablet as input device](#future-phonetablet-as-input-device) for the agreed trust model and input-mode scope.
   - Presenter: add an HTTP/3 WebTransport endpoint on the presenter's own UDP port (any port, including 47800; not 443), e.g. `wtransport` or `h3` + `quinn`. Video goes as WebTransport datagrams with the existing fragment header; control messages on a bidirectional stream. Decode with **WebCodecs**.
