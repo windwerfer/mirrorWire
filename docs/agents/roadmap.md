@@ -27,6 +27,29 @@ target), **planned**, **idea**. Update this file when an item moves.
 
 ## Next (owner-agreed order)
 
+0. **TOP PRIORITY: reliable, likable transport (owner, 2026-11-14).** The prototype only
+   continues if streaming over real Wi-Fi is stable and pleasant. Do these first, in order:
+   1. **Explain the adaptive-bitrate cuts:** log the reason for each cut (loss / RTT / backlog plus
+      the values) and add a closed-loop simulation test (rate controller + `LossSim`/`BandwidthSim`
+      + encoder model, no QUIC). Find out why "no limit + 2 % random loss" holds only ~17 of
+      40 Mbit (testing.md §3); the 3-point excess-loss rule means 2 % alone cannot cut, so the
+      trigger is RTT, backlog drops or window edge effects. Fix the doc explanation. ~½ day.
+   2. **Delay-gradient signal** (GCC-style trendline): one-way delay trend from `capture_us` /
+      arrival time reported in the `LinkReport` (protocol bump). Cut only on loss plus rising delay;
+      loss with flat delay counts as random. ~250–400 LOC, 1–1.5 days.
+   3. **Ignore loss right after a keyframe or VAAPI reopen** so reopen, then IDR burst, then another
+      cut can't loop; spread IDR parity across frames. ~60–100 LOC.
+   4. **Hysteresis and probing:** remember the last good budget, climb slowly near it, probe with
+      extra FEC before more video, start from the last good value per peer. ~100–150 LOC.
+   5. **Don't cut when FEC recovered everything** (`unrecoverable == 0`); smooth the loss shared by
+      FEC and rate control. ~40–80 LOC.
+   6. **Live VAAPI bitrate without a reopen** (VA-API misc-param buffers or a QP clamp), removing
+      the 5 s reopen limit. ~200–300 LOC FFI, hardware-dependent.
+   7. Small fixes: `lan_cc.rs` window never grows back after persistent congestion; the UI should
+      say CQP/ICQ ignore adaptive bitrate.
+   Alongside: fuzz the proto parsers (fragment, fec, cursor, control) and remove the panicking
+   index/unwrap sites in proto/net, since hostile or corrupt packets must never crash a stream.
+
 1. **Quality and latency fix:** stream at the screen's native resolution (no fixed
    2000×1000 scaling), higher default bitrate for desktop text, move colour conversion and
    scaling to the GPU (VAAPI `scale_vaapi`/hw upload) so `capture_to_encoded` drops.
