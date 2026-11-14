@@ -46,6 +46,19 @@ target), **planned**, **idea**. Update this file when an item moves.
   - Leak check (code reading only): a skipped decoder's `Active` (codec, reader, window) is
     dropped once before the next opens; reopen happens only after a skip; images are dropped
     after conversion. No leak found, not measured on a device.
+  - Owner test 2026-11-14, Build 43570349073 (release-signed, fallback fix): the fallback
+    works. HUD: `SOFTWARE decoder c2.android.avc.decoder (OMX.MTK.VIDEO.DECODER.AVC failed:
+    plane 1: CodecErrorReclaimed)` (so the OMX MTK decoder hits the same plane-1 error),
+    1920x1080, `11.9 fps`, `decode 155.4 ms`, `to RGBA 14.5 ms`, `lost 17`, `in 11.9 decoded 11.9
+    shown 11.9`, `key req 11 flushes 0 input full 0 errors 6`, `fec +12% loss 0.0%
+    unrecoverable frames 17`, presenter `h264_vaapi` 6.46 Mbit/s. Picture: the first frame shows,
+    then it is a still image; with a video behind it a few tiles flip colour back and forth;
+    the cursor (separate overlay) moves but with huge latency. Leads: 155 ms software decode
+    caps the tablet at ~6 fps of real work, so the queue drops frames; 17 unrecoverable frames
+    with 0 % network loss point at frames dropped *before* decode (lost references), so P-frames
+    decode against a stale picture (flipping tiles) until a keyframe that apparently never
+    lands cleanly. Check whether queue drops skip frames the decoder needs, and request a
+    keyframe instead of feeding P-frames after a drop.
   - Next steps: on the tablet, read `adb logcat` around the error (format, usage, plane strides);
     if hardware decode keeps failing CPU reads, render the decoder to a `SurfaceTexture`/
     `AHardwareBuffer` → GL texture (roadmap "Android viewer polish") instead of the CPU path;
