@@ -2,9 +2,11 @@
 //! recovery, and a decode thread. A compact copy of the desktop viewer loop
 //! (`mirrorwire-app/src/viewer.rs`) without FFmpeg.
 
-use crate::codec::{DecodedImage, Decoder};
+use crate::codec::{DecodedImage, Decoder, Fed};
+use crate::codec_list::CodecEntry;
+use crate::stats::{Counters, PipelineHud, PipelineWindow};
 use anyhow::{anyhow, Result};
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use mirrorwire_net::diag::{ConnectStepId, ConnectTrace, HANDSHAKE_TIMEOUT};
 use mirrorwire_net::identity::Identity;
 use mirrorwire_net::pairing::ConnectInfo;
@@ -14,7 +16,7 @@ use mirrorwire_proto::control::{Control, StreamInfo};
 use mirrorwire_proto::cursor::ViewerCursor;
 use mirrorwire_proto::fec::{LinkHud, LinkWindow};
 use mirrorwire_proto::fragment::{AssembledFrame, Reassembler};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -27,7 +29,10 @@ pub struct Status {
     pub trace: ConnectTrace,
     pub fps: f64,
     pub mbps: f64,
+    /// Time from handing a frame to MediaCodec until its picture came out.
     pub decode_ms: f64,
+    /// YUV → RGBA conversion of the last picture.
+    pub convert_ms: f64,
     pub lost: u64,
     pub first_frame: bool,
     /// How the presenter sends the cursor: `separate`, `embedded`, `hidden`.
@@ -36,12 +41,55 @@ pub struct Status {
     pub cursor: Option<Arc<Mutex<ViewerCursor>>>,
     /// FEC overhead, packet loss and rebuilt packets (last ~0.5 s).
     pub link: LinkHud,
+    /// Frames in / decoded / shown per second, and where the picture is stuck.
+    pub pipeline: PipelineHud,
+}
+
+/// Pipeline totals, written by the network loop, the decode thread and the UI.
+#[derive(Default)]
+pub struct PipelineCounters {
+    received: AtomicU64,
+    skipped_waiting_key: AtomicU64,
+    backlog_flushes: AtomicU64,
+    key_requests: AtomicU64,
+    queued: AtomicU64,
+    input_full: AtomicU64,
+    rendered: AtomicU64,
+    superseded: AtomicU64,
+    decoded: AtomicU64,
+    errors: AtomicU64,
+    /// Counted by the UI when it uploads a picture to its texture.
+    pub presented: AtomicU64,
+}
+
+impl PipelineCounters {
+    fn add(c: &AtomicU64, n: u64) {
+        c.fetch_add(n, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> Counters {
+        let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        Counters {
+            received: g(&self.received),
+            skipped_waiting_key: g(&self.skipped_waiting_key),
+            backlog_flushes: g(&self.backlog_flushes),
+            key_requests: g(&self.key_requests),
+            queued: g(&self.queued),
+            input_full: g(&self.input_full),
+            rendered: g(&self.rendered),
+            superseded: g(&self.superseded),
+            decoded: g(&self.decoded),
+            errors: g(&self.errors),
+            presented: g(&self.presented),
+        }
+    }
 }
 
 pub struct Handle {
     pub status: Arc<Mutex<Status>>,
     pub frames: Receiver<DecodedImage>,
     pub recycle: Sender<Vec<u8>>,
+    pub counters: Arc<PipelineCounters>,
     stop: Arc<AtomicBool>,
 }
 
@@ -66,15 +114,24 @@ pub fn spawn(
     identity: Arc<Identity>,
     target: ConnectInfo,
     name: String,
+    decoders: Vec<CodecEntry>,
     repaint: Arc<dyn Fn() + Send + Sync>,
 ) -> Handle {
     let status = Arc::new(Mutex::new(Status::default()));
     let (frames_tx, frames) = bounded::<DecodedImage>(1);
     let (recycle, recycle_rx) = bounded::<Vec<u8>>(2);
     let stop = Arc::new(AtomicBool::new(false));
-    let handle = Handle { status: status.clone(), frames: frames.clone(), recycle, stop: stop.clone() };
+    let counters = Arc::new(PipelineCounters::default());
+    let handle = Handle {
+        status: status.clone(),
+        frames: frames.clone(),
+        recycle,
+        counters: counters.clone(),
+        stop: stop.clone(),
+    };
+    let channels = Channels { frames_tx, frames_drain: frames, recycle_rx };
     runtime.spawn(async move {
-        let result = run(identity, target, name, status.clone(), frames_tx, frames, recycle_rx, stop, repaint.clone()).await;
+        let result = run(identity, target, name, decoders, status.clone(), channels, counters, stop, repaint.clone()).await;
         let mut s = status.lock().unwrap_or_else(|e| e.into_inner());
         s.connected = false;
         if let Err(e) = result {
@@ -87,15 +144,22 @@ pub fn spawn(
     handle
 }
 
+/// Picture hand-over between the decode thread and the UI.
+struct Channels {
+    frames_tx: Sender<DecodedImage>,
+    frames_drain: Receiver<DecodedImage>,
+    recycle_rx: Receiver<Vec<u8>>,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run(
     identity: Arc<Identity>,
     target: ConnectInfo,
     name: String,
+    decoders: Vec<CodecEntry>,
     status: Arc<Mutex<Status>>,
-    frames_tx: Sender<DecodedImage>,
-    frames_drain: Receiver<DecodedImage>,
-    recycle_rx: Receiver<Vec<u8>>,
+    channels: Channels,
+    counters: Arc<PipelineCounters>,
     stop: Arc<AtomicBool>,
     repaint: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<()> {
@@ -115,20 +179,32 @@ async fn run(
     let mut stream_updates = session.stream_updates.clone();
 
     let need_keyframe = Arc::new(AtomicBool::new(true));
-    // Bounded, flushed on overflow: decode only fresh frames (see the
-    // desktop viewer).
-    let (decode_tx, decode_rx) = bounded::<AssembledFrame>(2);
+    // Bounded, flushed on overflow (then we wait for a keyframe). Deeper
+    // than the desktop viewer's 2: a phone's decoder takes several frame
+    // times for a keyframe, and with a 2-deep queue every keyframe overflowed
+    // it, which threw the stream away and asked for the next keyframe: the
+    // picture stalled after the first frame (measured on the emulator: ~1
+    // picture/s, 2+ flushes per second). Frames that wait are still decoded,
+    // only their YUV → RGBA copy is skipped (see `Decoder::decode`).
+    let (decode_tx, decode_rx) = bounded::<AssembledFrame>(DECODE_QUEUE);
     let decode_flush = decode_rx.clone();
     let control = session.control_sender();
     let dec_status = status.clone();
     let dec_need_key = need_keyframe.clone();
     let dec_trace = trace.clone();
     let dec_repaint = repaint.clone();
+    let dec_counters = counters.clone();
     let decode_thread = std::thread::Builder::new().name("decode".into()).spawn(move || {
-        decode_loop(
-            decode_rx, info, dec_status, frames_tx, frames_drain, recycle_rx, dec_need_key, control, dec_trace,
-            dec_repaint,
-        )
+        let ctx = DecodeCtx {
+            status: dec_status,
+            channels,
+            need_keyframe: dec_need_key,
+            control,
+            trace: dec_trace,
+            repaint: dec_repaint,
+            counters: dec_counters,
+        };
+        decode_loop(decode_rx, info, decoders, ctx)
     })?;
 
     let self_healing = session.stream_info.intra_refresh;
@@ -138,9 +214,19 @@ async fn run(
     let mut lost = 0u64;
     let mut window = (Instant::now(), 0u64, 0u64);
     let mut link_window = LinkWindow::default();
+    let mut pipeline_window = PipelineWindow::default();
     let close_reason = loop {
         if stop.load(Ordering::Acquire) {
             break None;
+        }
+        // Before waiting for a datagram, so a stall with no traffic still updates the HUD.
+        if let Some(hud) = pipeline_window.tick(counters.snapshot(), now_us(), 1_000_000) {
+            if let Some(warning) = hud.stall() {
+                tracing::warn!("{warning} [{}]", hud.line().replace('\n', "; "));
+            } else {
+                tracing::info!("pipeline: {}", hud.line().replace('\n', "; "));
+            }
+            status.lock().unwrap_or_else(|e| e.into_inner()).pipeline = hud.clone();
         }
         let datagram = tokio::select! {
             d = session.conn.read_datagram() => d,
@@ -169,6 +255,7 @@ async fn run(
             continue;
         }
         let Some((frame, event)) = reassembler.push(datagram, now_us()) else { continue };
+        PipelineCounters::add(&counters.received, 1);
         window.1 += 1;
         window.2 += frame.data.len() as u64;
         if window.0.elapsed() >= Duration::from_secs(1) {
@@ -187,8 +274,10 @@ async fn run(
         }
         if need_keyframe.load(Ordering::Acquire) {
             if !frame.keyframe {
+                PipelineCounters::add(&counters.skipped_waiting_key, 1);
                 if last_request.elapsed() > Duration::from_millis(100) {
                     session.request_keyframe("recovering from loss");
+                    PipelineCounters::add(&counters.key_requests, 1);
                     last_request = Instant::now();
                 }
                 continue;
@@ -199,9 +288,11 @@ async fn run(
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 while decode_flush.try_recv().is_ok() {}
+                PipelineCounters::add(&counters.backlog_flushes, 1);
                 need_keyframe.store(true, Ordering::Release);
                 if last_request.elapsed() > Duration::from_millis(100) {
                     session.request_keyframe("decoder backlog");
+                    PipelineCounters::add(&counters.key_requests, 1);
                     last_request = Instant::now();
                 }
             }
@@ -220,54 +311,101 @@ async fn run(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn decode_loop(
-    rx: Receiver<AssembledFrame>,
-    info: StreamInfo,
+/// Everything the decode thread shares with the session.
+struct DecodeCtx {
     status: Arc<Mutex<Status>>,
-    frames_tx: Sender<DecodedImage>,
-    frames_drain: Receiver<DecodedImage>,
-    recycle_rx: Receiver<Vec<u8>>,
+    channels: Channels,
     need_keyframe: Arc<AtomicBool>,
     control: tokio::sync::mpsc::UnboundedSender<Control>,
     trace: ConnectTrace,
     repaint: Arc<dyn Fn() + Send + Sync>,
-) -> Result<()> {
-    let mut decoder = Decoder::new(info.width, info.height);
+    counters: Arc<PipelineCounters>,
+}
+
+impl DecodeCtx {
+    fn request_keyframe(&self, reason: &str) {
+        self.need_keyframe.store(true, Ordering::Release);
+        let _ = self.control.send(Control::RequestKeyframe { reason: reason.into() });
+        PipelineCounters::add(&self.counters.key_requests, 1);
+    }
+
+    /// Hands a picture to the UI; the newest picture wins.
+    fn show(&self, img: DecodedImage, decoder: &Decoder, first: &mut bool) {
+        {
+            let mut s = self.status.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(ms) = decoder.latency_ms() {
+                s.decode_ms = ms;
+            }
+            s.convert_ms = decoder.convert_ms();
+            s.decoder = decoder.name().to_owned();
+            s.first_frame = true;
+        }
+        if *first {
+            *first = false;
+            self.trace.ok(ConnectStepId::FirstFrame, format!("{}x{} via {}", img.width, img.height, decoder.name()));
+        }
+        PipelineCounters::add(&self.counters.decoded, 1);
+        if let Err(TrySendError::Full(img)) = self.channels.frames_tx.try_send(img) {
+            let _ = self.channels.frames_drain.try_recv();
+            let _ = self.channels.frames_tx.try_send(img);
+        }
+        (self.repaint)();
+    }
+}
+
+/// Frames that may wait for the decoder before the queue is flushed.
+const DECODE_QUEUE: usize = 6;
+
+/// How long the decode thread waits for a frame before it polls MediaCodec
+/// for pictures that finished late.
+const POLL_EVERY: Duration = Duration::from_millis(8);
+
+fn decode_loop(rx: Receiver<AssembledFrame>, info: StreamInfo, decoders: Vec<CodecEntry>, ctx: DecodeCtx) -> Result<()> {
+    let mut decoder = Decoder::new(info.width, info.height, &decoders);
     let mut first = true;
-    while let Ok(frame) = rx.recv() {
-        if let Ok(buf) = recycle_rx.try_recv() {
+    let mut synced = crate::codec::Counts::default();
+    loop {
+        let frame = match rx.recv_timeout(POLL_EVERY) {
+            Ok(f) => Some(f),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        if let Ok(buf) = ctx.channels.recycle_rx.try_recv() {
             decoder.recycle(buf);
         }
-        let t0 = now_us();
-        match decoder.decode(&frame.data, frame.keyframe, frame.completed_us) {
-            Ok(Some(img)) => {
-                let decode_ms = (now_us().saturating_sub(t0)) as f64 / 1000.0;
-                {
-                    let mut s = status.lock().unwrap_or_else(|e| e.into_inner());
-                    s.decode_ms = decode_ms;
-                    s.decoder = decoder.name().to_owned();
-                    s.first_frame = true;
+        let result = match &frame {
+            // A newer frame is already waiting: decode this one, don't show it.
+            Some(f) => decoder.decode(&f.data, f.keyframe, f.completed_us, rx.is_empty()),
+            None => decoder.poll().map(Fed::Queued),
+        };
+        // Mirror the decoder's own counters into the shared ones.
+        let now = decoder.counts();
+        PipelineCounters::add(&ctx.counters.queued, now.queued - synced.queued);
+        PipelineCounters::add(&ctx.counters.input_full, now.input_full - synced.input_full);
+        PipelineCounters::add(&ctx.counters.rendered, now.rendered - synced.rendered);
+        PipelineCounters::add(&ctx.counters.superseded, now.superseded - synced.superseded);
+        synced = now;
+        match result {
+            Ok(Fed::Queued(Some(img))) => ctx.show(img, &decoder, &mut first),
+            Ok(Fed::Queued(None)) | Ok(Fed::NotOpen) => {
+                if frame.is_some() {
+                    ctx.status.lock().unwrap_or_else(|e| e.into_inner()).decoder = decoder.name().to_owned();
                 }
-                if first {
-                    first = false;
-                    trace.ok(ConnectStepId::FirstFrame, format!("{}x{} via {}", img.width, img.height, decoder.name()));
-                }
-                // Newest picture wins: drop an undisplayed one.
-                if let Err(TrySendError::Full(img)) = frames_tx.try_send(img) {
-                    let _ = frames_drain.try_recv();
-                    let _ = frames_tx.try_send(img);
-                }
-                repaint();
             }
-            Ok(None) => {
-                status.lock().unwrap_or_else(|e| e.into_inner()).decoder = decoder.name().to_owned();
+            Ok(Fed::InputFull(img)) => {
+                // The dropped frame is a reference for the next ones: without
+                // a keyframe the picture would stay broken or frozen.
+                tracing::warn!("decoder input full, frame dropped; asking for a keyframe");
+                ctx.request_keyframe("decoder input full");
+                if let Some(img) = img {
+                    ctx.show(img, &decoder, &mut first);
+                }
             }
             Err(e) => {
                 tracing::warn!("decode error: {e:#}");
-                need_keyframe.store(true, Ordering::Release);
-                let _ = control.send(Control::RequestKeyframe { reason: "decode error".into() });
-                let mut s = status.lock().unwrap_or_else(|e| e.into_inner());
+                PipelineCounters::add(&ctx.counters.errors, 1);
+                ctx.request_keyframe("decode error");
+                let mut s = ctx.status.lock().unwrap_or_else(|e| e.into_inner());
                 s.decoder = format!("{} (error: {e:#})", decoder.name());
             }
         }

@@ -105,11 +105,20 @@ impl ViewerApp {
         self.cursor_tex = None;
         self.target_name = target.name.clone().unwrap_or_else(|| target.addr.to_string());
         let repaint = ctx.clone();
+        // Written by the Java shell at start-up (MediaCodecList has no NDK API).
+        let decoders = std::fs::read_to_string(self.data_dir.join(crate::codec_list::CODEC_LIST_FILE))
+            .map(|t| crate::codec_list::parse(&t))
+            .unwrap_or_default();
+        tracing::info!(
+            "H.264 decoders on this device: {}",
+            decoders.iter().map(|d| format!("{}{}", d.name, if d.hardware { " (hw)" } else { "" })).collect::<Vec<_>>().join(", ")
+        );
         self.session = Some(session::spawn(
             self.runtime.handle(),
             identity,
             target,
             "Android".into(),
+            decoders,
             Arc::new(move || repaint.request_repaint()),
         ));
     }
@@ -256,7 +265,7 @@ impl ViewerApp {
         if self.show_overlay {
             let stream = status.stream.as_ref();
             let text = format!(
-                "{}x{}  {:.1} fps  {:.2} Mbit/s  ({})\n{}  decode {:.1} ms  lost {}\ncursor {}\n{}\ntap: hide",
+                "{}x{}  {:.1} fps  {:.2} Mbit/s  presenter encodes with {}\n{}\ndecode {:.1} ms  to RGBA {:.1} ms  lost {}\n{}\ncursor {}\n{}\ntap: hide",
                 stream.map(|s| s.width).unwrap_or(0),
                 stream.map(|s| s.height).unwrap_or(0),
                 status.fps,
@@ -264,11 +273,26 @@ impl ViewerApp {
                 stream.map(|s| s.encoder.as_str()).unwrap_or("?"),
                 status.decoder,
                 status.decode_ms,
+                status.convert_ms,
                 status.lost,
+                status.pipeline.line(),
                 if status.cursor_mode.is_empty() { "?" } else { status.cursor_mode.as_str() },
                 status.link.line(),
             );
-            ui.painter().text(rect.left_top() + egui::vec2(8.0, 40.0), egui::Align2::LEFT_TOP, text, egui::FontId::monospace(12.0), egui::Color32::from_rgb(0, 255, 120));
+            let galley = ui.painter().layout(
+                text,
+                egui::FontId::monospace(12.0),
+                egui::Color32::from_rgb(0, 255, 120),
+                rect.width() - 170.0,
+            );
+            let pos = rect.left_top() + egui::vec2(8.0, 40.0);
+            ui.painter().galley(pos, galley.clone(), egui::Color32::from_rgb(0, 255, 120));
+            if let Some(warning) = status.pipeline.stall() {
+                let warn = ui.painter().layout(warning, egui::FontId::proportional(15.0), egui::Color32::from_rgb(255, 90, 90), rect.width() - 16.0);
+                let at = pos + egui::vec2(0.0, galley.size().y + 8.0);
+                ui.painter().rect_filled(egui::Rect::from_min_size(at, warn.size()).expand(4.0), 4.0, egui::Color32::from_black_alpha(200));
+                ui.painter().galley(at, warn, egui::Color32::from_rgb(255, 90, 90));
+            }
             let button = egui::Rect::from_min_size(rect.right_top() + egui::vec2(-150.0, 40.0), egui::vec2(140.0, 44.0));
             if ui.put(button, egui::Button::new("Disconnect")).clicked() {
                 self.disconnect();
@@ -320,6 +344,7 @@ impl eframe::App for ViewerApp {
                     None => self.texture = Some(ctx.load_texture("video", image, egui::TextureOptions::LINEAR)),
                 }
                 let _ = s.recycle.try_send(img.rgba);
+                s.counters.presented.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         match status {
