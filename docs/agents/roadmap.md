@@ -63,6 +63,12 @@ target), **planned**, **idea**. Update this file when an item moves.
     Unclear whether that build really used hardware decode (it may have, despite the name), or
     whether the software decoder got slower (queue/conversion changes since `d4e9856`/`7a8d2e8`).
     Compare: put the first APK's decoder name + decode time next to the current one.
+  - Owner hypothesis: the 155 ms may not be real decode work at all; the HUD says
+    `decoded 11.9 shown 11.9` but nothing on screen changes. Candidates: (a) frames dropped or
+    decoded incompletely (lost references); (b) output pictures never reach the texture (the
+    draw/upload path keeps showing the first picture, stale buffer, wrong stride/plane);
+    (c) the timing measures waiting, not decoding. Check first: hash or sample a few pixels of
+    each converted RGBA frame; if they change, the bug is in drawing, if not, in decode/queue.
   - Next steps: on the tablet, read `adb logcat` around the error (format, usage, plane strides);
     if hardware decode keeps failing CPU reads, render the decoder to a `SurfaceTexture`/
     `AHardwareBuffer` → GL texture (roadmap "Android viewer polish") instead of the CPU path;
