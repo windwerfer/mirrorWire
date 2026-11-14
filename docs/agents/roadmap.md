@@ -149,6 +149,11 @@ target), **planned**, **idea**. Update this file when an item moves.
   (`--decoder filmcraft`, cargo feature, GUI selector), like the FilmCraft encoder. It is never
   picked automatically. The goal is for the owner to judge whether its latency is acceptable,
   with decode time shown in the HUD next to FFmpeg's. Depends on the 0c `Decoder` trait.
+- **Rename to BeamCraft (owner 2026-11-14):** the owner's favourite (alternatives: WireCraft
+  etc.). Steps: check the name is free (GitHub, Flathub, app stores, trademarks); then do one
+  rename before friends install it: app id, mDNS service, ALPN, URI scheme, config dir (D5),
+  crate names, docs, packaging. Keep port 47800. Consider migrating old config and pairings from
+  `mirrorwire`. Needs the owner's go-ahead on the final name (a D5 change).
 - **Android presenter** later (MediaProjection + MediaCodec encode; needs Java/JNI glue).
 - **Browser viewer (WebAssembly), sketch:** see also [Future: phone/tablet as input device](#future-phonetablet-as-input-device) for the agreed trust model and input-mode scope.
   - Presenter: add an HTTP/3 WebTransport endpoint on the presenter's own UDP port (any port, including 47800; not 443), e.g. `wtransport` or `h3` + `quinn`. Video goes as WebTransport datagrams with the existing fragment header; control messages on a bidirectional stream. Decode with **WebCodecs**.
