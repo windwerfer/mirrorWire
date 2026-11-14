@@ -8,6 +8,7 @@
 //! fallback).
 
 pub mod h264;
+pub mod stats;
 pub mod yuv;
 
 #[cfg(target_os = "android")]
