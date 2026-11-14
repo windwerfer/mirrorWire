@@ -242,11 +242,32 @@ impl Decoder {
             }
             self.open(au)?;
         }
-        match self.decode_inner(au, pts_us, want_picture) {
-            Ok(fed) => {
-                self.errors = 0;
-                Ok(fed)
-            }
+        let result = self.decode_inner(au, pts_us, want_picture);
+        let picture = matches!(result, Ok(Fed::Queued(Some(_)) | Fed::InputFull(Some(_))));
+        self.track_errors(result, picture)
+    }
+
+    /// Picks up pictures that finished after the last [`Decoder::decode`]
+    /// returned. Call this when no new frame arrived for a few milliseconds.
+    pub fn poll(&mut self) -> Result<Option<DecodedImage>> {
+        if self.active.is_none() {
+            return Ok(None);
+        }
+        let result = self.drain(Duration::ZERO, true);
+        let picture = matches!(result, Ok(Some(_)));
+        self.track_errors(result, picture)
+    }
+
+    /// Counts consecutive failures of the open decoder across `decode` *and*
+    /// `poll`, and skips to the next decoder after 3. Only a delivered picture
+    /// clears the count: a decoder that takes input but fails every picture
+    /// (MTK tablet, 2026-11-14: "plane 1: CodecErrorReclaimed" from poll,
+    /// with successful input calls in between that used to reset the count)
+    /// must still be dropped.
+    fn track_errors<T>(&mut self, result: Result<T>, picture: bool) -> Result<T> {
+        match &result {
+            Ok(_) if picture => self.errors = 0,
+            Ok(_) => {}
             Err(e) => {
                 self.errors += 1;
                 if self.errors >= 3 {
@@ -256,21 +277,13 @@ impl Decoder {
                         .map(|a| a.entry.name.clone())
                         .unwrap_or_default();
                     tracing::warn!("decoder {name} keeps failing ({e:#}); trying the next one");
+                    // Dropping `Active` deletes the codec and its image reader once.
                     self.skip_current(format!("{name} failed: {e:#}"));
                     self.errors = 0;
                 }
-                Err(e)
             }
         }
-    }
-
-    /// Picks up pictures that finished after the last [`Decoder::decode`]
-    /// returned. Call this when no new frame arrived for a few milliseconds.
-    pub fn poll(&mut self) -> Result<Option<DecodedImage>> {
-        if self.active.is_none() {
-            return Ok(None);
-        }
-        self.drain(Duration::ZERO, true)
+        result
     }
 
     fn decode_inner(&mut self, au: &[u8], pts_us: u64, want: bool) -> Result<Fed> {
