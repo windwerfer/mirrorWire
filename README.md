@@ -86,7 +86,10 @@ then Artifacts). A `v*` tag also attaches them to a GitHub Release:
 **Android viewer.** Install the APK, open MirrorWire, and either tap a presenter in the
 list (same Wi-Fi), type the 6-digit pairing code on the keypad the first time, or scan the
 presenter's QR code with the phone's camera app: the `mirrorwire://` link opens MirrorWire
-and connects. Tap the video to show or hide the stats and **Disconnect**. Logs:
+and connects. Tap the video to show or hide the stats and **Disconnect**. The stats say
+which decoder the phone uses (`hardware decoder …` or `SOFTWARE decoder …`, with the reason a
+hardware one was skipped), the decode time, and `in / decoded / shown fps`; if the picture
+stops while frames still arrive, a red line names the stuck step. Logs:
 `adb logcat -s mirrorwire`.
 
 **Opening the unsigned Mac app.** The builds are ad-hoc signed, not notarized.
@@ -298,7 +301,7 @@ when the portal only sent 6.8 fps, because PTS advanced by 1/60 s per frame.
 | VideoToolbox encode/decode, macOS build | software H.264 decode works on the 2011 iMac |
 | Flatpak, AppImage, macOS .app / DMG builds | built in CI; Flatpak presenter and Intel DMG viewer start on the real machines |
 | camera QR scanning | not started |
-| Android viewer (APK) | built, untested on devices: arm64-v8a, Android 8+, MediaCodec decode |
+| Android viewer (APK) | built: arm64-v8a, Android 8+, MediaCodec decode (hardware first). First phone test froze after one picture; fixed, emulator-tested, device retest pending |
 | Android presenter | later (MediaProjection) |
 | Browser viewer (WebAssembly) | planned (WebTransport + WebCodecs); details in [docs/agents/roadmap.md](docs/agents/roadmap.md) |
 | Phone/tablet as input device (remote, pointer, drawing, touchpad, pen tablet) | idea, parked until mirroring is solid and a UI sketch arrives; see [docs/agents/roadmap.md](docs/agents/roadmap.md#future-phonetablet-as-input-device) |

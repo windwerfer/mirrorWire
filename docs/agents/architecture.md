@@ -146,16 +146,26 @@ x264 on Linux only). `packaging/macos/` makes the `.app` and a UDZO DMG (ad-hoc 
 ```
 packaging/android/MainActivity.java   extends NativeActivity; the only Java. Holds the Wi-Fi
                                       MulticastLock (mDNS), keeps the screen on, writes an
-                                      opened mirrorwire:// link to files/pending_uri.txt
+                                      opened mirrorwire:// link to files/pending_uri.txt, and
+                                      lists the H.264 decoders (MediaCodecList, no NDK API)
+                                      into files/h264_decoders.txt
 crates/mirrorwire-android             android_main -> eframe (glow) -> ViewerApp
   app.rs      home (mDNS list, 6-digit keypad, link field), connecting steps, video + overlay;
               polls pending_uri.txt every 500 ms (QR scanned with the camera app opens the link)
-  session.rs  QUIC receive loop (same as mirrorwire-app's viewer) + a decode thread
-  codec.rs    AMediaCodec "video/avc" (hardware first, then c2.android.avc.decoder /
-              OMX.google.h264.decoder) -> AImageReader YUV_420_888 -> yuv.rs -> RGBA
+  session.rs  QUIC receive loop (like mirrorwire-app's viewer, but a 6-deep decode queue)
+              + a decode thread that also polls MediaCodec every 8 ms for late pictures
+  codec.rs    AMediaCodec by name from codec_list.rs (hardware decoders first, then
+              software; a decoder that fails to start or errors 3x is skipped, the reason
+              is shown) -> AImageReader YUV_420_888 -> yuv.rs -> RGBA. Pictures that a
+              newer queued frame supersedes are released unrendered (no RGBA copy).
+  codec_list.rs  parses/ranks h264_decoders.txt; vendor low-latency keys (Qualcomm, Exynos)
+  stats.rs    pipeline counters -> HUD "in / decoded / shown fps" + a stall warning that
+              names the stuck stage
 packaging/android/build-apk.sh        cargo-ndk + javac/d8 + aapt2 + zipalign + apksigner (no Gradle)
 ```
 
-The Java shell is deliberately frozen: new features go into the Rust crate. Debug output:
+The Java shell stays minimal: new features go into the Rust crate. It only grows for what has
+no NDK API and would otherwise need JNI (`unsafe`), handed over as a file (pending link, decoder
+list). Debug output:
 `adb logcat -s mirrorwire`.
 

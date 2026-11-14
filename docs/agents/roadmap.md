@@ -15,7 +15,7 @@ target), **planned**, **idea**. Update this file when an item moves.
 | Viewer on the iMac (OpenGL, DMG x86_64) | works on the target iMac |
 | Pairing, pinned TLS, mDNS | works between the target machines (after opening 47800/udp) |
 | Flatpak, AppImage, DMGs in CI | built; Flatpak and x86_64 DMG run on target |
-| Android viewer APK (arm64-v8a, MediaCodec) | built (2026-11-13), untested on a device |
+| Android viewer APK (arm64-v8a, MediaCodec) | built (2026-11-13); first device test 2026-11-14: connects, cursor fine, picture froze after the first frame. Fixed 2026-11-14 (decode-queue flush spiral, late pictures, hardware decoder choice, pipeline HUD), tested on the x86_64 emulator only; device retest pending |
 | Browser (WebAssembly) viewer | design sketch in Planned and Future, not started |
 | Camera QR scan in the desktop viewer | not started (Android: the phone's camera app opens the `mirrorwire://` link) |
 | Cursor sent as coordinates (portal METADATA cursor, pointer datagrams, viewer-drawn) | built (2026-11-13), loopback-tested with a synthetic cursor; untested with KWin on the T480s |
@@ -267,3 +267,8 @@ Found while writing these docs (2026-11-12, commit `f7677c7`). Fix them in their
   together in code. Bump both together (protocol.md §4).
 - **macOS presenter:** the **Present** button is disabled on macOS (no capture source there
   yet); VideoToolbox encode is built but untested.
+- **Desktop viewer decode queue is 2 deep** (`viewer.rs` `DECODE_QUEUE`). On Android the same
+  depth made every slow keyframe overflow the queue, flush it, and request another keyframe:
+  ~1 picture/s on the emulator, a frozen picture on the owner's phone. Android now uses 6 and
+  skips the RGBA copy of superseded pictures. The iMac (11 ms software decode) has not shown
+  it, but a slower Mac would; port the same change if it does.

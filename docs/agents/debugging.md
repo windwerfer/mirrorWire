@@ -83,6 +83,25 @@ line `fps, Mbit/s, rtt, ms mean/p95/max: …stages…`.
   `ctx.input(|i| …)`; `double_clicked()` re-locks the context and deadlocks against the decode
   thread's `request_repaint()`.
 
+## Android: picture frozen, cursor still moves
+
+Read the HUD (tap the video). Line 2 is the phone's decoder: `hardware decoder <name>` or
+`SOFTWARE decoder <name> (<hardware name> failed: <reason>)`. Line 4 is
+`in X  decoded Y  shown Z fps`:
+
+- `in` > 0, `decoded` 0, red "decoder has returned no picture": MediaCodec takes input but
+  gives nothing back. Check the `input full` / `errors` counters and the decoder name;
+  `adb logcat -s mirrorwire` has the MediaCodec error.
+- `waiting key N/s` high and the red "waiting for a keyframe" line: the viewer dropped the
+  stream (loss or decode backlog) and the presenter is not sending keyframes; check the
+  presenter's `keyframes` count.
+- `flushes` keeps climbing: the decoder is slower than the stream, so the queue overflows and
+  every overflow costs a keyframe. Lower the presenter's fps or resolution, or get a hardware
+  decoder working. `late, not shown N/s` alone is fine: frames are decoded, only the
+  superseded ones are not converted to RGBA.
+- `decoded` > 0 but `shown` 0, red "none were shown": the UI does not pick up pictures (a GUI
+  bug, not the network).
+
 ## Presenter side
 
 - No share dialog: the portal backend (`xdg-desktop-portal-kde`) isn't running, or the restore
