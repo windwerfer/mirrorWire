@@ -85,6 +85,9 @@ target), **planned**, **idea**. Update this file when an item moves.
    would likely be several times slower and break the latency budget. Best practice for that FFI layer: one small module with a safe API,
    a `// SAFETY:` invariant on every block, `clippy::undocumented_unsafe_blocks`, a CI job running
    the media tests under AddressSanitizer, and fuzzing the decode path with corrupt H.264 input.
+   Part of the same safe API: a `Decoder` trait with our own frame type (today `decode.rs`
+   returns `ffmpeg_next::frame::Video`, and there is only one FFmpeg-based decoder), so other
+   decoders (VideoToolbox direct, FilmCraft) can be plugged in like the encoder backends. ~1 day.
    Later, for fun: try a FilmCraft decoder behind `--decoder filmcraft` if one exists.
 
 1. **Quality and latency fix:** stream at the screen's native resolution (no fixed
