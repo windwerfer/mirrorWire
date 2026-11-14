@@ -27,6 +27,30 @@ target), **planned**, **idea**. Update this file when an item moves.
 
 ## Next (owner-agreed order)
 
+- **BUG (first): Android MTK tablet, no picture (owner test 2026-11-14, Build 43542749952).**
+  HUD: `hardware decoder c2.mtk.avc.decoder (error: plane 1: CodecErrorReclaimed)`,
+  `in 12.0 decoded 0.0 shown 0.0`, `key req 212 errors 190`, black screen, the red stall line
+  comes and goes every 20–30 s. The previous APK (software `c2.android.avc.decoder`) showed
+  the first frame. Found so far:
+  - The 3-failures fallback never fired: errors from `Decoder::poll()` (late pictures) were not
+    counted, and every successful input call reset the count. Fixed in the commit after this
+    one: failures from `decode` and `poll` count together, and only a delivered picture clears
+    them, so the next decoder (in the end `c2.android.avc.decoder`) takes over with the reason
+    in the HUD. Unverified on the tablet.
+  - The text comes from `codec.rs` `convert()`: `AImage_getPlaneData(1)` (plane 0 succeeded)
+    returned status 1101, which the `ndk` crate names `CodecErrorReclaimed`
+    (`AMEDIACODEC_ERROR_RECLAIMED`). In AOSP's `NdkImage.cpp` neither `lockImage` nor
+    `getPlaneData` returns 1101, so it is probably a vendor (MTK) value or a mislabelled code,
+    not a real resource-manager reclaim. Unknown: the AImage format/usage the MTK decoder
+    delivers to a YUV_420_888 reader (maybe a private/compressed layout that cannot be CPU-read).
+  - Leak check (code reading only): a skipped decoder's `Active` (codec, reader, window) is
+    dropped once before the next opens; reopen happens only after a skip; images are dropped
+    after conversion. No leak found, not measured on a device.
+  - Next steps: on the tablet, read `adb logcat` around the error (format, usage, plane strides);
+    if hardware decode keeps failing CPU reads, render the decoder to a `SurfaceTexture`/
+    `AHardwareBuffer` → GL texture (roadmap "Android viewer polish") instead of the CPU path;
+    add a "no picture within N s" timeout per decoder, not only the error count.
+
 0. **TOP PRIORITY: reliable, likable transport (owner, 2026-11-14).** The prototype only
    continues if streaming over real Wi-Fi is stable and pleasant. Do these first, in order:
    1. **Explain the adaptive-bitrate cuts:** log the reason for each cut (loss / RTT / backlog plus
