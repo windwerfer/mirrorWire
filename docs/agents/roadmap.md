@@ -50,6 +50,24 @@ target), **planned**, **idea**. Update this file when an item moves.
    Alongside: fuzz the proto parsers (fragment, fec, cursor, control) and remove the panicking
    index/unwrap sites in proto/net, since hostile or corrupt packets must never crash a stream.
 
+0b. **Structure improvements (owner, 2026-11-14): after item 0, before widening the scope**
+   (bottleneck line, Extend mode, phone input, Mac presenter). Borrowed from PhotoCraft:
+   1. **Lints enforced by tooling:** `[workspace.lints]` plus `clippy.toml` (unwrap/expect/panic
+      allowed in tests only); `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic,
+      clippy::indexing_slicing)]` in proto and net; `forbid(unsafe_code)` everywhere except media
+      and the glow renderer; `clippy::undocumented_unsafe_blocks` with a `// SAFETY:` comment on
+      all ~40 unsafe sites; lock poisoning via `unwrap_or_else(PoisonError::into_inner)`. ~1 day.
+   2. **cargo-fuzz targets** for fragment, fec, cursor and control decode, plus a CI job (if not
+      already done alongside item 0). ~½ day.
+   3. **One formatting-only commit** (`cargo fmt`, `rustfmt.toml`), then a `cargo xtask ci` gate:
+      fmt, clippy, tests, a crate-layer check (architecture.md made mechanical), loopback test.
+   4. **Machine-checked perf budgets:** loopback p95 capture→decoded and the adaptive-bitrate
+      simulation rows as TOML budgets checked in CI, instead of prose tables in testing.md.
+   5. **Split the big files** (encode.rs, presenter.rs, transport.rs; move FecState and the rate
+      wiring out of transport.rs) and merge the duplicated encoder-config comparison in
+      pipeline.rs (`maybe_reopen` / `maybe_replace_encoder`).
+   Already in force: decision records with alternatives (decisions.md) and small commits (AGENTS.md).
+
 1. **Quality and latency fix:** stream at the screen's native resolution (no fixed
    2000×1000 scaling), higher default bitrate for desktop text, move colour conversion and
    scaling to the GPU (VAAPI `scale_vaapi`/hw upload) so `capture_to_encoded` drops.
