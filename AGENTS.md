@@ -115,6 +115,9 @@ schedule so new advisories against existing pins are caught. Details:
   `bot@users.noreply.github.com` or a bot account as author.
 - Small, focused commits with an imperative subject (`Add FEC parity to fragment header`). One
   topic per commit. Only commit states that pass the gates.
+  Split a session's work into several commits (e.g. feature, its tests, docs, a refactor) instead
+  of one 1–2k-line commit; a commit that mixes unrelated fixes is hard to review and bisect.
+  Formatting-only and move-only changes always get their own commit.
 - **Pushing directly to `main` is allowed in this repository** (the owner's decision; no PR
   needed). `git pull --rebase` before pushing; other agents may be working in parallel.
 - **Never force-push, never rewrite pushed history** (`rebase -i`, `commit --amend`,
