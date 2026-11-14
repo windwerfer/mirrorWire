@@ -76,6 +76,11 @@ target), **planned**, **idea**. Update this file when an item moves.
    dropping the `unsafe impl Send` by restructuring threads. Remove what can go; for what must
    stay, write down why (per site) and report the list to the owner. Goal: no `unsafe` outside
    `mirrorwire-media`, then `#![forbid(unsafe_code)]` in proto, net and app.
+   FFmpeg stays (the iMac's 11 ms software decode is FFmpeg's C/asm decoder; no pure-Rust H.264
+   decoder is fast enough). Best practice for that FFI layer: one small module with a safe API,
+   a `// SAFETY:` invariant on every block, `clippy::undocumented_unsafe_blocks`, a CI job running
+   the media tests under AddressSanitizer, and fuzzing the decode path with corrupt H.264 input.
+   Later, for fun: try a FilmCraft decoder behind `--decoder filmcraft` if one exists.
 
 1. **Quality and latency fix:** stream at the screen's native resolution (no fixed
    2000×1000 scaling), higher default bitrate for desktop text, move colour conversion and
