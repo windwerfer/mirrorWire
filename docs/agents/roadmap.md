@@ -76,8 +76,13 @@ target), **planned**, **idea**. Update this file when an item moves.
    dropping the `unsafe impl Send` by restructuring threads. Remove what can go; for what must
    stay, write down why (per site) and report the list to the owner. Goal: no `unsafe` outside
    `mirrorwire-media`, then `#![forbid(unsafe_code)]` in proto, net and app.
-   FFmpeg stays (the iMac's 11 ms software decode is FFmpeg's C/asm decoder; no pure-Rust H.264
-   decoder is fast enough). Best practice for that FFI layer: one small module with a safe API,
+   **Realistic goal (owner-agreed):** not zero `unsafe`, but FFmpeg behind one small,
+   well-documented module with a safe API; `unsafe` removed from the GUI's OpenGL code
+   (yuv_glow.rs), logging (applog.rs) and network diagnostics (net/diag.rs). Reason: the iMac
+   has no hardware H.264 decoder, and its ~11 ms software decode at 2560×1440 is FFmpeg's
+   hand-optimised C/asm decoder, reachable from Rust only through FFI (hardware decode would
+   need FFI too). No known pure-Rust H.264 decoder is fast enough; one written from scratch
+   would likely be several times slower and break the latency budget. Best practice for that FFI layer: one small module with a safe API,
    a `// SAFETY:` invariant on every block, `clippy::undocumented_unsafe_blocks`, a CI job running
    the media tests under AddressSanitizer, and fuzzing the decode path with corrupt H.264 input.
    Later, for fun: try a FilmCraft decoder behind `--decoder filmcraft` if one exists.
