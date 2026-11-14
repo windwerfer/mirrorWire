@@ -59,6 +59,10 @@ target), **planned**, **idea**. Update this file when an item moves.
     decode against a stale picture (flipping tiles) until a keyframe that apparently never
     lands cleanly. Check whether queue drops skip frames the decoder needs, and request a
     keyframe instead of feeding P-frames after a drop.
+  - Owner note: the first Android APK decoded in ~10–40 ms (~33 ms typical), now 155 ms.
+    Unclear whether that build really used hardware decode (it may have, despite the name), or
+    whether the software decoder got slower (queue/conversion changes since `d4e9856`/`7a8d2e8`).
+    Compare: put the first APK's decoder name + decode time next to the current one.
   - Next steps: on the tablet, read `adb logcat` around the error (format, usage, plane strides);
     if hardware decode keeps failing CPU reads, render the decoder to a `SurfaceTexture`/
     `AHardwareBuffer` → GL texture (roadmap "Android viewer polish") instead of the CPU path;
