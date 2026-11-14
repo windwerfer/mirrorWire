@@ -7,6 +7,8 @@
 # Usage: packaging/android/build-apk.sh [out-dir]
 # Optional: ANDROID_ABI (default arm64-v8a; x86_64 for the emulator),
 #           MIRRORWIRE_KEYSTORE=path (a debug key is generated when missing),
+#           MIRRORWIRE_KS_PASS / MIRRORWIRE_KEY_PASS / MIRRORWIRE_KEY_ALIAS for a
+#           release key (default: the debug key's "android" / androiddebugkey),
 #           VERSION_CODE (default 1).
 set -euo pipefail
 
@@ -75,7 +77,11 @@ if [ ! -f "$KEYSTORE" ]; then
     -dname "CN=MirrorWire Debug,O=MirrorWire,C=DE" >/dev/null
 fi
 APK="$OUT/MirrorWire-$ABI.apk"
-"$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android \
-  --ks-key-alias androiddebugkey --out "$APK" "$WORK/aligned.apk"
+# Passwords go through env: so they never show up in the process list or logs.
+export MIRRORWIRE_KS_PASS="${MIRRORWIRE_KS_PASS:-android}"
+export MIRRORWIRE_KEY_PASS="${MIRRORWIRE_KEY_PASS:-$MIRRORWIRE_KS_PASS}"
+"$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass env:MIRRORWIRE_KS_PASS \
+  --key-pass env:MIRRORWIRE_KEY_PASS --ks-key-alias "${MIRRORWIRE_KEY_ALIAS:-androiddebugkey}" \
+  --out "$APK" "$WORK/aligned.apk"
 "$BT/apksigner" verify --verbose "$APK" | head -n 4
 ls -la "$APK"
