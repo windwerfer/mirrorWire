@@ -27,10 +27,11 @@ Rules:
 - **Only `mirrorwire-app` and `mirrorwire-android` know about egui/eframe** (and only the app
   about clap and tracing-subscriber). Library crates
   log through `tracing` and return `anyhow::Result`.
-- **Only `mirrorwire-media` touches FFmpeg and `unsafe`.** The `unsafe` is FFmpeg FFI
-  (hardware frame contexts, raw `AVCodecContext` fields, `Send` impls for FFmpeg wrappers). Keep
-  it in `encode.rs`, `decode.rs` and `hw.rs`, give each block a `// SAFETY:` comment (existing
-  blocks lack them, see roadmap), and keep the public API safe. No `unsafe` in the other crates.
+- **`unsafe` is avoided (D15).** Today it exists as FFI in `mirrorwire-media` (`encode.rs`,
+  `decode.rs`, `hw.rs`, one site in `source/portal.rs`), in `mirrorwire-app` (`yuv_glow.rs` GL
+  calls, one in `applog.rs`) and in `mirrorwire-net/src/diag.rs`. All of it lacks `// SAFETY:`
+  comments (see roadmap 0b). The goal is to remove the sites outside media where a safe API
+  exists and to keep proto `unsafe`-free. Any new `unsafe` needs a note to the owner.
 - New platform code (Android JNI, a pure-Rust encoder) goes behind the same traits
   (`FrameSource`, `VideoSink`, the encoder backend enum), not as special cases in `mirrorwire-app`.
 

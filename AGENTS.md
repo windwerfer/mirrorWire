@@ -70,6 +70,13 @@ sharp text, and no special privileges.
     Apache-2.0, BSD, ISC, Zlib, Unicode, CC0, MPL-2.0 unmodified). GPL code is only ever
     *linked at build time by packaging* (x264 in the Linux release builds), never vendored or
     copied into the source tree. See [decisions.md](docs/agents/decisions.md) D8.
+12. **No `unsafe` Rust if at all possible.** Prefer a safe crate API, a safe wrapper that
+    already exists, or a different design. If `unsafe` really is unavoidable (FFmpeg/VA-API
+    FFI, GL, JNI), **tell the owner before or in the same message as the change**: which file,
+    why there is no safe way, and what alternative was rejected. Keep the block as small as
+    possible, give it a `// SAFETY:` comment stating the invariant, and keep the public API
+    safe. Never add `unsafe` silently, and never add it to proto or net (parsers of network
+    input). See [decisions.md](docs/agents/decisions.md) D15.
 
 ## 2. Working rules
 

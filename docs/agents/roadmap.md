@@ -56,7 +56,8 @@ target), **planned**, **idea**. Update this file when an item moves.
       allowed in tests only); `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic,
       clippy::indexing_slicing)]` in proto and net; `forbid(unsafe_code)` everywhere except media
       and the glow renderer; `clippy::undocumented_unsafe_blocks` with a `// SAFETY:` comment on
-      all ~40 unsafe sites; lock poisoning via `unwrap_or_else(PoisonError::into_inner)`. ~1 day.
+      all remaining unsafe sites; first try to remove the `unsafe` in net/diag.rs,
+      app/applog.rs and portal.rs via safe APIs (D15); lock poisoning via `unwrap_or_else(PoisonError::into_inner)`. ~1 day.
    2. **cargo-fuzz targets** for fragment, fec, cursor and control decode, plus a CI job (if not
       already done alongside item 0). ~½ day.
    3. **One formatting-only commit** (`cargo fmt`, `rustfmt.toml`), then a `cargo xtask ci` gate:
