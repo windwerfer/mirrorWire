@@ -205,8 +205,9 @@ jobs:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
           if [ -n "$KEYSTORE_BASE64" ]; then
-            # Pasting into the web form can add line breaks or spaces; base64 -d rejects them.
-            printf '%s' "$KEYSTORE_BASE64" | tr -d ' \t\r\n' | base64 -d > "$RUNNER_TEMP/release.jks"
+            # Pasting into the web form can add line breaks, spaces or invisible Unicode
+            # whitespace; keep only base64 characters so base64 -d accepts it.
+            printf '%s' "$KEYSTORE_BASE64" | LC_ALL=C tr -cd 'A-Za-z0-9+/=' | base64 -d > "$RUNNER_TEMP/release.jks"
             echo "MIRRORWIRE_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
             echo "Signing with the release key"
           else
