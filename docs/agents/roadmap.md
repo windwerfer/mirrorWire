@@ -69,6 +69,14 @@ target), **planned**, **idea**. Update this file when an item moves.
       pipeline.rs (`maybe_reopen` / `maybe_replace_encoder`).
    Already in force: decision records with alternatives (decisions.md) and small commits (AGENTS.md).
 
+0c. **Remove `unsafe` Rust where possible (owner, 2026-11-14; after 0 and 0b, D15).** Go through
+   every `unsafe` site (encode.rs, decode.rs, hw.rs, source/portal.rs, yuv_glow.rs, applog.rs,
+   net/diag.rs) and check for a safe replacement: safe methods of `ffmpeg-next`/`ffmpeg-sys`
+   wrappers, `glow`/egui-safe GL paths or a wgpu-only path, safe crates for the libc/socket calls,
+   dropping the `unsafe impl Send` by restructuring threads. Remove what can go; for what must
+   stay, write down why (per site) and report the list to the owner. Goal: no `unsafe` outside
+   `mirrorwire-media`, then `#![forbid(unsafe_code)]` in proto, net and app.
+
 1. **Quality and latency fix:** stream at the screen's native resolution (no fixed
    2000×1000 scaling), higher default bitrate for desktop text, move colour conversion and
    scaling to the GPU (VAAPI `scale_vaapi`/hw upload) so `capture_to_encoded` drops.
